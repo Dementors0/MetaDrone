@@ -1,0 +1,34 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /home/csn/miniconda3/envs/DiffPhysDrone/bin/nvcc
+
+cflags = -pthread -B /home/csn/miniconda3/envs/DiffPhysDrone/compiler_compat -Wl,--sysroot=/ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -Wstrict-prototypes -fPIC -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/torch/csrc/api/include -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/TH -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/THC -I/home/csn/miniconda3/envs/DiffPhysDrone/include -I/home/csn/miniconda3/envs/DiffPhysDrone/include/python3.8 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=quadsim_cuda -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17
+cuda_cflags = -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/torch/csrc/api/include -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/TH -I/home/csn/miniconda3/envs/DiffPhysDrone/lib/python3.8/site-packages/torch/include/THC -I/home/csn/miniconda3/envs/DiffPhysDrone/include -I/home/csn/miniconda3/envs/DiffPhysDrone/include/python3.8 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=quadsim_cuda -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 -std=c++17
+cuda_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc  $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+build /home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/dynamics_kernel.o: cuda_compile /home/csn/working_space/validation_code/multi_pub/src/dynamics_kernel.cu
+build /home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/quadsim.o: compile /home/csn/working_space/validation_code/multi_pub/src/quadsim.cpp
+build /home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/quadsim_kernel.o: cuda_compile /home/csn/working_space/validation_code/multi_pub/src/quadsim_kernel.cu
+
+
+
+
+
+

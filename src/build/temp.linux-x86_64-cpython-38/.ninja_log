@@ -1,0 +1,4 @@
+# ninja log v7
+0	21111	1769770973823155688	/home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/quadsim.o	764e120c0df39466
+1	45885	1769770973823155688	/home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/quadsim_kernel.o	f24a0b08e8ea97c9
+0	46935	1769770973823155688	/home/csn/working_space/validation_code/multi_pub/src/build/temp.linux-x86_64-cpython-38/dynamics_kernel.o	b3ef8bfb5d3d7644

@@ -1,3 +1,4 @@
 
-meta_learning_v3.py为直接把meta_loss反向传播回LossGenNet
-meta_TD.py为TDFusion图像融合中用的更新算法，通过LossGenNet对WorkNet一步梯度下降的元目标（meta_loss）更新LossGenNet
+#meta_learning_v3.py为直接把meta_loss反向传播回LossGenNet
+
+#meta_TD.py为TDFusion图像融合中用的更新算法，通过LossGenNet对WorkNet一步梯度下降的元目标（meta_loss）更新LossGenNet

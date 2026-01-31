@@ -14,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 
-# 假设这些是你本地的模块
 from env_cuda import Env
 from WorkNet import WorkNet
 from LossGenNet import LossGenNet
@@ -27,7 +26,6 @@ parser.add_argument('--resume_worker',
 parser.add_argument('--resume_lgn',
                     default="/home/robot/validation_code/training_code/multi_pub/lgn_ckpt_272999.pth",
                     help='Path to pretrained lgn model')
-# 保持代码一的 Batch Size 设定
 parser.add_argument('--batch_size', type=int, default=256) 
 parser.add_argument('--num_iters', type=int, default=500000)
 
@@ -56,7 +54,6 @@ parser.add_argument('--lgn_lr', type=float, default=5e-4, help='LGN Learning Rat
 
 args = parser.parse_args()
 
-# 使用更清晰的日志目录名
 writer = SummaryWriter()
 print(args)
 
@@ -78,7 +75,7 @@ worknet = worknet.to(device)
 
 # --- LGN Network ---
 lgn_state_dim = 7 if args.no_odom else 10
-# [保持代码一] 实例化新的 LossGenNet，指定 hidden_dim
+# 实例化LossGenNet，指定 hidden_dim
 lgn = LossGenNet(state_dim=lgn_state_dim, hidden_dim=128).to(device)
 
 ########## 5. 优化器配置 ##########
@@ -90,7 +87,6 @@ sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 scaler_q = defaultdict(list)
 
 def smooth_dict(ori_dict):
-    """累积数据用于平滑显示"""
     for k, v in ori_dict.items():
         if isinstance(v, torch.Tensor):
             v = v.item()
@@ -99,10 +95,10 @@ def smooth_dict(ori_dict):
 def is_save_iter(i):
     return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
 
-# [使用代码二逻辑] 逐时间步计算重叠损失
+# 逐时间步计算重叠损失
 def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=300):
     """
-    计算轨迹重叠损失 (逐时间步版本)
+    计算轨迹重叠损失 (逐时间步)
     返回: [Batch, Time] 的 Loss 矩阵
     """
     p_history = p_history.permute(1, 0, 2)
@@ -140,7 +136,7 @@ for i in pbar:
         worker_pos = cycle_pos - args.lgn_steps + 1
         phase_str = f"Work ({worker_pos}/{args.worker_steps})"
 
-    # 重置环境 (Shared Reset)
+    # 重置环境 
     env.reset()
     worknet.reset()
     
@@ -255,7 +251,7 @@ for i in pbar:
             state_tensor = torch.cat(state_list, -1)
             x_pooled = F.max_pool2d((3 / depth.clamp_(0.3, 24) - 0.6)[:, None], 4, 4)
 
-            # [关键] 使用 functional_call 调用带有 fast_params 的 WorkNet
+            # 使用 functional_call 调用带有 fast_params 的 WorkNet
             act, _, h_worker_fast = functional_call(worknet, fast_params, (x_pooled, state_tensor, h_worker_fast))
             
             a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
@@ -271,13 +267,12 @@ for i in pbar:
         if vec_stack_2.dim() == 4: vec_stack_2 = vec_stack_2.mean(1)
         
         # [Code 1] Meta Loss Calculation
-        # 注意：这里使用第二次 Rollout 的数据计算 Meta Loss
+        # 使用第二次 Rollout 的数据计算 Meta Loss
         distance = vec_stack_2.norm(2, -1) - env.margin
         with torch.no_grad():
              v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)
         
         loss_meta_pos = torch.norm(p_stack_2[-1] - env.p_target, 2, -1).mean()
-        # 注意: v_to_pt 维度匹配问题，这里简单处理，若 Code 1 原逻辑有特定 shape 需求请保持
         loss_meta_coll = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()
         loss_meta_ctrl = act_stack_2.norm(2, -1).sum()
         
@@ -290,8 +285,8 @@ for i in pbar:
         nn.utils.clip_grad_norm_(lgn.parameters(), 1.0)
         optim_lgn.step()
 
-        # 为了日志记录一致性，保存变量用于 tensorboard
-        # 注意：这里的 weights_seq 是第一次 rollout 产生的，反映了更新前的策略
+        # 保存变量用于 tensorboard
+        # 这里的 weights_seq 是第一次 rollout 产生的，反映了更新前的策略
         weights_seq = w_stack 
         dist_obj = vec_stack.norm(2, -1) - env.margin # 用于计算 Success Rate (基于 Rollout 1)
 

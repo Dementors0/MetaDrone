@@ -3,6 +3,7 @@ import math
 from collections import defaultdict
 from random import normalvariate
 import os
+from datetime import datetime  # <--- [新增] 引入时间模块
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 
-# 假设这些是你本地的模块
 from env_cuda import Env
 from WorkNet import WorkNet
 from LossGenNet import LossGenNet
@@ -27,7 +27,6 @@ parser.add_argument('--resume_worker',
 parser.add_argument('--resume_lgn',
                     default="/home/robot/validation_code/training_code/multi_pub/lgn_ckpt_272999.pth",
                     help='Path to pretrained lgn model')
-# 保持代码一的 Batch Size 设定
 parser.add_argument('--batch_size', type=int, default=256) 
 parser.add_argument('--num_iters', type=int, default=500000)
 
@@ -56,9 +55,15 @@ parser.add_argument('--lgn_lr', type=float, default=5e-4, help='LGN Learning Rat
 
 args = parser.parse_args()
 
-# 使用更清晰的日志目录名
 writer = SummaryWriter()
 print(args)
+
+# 获取当前时间
+timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+# 创建保存路径 (例如: checkpoints/2023-10-27_15-30-00)
+save_dir = os.path.join('checkpoints', timestamp)
+os.makedirs(save_dir, exist_ok=True)
+print(f"--> Models will be saved to: {save_dir}")
 
 device = torch.device('cuda')
 
@@ -78,7 +83,6 @@ worknet = worknet.to(device)
 
 # --- LGN Network ---
 lgn_state_dim = 7 if args.no_odom else 10
-# [保持代码一] 实例化新的 LossGenNet，指定 hidden_dim
 lgn = LossGenNet(state_dim=lgn_state_dim, hidden_dim=128).to(device)
 
 ########## 5. 优化器配置 ##########
@@ -90,7 +94,6 @@ sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 scaler_q = defaultdict(list)
 
 def smooth_dict(ori_dict):
-    """累积数据用于平滑显示"""
     for k, v in ori_dict.items():
         if isinstance(v, torch.Tensor):
             v = v.item()
@@ -99,10 +102,10 @@ def smooth_dict(ori_dict):
 def is_save_iter(i):
     return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
 
-# [使用代码二逻辑] 逐时间步计算重叠损失
+# 逐时间步计算重叠损失
 def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=300):
     """
-    计算轨迹重叠损失 (逐时间步版本)
+    计算轨迹重叠损失 (逐时间步)
     返回: [Batch, Time] 的 Loss 矩阵
     """
     p_history = p_history.permute(1, 0, 2)
@@ -150,11 +153,11 @@ for i in pbar:
     trajectory_lgn_weights = []
     target_v_raw = env.p_target - env.p
     
-    # [保持代码一] 初始化隐状态
+    # 初始化GNU的隐状态
     h_worker = None
     h_lgn = None 
 
-    ###### A. Rollout (数据收集) ######
+    ###### A. 仿真环境中执行一个Rollout######
     for t in range(args.timesteps):
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)
         depth, flow = env.render(ctl_dt)
@@ -177,7 +180,7 @@ for i in pbar:
 
         x_pooled = F.max_pool2d((3 / depth.clamp_(0.3, 24) - 0.6)[:, None], 4, 4)
 
-        # --- LGN Forward (保持代码一接口) ---
+        # --- LGN Forward ---
         current_weights, h_lgn = lgn(x_pooled, state_tensor, h_lgn)
         trajectory_lgn_weights.append(current_weights)
 
@@ -189,7 +192,7 @@ for i in pbar:
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
 
-    ###### B. 损失计算 (保持代码二逻辑: 逐时间步加权) ######
+    ###### B. 损失计算（逐时间步加权) ######
     p_history = torch.stack(p_history)
     v_history = torch.stack(v_history)
     target_v_history = torch.stack(target_v_history)
@@ -230,13 +233,12 @@ for i in pbar:
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     meta_loss = loss_meta_pos + loss_meta_coll * 5.0 + loss_meta_ctrl * 0.001
 
-    ###### C. 优化执行 (核心修改) ######
+    ###### C. 优化执行 ######
     optim_worker.zero_grad()
     optim_lgn.zero_grad()
 
     if train_lgn_phase:
         # === 阶段 1: 优化 LGN (Direct Meta-Gradient Flow) ===
-        # 不计算显式的 Dot Product Loss，而是直接传递 Meta Loss 的梯度
         
         # 1. 计算 Proxy 梯度 (需要 create_graph 以连接到 LGN)
         grad_proxy = torch.autograd.grad(proxy_loss, worknet.parameters(), create_graph=True, allow_unused=True)
@@ -245,9 +247,6 @@ for i in pbar:
         grad_meta = torch.autograd.grad(meta_loss, worknet.parameters(), allow_unused=True, retain_graph=True)
         
         # 3. 构造上游梯度 (Grad Tensors)
-        # 这里的逻辑是：我们希望 WorkNet 的更新方向 (-grad_proxy) 能够最小化 Meta Loss。
-        # 根据链式法则 (Unrolled Diff)，这等价于最大化 (grad_proxy · grad_meta)。
-        # 因此，我们将 (-grad_meta) 作为 grad_proxy 的反向传播输入。
         grad_meta_neg = []
         for gm in grad_meta:
             if gm is not None:
@@ -256,7 +255,6 @@ for i in pbar:
                 grad_meta_neg.append(None)
 
         # 4. 反向传播：直接从 Proxy 梯度流向 LGN
-        # 这通过 Vector-Jacobian Product 实现了“使用 Meta Loss 优化 LGN”
         torch.autograd.backward(grad_proxy, grad_tensors=grad_meta_neg)
         
         nn.utils.clip_grad_norm_(lgn.parameters(), 1.0)
@@ -265,7 +263,6 @@ for i in pbar:
     else:
         # === 阶段 2: 优化 Worker (Standard Update) ===
         proxy_loss.backward()
-        #nn.utils.clip_grad_norm_(worknet.parameters(), 5.0)
         optim_worker.step()
         sched.step()
 
@@ -302,8 +299,11 @@ for i in pbar:
             writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
 
         if is_save_iter(i):
-            torch.save(worknet.state_dict(), f'worker_ckpt_{i:06d}.pth')
-            torch.save(lgn.state_dict(), f'lgn_ckpt_{i:06d}.pth')
+            save_path_worker = os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth')
+            save_path_lgn = os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth')
+            
+            torch.save(worknet.state_dict(), save_path_worker)
+            torch.save(lgn.state_dict(), save_path_lgn)
             
             # 绘图逻辑
             idx = 0

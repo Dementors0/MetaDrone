@@ -1,0 +1,400 @@
+import math
+import random
+import time
+import torch
+import torch.nn.functional as F
+import quadsim_cuda
+
+
+class GDecay(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.alpha, None
+
+g_decay = GDecay.apply
+
+
+class RunFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt, airmode):
+        act_next, p_next, v_next, a_next = quadsim_cuda.run_forward(
+            R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, ctl_dt, airmode)
+        ctx.save_for_backward(R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next)
+        ctx.grad_decay = grad_decay
+        ctx.ctl_dt = ctl_dt
+        return act_next, p_next, v_next, a_next
+
+    @staticmethod
+    def backward(ctx, d_act_next, d_p_next, d_v_next, d_a_next):
+        R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next = ctx.saved_tensors
+        d_act_pred, d_act, d_p, d_v, d_a = quadsim_cuda.run_backward(
+            R, dg, z_drag_coef, drag_2, pitch_ctl_delay, v, v_wind, act_next, d_act_next, d_p_next, d_v_next, d_a_next,
+            ctx.grad_decay, ctx.ctl_dt)
+        return None, None, None, None, None, d_act_pred, d_act, d_p, d_v, None, d_a, None, None, None
+
+run = RunFunction.apply
+
+
+class Env:
+    def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
+                 single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
+                 random_rotation=False, cam_angle=10) -> None:
+        self.device = device
+        self.batch_size = batch_size
+        self.width = width
+        self.height = height
+        self.grad_decay = grad_decay
+        self.ball_w = torch.tensor([8., 18, 6, 0.2], device=device)
+        self.ball_b = torch.tensor([0., -9, -1, 0.4], device=device)
+        self.voxel_w = torch.tensor([8., 18, 6, 0.1, 0.1, 0.1], device=device)
+        self.voxel_b = torch.tensor([0., -9, -1, 0.2, 0.2, 0.2], device=device)
+        self.ground_voxel_w = torch.tensor([8., 18,  0, 2.9, 2.9, 1.9], device=device)
+        self.ground_voxel_b = torch.tensor([0., -9, -1, 0.1, 0.1, 0.1], device=device)
+        self.cyl_w = torch.tensor([8., 18, 0.35], device=device)
+        self.cyl_b = torch.tensor([0., -9, 0.05], device=device)
+        self.cyl_h_w = torch.tensor([8., 6, 0.1], device=device)
+        self.cyl_h_b = torch.tensor([0., 0, 0.05], device=device)
+        self.gate_w = torch.tensor([2.,  2,  1.0, 0.5], device=device)
+        self.gate_b = torch.tensor([3., -1,  0.0, 0.5], device=device)
+        self.v_wind_w = torch.tensor([1,  1,  0.2], device=device)
+        self.g_std = torch.tensor([0., 0, -9.80665], device=device)
+        self.roof_add = torch.tensor([0., 0., 2.5, 1.5, 1.5, 1.5], device=device)
+        self.sub_div = torch.linspace(0, 1. / 15, 10, device=device).reshape(-1, 1, 1)
+        self.p_init = torch.as_tensor([
+            [-1.5, -3.,  1],
+            [ 9.5, -3.,  1],
+            [-0.5,  1.,  1],
+            [ 8.5,  1.,  1],
+            [ 0.0,  3.,  1],
+            [ 8.0,  3.,  1],
+            [-1.0, -1.,  1],
+            [ 9.0, -1.,  1],
+        ], device=device).repeat(batch_size // 8 + 7, 1)[:batch_size]
+        self.p_end = torch.as_tensor([
+            [8.,  3.,  1],
+            [0.,  3.,  1],
+            [8., -1.,  1],
+            [0., -1.,  1],
+            [8., -3.,  1],
+            [0., -3.,  1],
+            [8.,  1.,  1],
+            [0.,  1.,  1],
+        ], device=device).repeat(batch_size // 8 + 7, 1)[:batch_size]
+        self.flow = torch.empty((batch_size, 0, height, width), device=device)
+        self.single = single
+        self.gate = gate
+        self.ground_voxels = ground_voxels
+        self.scaffold = scaffold
+        self.speed_mtp = speed_mtp
+        self.random_rotation = random_rotation
+        self.cam_angle = cam_angle
+        self.fov_x_half_tan = fov_x_half_tan
+        self.reset()
+        # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
+
+    def reset(self):
+        B = self.batch_size
+        device = self.device
+
+        cam_angle = (self.cam_angle + torch.randn(B, device=device)) * math.pi / 180
+        zeros = torch.zeros_like(cam_angle)
+        ones = torch.ones_like(cam_angle)
+        self.R_cam = torch.stack([
+            torch.cos(cam_angle), zeros, -torch.sin(cam_angle),
+            zeros, ones, zeros,
+            torch.sin(cam_angle), zeros, torch.cos(cam_angle),
+        ], -1).reshape(B, 3, 3)
+
+        # Clear obstacles for maze environment where only walls matter
+        self.balls = torch.zeros((B, 0, 4), device=device)
+        self.cyl = torch.zeros((B, 0, 3), device=device)
+        self.cyl_h = torch.zeros((B, 0, 3), device=device)
+
+        # ---------------------------------------------------------------------
+        # Maze Generation
+        # ---------------------------------------------------------------------
+        # Grid: 8x18 cells -> 1m grid cells roughly covering x[0,8], y[-9,9]
+        cols, rows = 8, 18
+        
+        # Iterative DFS for maze generation (single layout for batch efficiency)
+        visited = set()
+        stack = [(0, 0)]
+        visited.add((0, 0))
+        passages = set()
+        
+        while stack:
+            c, r = stack[-1]
+            neighbors = []
+            for dc, dr in [(-1,0), (1,0), (0,-1), (0,1)]:
+                nc, nr = c+dc, r+dr
+                if 0 <= nc < cols and 0 <= nr < rows and (nc, nr) not in visited:
+                    neighbors.append((nc, nr))
+            
+            if neighbors:
+                nc, nr = random.choice(neighbors)
+                visited.add((nc, nr))
+                stack.append((nc, nr))
+                passages.add(tuple(sorted(((c, r), (nc, nr)))))
+            else:
+                stack.pop()
+        
+        wall_list = []
+        # Wall dimensions: CenterZ=1.0, HalfSizeZ=1.0 => 0m to 2m height
+        c_z = 1.0
+        h_z = 1.0
+        th = 0.1 # Half thickness of wall
+        
+        # Vertical walls (YZ plane)
+        for r in range(rows):
+            for c in range(cols + 1):
+                # Wall exists if perimeter OR no passage
+                is_wall = (c == 0 or c == cols)
+                if not is_wall and tuple(sorted(((c-1, r), (c, r)))) not in passages:
+                    is_wall = True
+                
+                if is_wall:
+                    # x = c. y center = r - 9 + 0.5.
+                    wall_list.append([float(c), r - 9.0 + 0.5, c_z, th, 0.5, h_z])
+        
+        # Horizontal walls (XZ plane)
+        for c in range(cols):
+            for r in range(rows + 1):
+                is_wall = (r == 0 or r == rows)
+                if not is_wall and tuple(sorted(((c, r-1), (c, r)))) not in passages:
+                    is_wall = True
+                
+                if is_wall:
+                    # y = r - 9. x center = c + 0.5.
+                    wall_list.append([c + 0.5, float(r) - 9.0, c_z, 0.5, th, h_z])
+                    
+        walls_tensor = torch.tensor(wall_list, device=device, dtype=torch.float32)
+
+        # Add floor and ceiling slabs (voxel format: cx, cy, cz, hx, hy, hz)
+        floor_ceiling = torch.tensor([
+            [4.0, 0.0, -0.1, 4.0, 9.0, 0.1],  # floor: z in [-0.2, 0.0]
+            [4.0, 0.0,  2.1, 4.0, 9.0, 0.1],  # ceiling: z in [2.0, 2.2]
+        ], device=device, dtype=torch.float32)
+
+        voxels_tensor = torch.cat([walls_tensor, floor_ceiling], dim=0)
+        # Replicate for batch: [B, N_voxels, 6]
+        self.voxels = voxels_tensor.unsqueeze(0).repeat(B, 1, 1)
+
+        # ---------------------------------------------------------------------
+        # Drone & Path Initialization
+        # ---------------------------------------------------------------------
+        self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
+        self.drone_radius = random.uniform(0.1, 0.15)
+        if self.single:
+            self.n_drones_per_group = 1
+        else:
+            self.n_drones_per_group = 8 # Default to 8 or choice
+
+        self.max_speed = 5.0 * self.speed_mtp
+        self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
+        
+        # Generate random start/end points
+        starts = []
+        ends = []
+        for _ in range(B):
+            sc = random.randint(0, cols-1)
+            sr = random.randint(0, rows-1)
+            ec = random.randint(0, cols-1)
+            er = random.randint(0, rows-1)
+            # Ensure start != end
+            while (sc, sr) == (ec, er):
+                 ec = random.randint(0, cols-1)
+                 er = random.randint(0, rows-1)
+            
+            starts.append([sc + 0.5, sr - 9.0 + 0.5, 1.0])
+            ends.append([ec + 0.5, er - 9.0 + 0.5, 1.0])
+            
+        p = torch.tensor(starts, device=device)
+        self.p_target = torch.tensor(ends, device=device)
+        self.p = p + torch.randn_like(p) * 0.1 # Add small noise to start
+
+        # Timings & Dynamics
+        self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
+        self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
+
+        self.v = torch.randn((B, 3), device=device) * 0.2
+        self.v_wind = torch.randn((B, 3), device=device) * self.v_wind_w
+        self.act = torch.randn_like(self.v) * 0.1
+        self.a = self.act
+        self.dg = torch.randn((B, 3), device=device) * 0.2
+
+        R = torch.zeros((B, 3, 3), device=device)
+        self.R = quadsim_cuda.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
+            torch.zeros_like(self.yaw_ctl_delay), 5)
+        self.R_old = self.R.clone()
+        self.p_old = self.p
+        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+
+        # drag coef
+        self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
+        self.drag_2[:, 0] = 0
+        self.z_drag_coef = torch.ones((B, 1), device=device)
+
+    @staticmethod
+    @torch.no_grad()
+    def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=5):
+        self_forward_vec = R[..., 0]
+        g_std = torch.tensor([0, 0, -9.80665], device=R.device)
+        a_thr = a_thr - g_std
+        thrust = torch.norm(a_thr, 2, -1, True)
+        self_up_vec = a_thr / thrust
+        forward_vec = self_forward_vec * yaw_inertia + v_pred
+        forward_vec = self_forward_vec * alpha + F.normalize(forward_vec, 2, -1) * (1 - alpha)
+        forward_vec[:, 2] = (forward_vec[:, 0] * self_up_vec[:, 0] + forward_vec[:, 1] * self_up_vec[:, 1]) / -self_up_vec[2]
+        self_forward_vec = F.normalize(forward_vec, 2, -1)
+        self_left_vec = torch.cross(self_up_vec, self_forward_vec)
+        return torch.stack([
+            self_forward_vec,
+            self_left_vec,
+            self_up_vec,
+        ], -1)
+
+    def render(self, ctl_dt):
+        canvas = torch.empty((self.batch_size, self.height, self.width), device=self.device)
+        # assert canvas.is_contiguous()
+        # assert nearest_pt.is_contiguous()
+        # assert self.balls.is_contiguous()
+        # assert self.cyl.is_contiguous()
+        # assert self.voxels.is_contiguous()
+        # assert Rt.is_contiguous()
+        quadsim_cuda.render(canvas, self.flow, self.balls, self.cyl, self.cyl_h,
+                            self.voxels, self.R @ self.R_cam, self.R_old, self.p,
+                            self.p_old, self.drone_radius, self.n_drones_per_group,
+                            self._fov_x_half_tan)
+        return canvas, None
+
+    def find_vec_to_nearest_pt(self):
+        p = self.p + self.v * self.sub_div
+        nearest_pt = torch.empty_like(p)
+        quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
+        return nearest_pt - p
+
+    def run(self, act_pred, ctl_dt=1/15, v_pred=None):
+        self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
+        self.p_old = self.p
+        self.act, self.p, self.v, self.a = run(
+            self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
+            act_pred, self.act, self.p, self.v, self.v_wind, self.a,
+            self.grad_decay, ctl_dt, 0.5)
+        # update attitude
+        alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
+        self.R_old = self.R.clone()
+        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+
+    def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
+        alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
+        self.act = act_pred * (1 - alpha) + self.act * alpha
+        self.dg = self.dg * math.sqrt(1 - ctl_dt) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt)
+        z_drag = 0
+        if self.z_drag_coef is not None:
+            v_up = torch.sum(self.v * self.R[..., 2], -1, keepdim=True) * self.R[..., 2]
+            v_prep = self.v - v_up
+            motor_velocity = (self.act - self.g_std).norm(2, -1, True).sqrt()
+            z_drag = self.z_drag_coef * v_prep * motor_velocity * 0.07
+        drag = self.drag_2 * self.v * self.v.norm(2, -1, True)
+        a_next = self.act + self.dg - z_drag - drag
+        self.p_old = self.p
+        self.p = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
+        self.v = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
+        self.a = a_next
+
+        # update attitude
+        alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
+        self.R_old = self.R.clone()
+        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+
+
+if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    # ---- 迷宫参数（与 reset() 一致） ----
+    cols, rows = 8, 18
+    cell_size = 1.0          # env_maze: 1m 单元格
+    y_offset = 9.0           # rows / 2
+    th = 0.1                 # 墙壁半厚度
+
+    # ---- DFS 生成完整迷宫（保留所有内部墙壁） ----
+    visited = set()
+    stack = [(0, 0)]
+    visited.add((0, 0))
+    passages = set()
+
+    while stack:
+        c, r = stack[-1]
+        neighbors = []
+        for dc, dr in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nc, nr = c + dc, r + dr
+            if 0 <= nc < cols and 0 <= nr < rows and (nc, nr) not in visited:
+                neighbors.append((nc, nr))
+        if neighbors:
+            nc, nr = random.choice(neighbors)
+            visited.add((nc, nr))
+            stack.append((nc, nr))
+            passages.add(tuple(sorted(((c, r), (nc, nr)))))
+        else:
+            stack.pop()
+
+    # ---- 收集墙壁 (center_x, center_y, half_dx, half_dy) ----
+    walls = []
+    # 竖直墙（沿 x 方向的边界）
+    for r in range(rows):
+        for c in range(cols + 1):
+            is_wall = (c == 0 or c == cols)
+            if not is_wall and tuple(sorted(((c - 1, r), (c, r)))) not in passages:
+                is_wall = True
+            if is_wall:
+                cx = float(c) * cell_size
+                cy = (r + 0.5) * cell_size - y_offset
+                walls.append((cx, cy, th, 0.5 * cell_size))
+    # 水平墙（沿 y 方向的边界）
+    for c in range(cols):
+        for r in range(rows + 1):
+            is_wall = (r == 0 or r == rows)
+            if not is_wall and tuple(sorted(((c, r - 1), (c, r)))) not in passages:
+                is_wall = True
+            if is_wall:
+                cx = (c + 0.5) * cell_size
+                cy = float(r) * cell_size - y_offset
+                walls.append((cx, cy, 0.5 * cell_size, th))
+
+    # ---- 随机起点/终点 ----
+    sc, sr = random.randint(0, cols - 1), random.randint(0, rows - 1)
+    ec, er = random.randint(0, cols - 1), random.randint(0, rows - 1)
+    while (sc, sr) == (ec, er):
+        ec, er = random.randint(0, cols - 1), random.randint(0, rows - 1)
+    start = ((sc + 0.5) * cell_size, (sr + 0.5) * cell_size - y_offset)
+    goal  = ((ec + 0.5) * cell_size, (er + 0.5) * cell_size - y_offset)
+
+    # ---- 绘图 ----
+    fig, ax = plt.subplots(figsize=(6, 12))
+    ax.set_title('env_maze.py — Full Maze (8×18, cell=1m, wall=0.2m)', fontsize=13)
+
+    for cx, cy, hdx, hdy in walls:
+        rect = patches.Rectangle((cx - hdx, cy - hdy), 2 * hdx, 2 * hdy,
+                                  linewidth=0.3, edgecolor='black', facecolor='#4a4a4a')
+        ax.add_patch(rect)
+
+    ax.plot(*start, 'go', markersize=10, label='Start')
+    ax.plot(*goal,  'r*', markersize=14, label='Goal')
+
+    ax.set_xlim(-0.5, cols * cell_size + 0.5)
+    ax.set_ylim(-y_offset - 0.5, y_offset + 0.5)
+    ax.set_aspect('equal')
+    ax.legend(loc='upper right')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+
+    out_path = 'maze_full_topview.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {out_path}')

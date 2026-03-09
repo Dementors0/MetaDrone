@@ -217,8 +217,8 @@ class Env:
         self.p_target = torch.tensor(ends, device=device)
         self.p = p + torch.randn_like(p) * 0.1 # Add small noise to start
 
-        # Timings & Dynamics
-        self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
+        # Timings & Dynamics (pitch delay 6 for maze agility, was 12)
+        self.pitch_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
         self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
 
         self.v = torch.randn((B, 3), device=device) * 0.2
@@ -229,7 +229,7 @@ class Env:
 
         R = torch.zeros((B, 3, 3), device=device)
         self.R = quadsim_cuda.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
-            torch.zeros_like(self.yaw_ctl_delay), 5)
+            torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p
         self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
@@ -241,7 +241,7 @@ class Env:
 
     @staticmethod
     @torch.no_grad()
-    def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=5):
+    def update_state_vec(R, a_thr, v_pred, alpha, yaw_inertia=2):
         self_forward_vec = R[..., 0]
         g_std = torch.tensor([0, 0, -9.80665], device=R.device)
         a_thr = a_thr - g_std
@@ -288,7 +288,7 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
 
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
@@ -310,7 +310,7 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
+        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
 
 
 if __name__ == '__main__':

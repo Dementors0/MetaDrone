@@ -50,13 +50,13 @@ class LossGenNet(nn.Module):
         self.pre_norm = nn.LayerNorm(hidden_dim)
         self.out_norm = nn.LayerNorm(hidden_dim)
 
-        # 4. 输出头 (多层 MLP)
+        # 4. 输出头 (Sigmoid独立激活, 打破Softmax零和竞争)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, 5),  # [Vel, Dir, Obs, Expl, Smooth]
-            nn.Softmax(dim=-1)
         )
+        self.weight_floor = 0.05  # 每通道最小权重, 防止坍缩至0
 
     def forward(self, depth_feat, state, hx=None):
         """
@@ -95,8 +95,9 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成权重
-        weights = self.head(last_token)
+        # 5. 生成权重 (Sigmoid独立激活 + 下界保护)
+        raw = self.head(last_token)
+        weights = torch.sigmoid(raw) * (1.0 - self.weight_floor) + self.weight_floor
         
         # 返回 weights 和 新的记忆序列
         return weights, seq

@@ -70,6 +70,23 @@ class RunningMeanStd(nn.Module):
                 self.count.copy_(tot_count)
         return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
 
+class LossNormalizer:
+    """Tracks running std of each loss component for scale normalization.
+    Ensures all loss components contribute equally regardless of raw magnitude.
+    Division is differentiable; statistics are detached."""
+    def __init__(self, n_losses, momentum=0.01):
+        self.running_std = [1.0] * n_losses
+        self.momentum = momentum
+
+    def normalize(self, *losses):
+        normalized = []
+        for i, loss in enumerate(losses):
+            with torch.no_grad():
+                batch_std = max(loss.std().item(), 1e-6)
+                self.running_std[i] = (1 - self.momentum) * self.running_std[i] + self.momentum * batch_std
+            normalized.append(loss / self.running_std[i])
+        return normalized
+
 ########### 1. 参数配置 ##########
 parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
@@ -89,9 +106,11 @@ parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--lgn_timesteps', type=int, default=48,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
-parser.add_argument('--detach_interval', type=int, default=8,
+parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
 parser.add_argument('--cam_angle', type=int, default=10)
+parser.add_argument('--goal_radius', type=float, default=0.5,
+                    help='Episode terminates when all drones are within this radius of their goal')
 
 # Transformer memory参数
 parser.add_argument('--worker_max_seq_len', type=int, default=32)
@@ -109,9 +128,9 @@ parser.add_argument('--no_odom', default=False, action='store_true')
 # 学习率
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--lgn_lr', type=float, default=5e-4)
-parser.add_argument('--inner_lr', type=float, default=1e-4,
+parser.add_argument('--inner_lr', type=float, default=5e-3,
                     help='Inner loop LR for differentiable worker update in LGN phase')
-parser.add_argument('--inner_steps', type=int, default=1,
+parser.add_argument('--inner_steps', type=int, default=3,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
@@ -181,6 +200,8 @@ optim_worker = AdamW(worknet.parameters(), args.lr)
 optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 
+loss_normalizer = LossNormalizer(5)  # normalize 5 loss components to equal scale
+
 ########## 6. 辅助函数 ##########
 scaler_q = defaultdict(list)
 
@@ -225,8 +246,12 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     Validation rollout with virtually-updated worker params (via functional_call).
     Computes and returns meta_loss (position + collision + control) plus components.
     LGN is NOT needed here — meta_loss is purely task-performance based.
+    Reuses the same maze layout for consistent LGN signal.
     """
+    # [问题5] 保存迷宫布局, reset后恢复, 确保emeta评估与proxy在同一张地图上
+    saved_voxels = env.voxels
     env.reset()
+    env.voxels = saved_voxels
 
     p_list, v_list, vec_list = [], [], []
     act_buf = [env.act.detach()] * 2
@@ -266,6 +291,12 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
         env.run(real_act, ctl_dt, target_v_raw)
 
+        # Early termination when all drones reach their goals
+        with torch.no_grad():
+            _dist_to_goal_val = torch.norm(env.p - env.p_target, 2, -1)
+            if t >= 10 and (_dist_to_goal_val < args.goal_radius).all():
+                break
+
         # 周期性截断以限制显存
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
             if h_val is not None:
@@ -283,8 +314,12 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
     m_coll = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
     m_ctrl = act_val.norm(2, -1).sum()
+    # [问题1] Meta rollout也加入高度惩罚
+    m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
+               + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
+               + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = m_pos + m_coll * 5.0 + m_ctrl * 0.000001
+    meta_val = m_pos + m_coll * 5.0 + m_ctrl * 0.000001 + m_height * 2.0
     return meta_val, m_pos, m_coll, m_ctrl
 
 ########## 7. 训练主循环 ##########
@@ -352,6 +387,12 @@ for i in pbar:
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
 
+        # Early termination when all drones reach their goals
+        with torch.no_grad():
+            _dist_to_goal = torch.norm(env.p - env.p_target, 2, -1)
+            if t >= 10 and (_dist_to_goal < args.goal_radius).all():
+                break
+
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
             if h is not None:
                 h = h.detach()
@@ -368,41 +409,72 @@ for i in pbar:
     if vec_to_pt.dim() == 4: vec_to_pt = vec_to_pt.mean(1)
     
     # 1. 计算各项 Raw Loss (保留 [T, B] 维度用于 Step-wise 加权)
-    loss_speed_seq = F.smooth_l1_loss(v_history.norm(2, -1), 
-                                      torch.ones_like(v_history.norm(2, -1)) * 5.0, 
-                                      reduction='none')
-    
+
+    # 碰撞距离 (先计算, 后续速度目标依赖它)
+    dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
+
+    # [问题3] 自适应速度目标: 近障碍物/近终点时自动减速
+    speed_actual = v_history.norm(2, -1)  # [T, B]
+    dist_to_goal = (env.p_target - p_history).norm(2, -1)  # [T, B]
+    v_max = float(env.max_speed)
+    speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
+    speed_factor_goal = torch.clamp(dist_to_goal / 1.0, 0.0, 1.0)  # 终点1m内线性减速
+    v_target_adaptive = v_max * (0.3 + 0.7 * speed_factor_obs) * speed_factor_goal
+    loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
+
     target_dir = F.normalize(env.p_target - p_history, dim=-1)
     v_dir = F.normalize(v_history, dim=-1)
     loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
-    
-    dist_obj = vec_to_pt.norm(2, -1) - env.margin
-    loss_avoidance_seq = F.softplus(-dist_obj * 10.0)
-    
+
+    # [问题2] 多尺度避障 + 前瞻碰撞预测
+    vec_to_pt_dir = F.normalize(vec_to_pt, dim=-1)
+    approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
+    dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
+    dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
+    loss_avoidance_seq = (F.softplus(-dist_obj * 32.0) +
+                          0.5 * F.softplus(-dist_obj * 3.0) +
+                          0.3 * F.softplus(-dist_future_02 * 10.0) +
+                          0.2 * F.softplus(-dist_future_04 * 10.0))
+
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
-    
-    # Smoothness: act_buffer 长度比 timestep 多, 取最后 rollout_steps 步
-    loss_smooth_seq = act_buffer.diff(1, 0)[-rollout_steps:].pow(2).sum(-1)
+
+    # Smoothness: act_buffer 长度比 timestep 多, 取最后 actual_T 步 (支持 early termination)
+    actual_T = p_history.shape[0]
+    loss_smooth_seq = act_buffer.diff(1, 0)[-actual_T:].pow(2).sum(-1)
+
+    # [问题1] 高度约束损失 (固定权重, 不经LGN控制)
+    z_pos = p_history[:, :, 2]  # [T, B]
+    z_target = 1.0  # 迷宫中层高度
+    z_min, z_max = 0.15, 1.85
+    loss_height_seq = (F.smooth_l1_loss(z_pos, torch.full_like(z_pos, z_target), reduction='none')
+                       + F.softplus((z_pos - z_max) * 20.0)
+                       + F.softplus((z_min - z_pos) * 20.0))
+
+    # [问题5] 归一化各损失项到相同尺度 (可微除法, stats detached)
+    loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n, loss_smooth_n = \
+        loss_normalizer.normalize(loss_speed_seq, loss_direction_seq, loss_avoidance_seq,
+                                  loss_exploration_seq, loss_smooth_seq)
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
-        weights_seq[:, :, 0] * loss_speed_seq +
-        weights_seq[:, :, 1] * loss_direction_seq +
-        (weights_seq[:, :, 2] + 0.2) * loss_avoidance_seq +
-        (weights_seq[:, :, 3] + 0.1) * loss_exploration_seq +
-        weights_seq[:, :, 4] * loss_smooth_seq
+        weights_seq[:, :, 0] * loss_speed_n +
+        weights_seq[:, :, 1] * loss_dir_n +
+        (weights_seq[:, :, 2] + 0.2) * loss_avoid_n +
+        (weights_seq[:, :, 3] + 0.1) * loss_expl_n +
+        weights_seq[:, :, 4] * loss_smooth_n
     )
 
-    # 3. 最终 Proxy Loss
-    proxy_loss = weighted_loss_map.mean()
+    # 3. 最终 Proxy Loss (含固定权重的高度约束)
+    proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
 
     # --- Meta Loss Components ---
     loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
     loss_meta_coll = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
+    loss_meta_height = loss_height_seq.mean()
 
-    meta_loss = loss_meta_pos + loss_meta_coll * 5.0 + loss_meta_ctrl * 0.000001
+    meta_loss = loss_meta_pos + loss_meta_coll * 5.0 + loss_meta_ctrl * 0.000001 + loss_meta_height * 2.0
 
     ###### C. Optimization ######
     optim_worker.zero_grad()
@@ -428,9 +500,12 @@ for i in pbar:
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
             unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
 
-        # Step 3: 反向传播贯穿整条链路
+        # Step 3: 反向传播贯穿整条链路 + 熵正则化
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        meta_loss_unrolled.backward()
+        # [问题5] 熵正则化: 鼓励LGN权重多样性, 防止坍缩
+        weight_ent = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(-1).mean()
+        lgn_total = meta_loss_unrolled - 0.1 * weight_ent
+        lgn_total.backward()
         nn.utils.clip_grad_norm_(lgn.parameters(), 1.0)
         optim_lgn.step()
 
@@ -479,11 +554,13 @@ for i in pbar:
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Smoothness': loss_smooth_seq.mean(),
+            'Proxy_Comp/5_Height': loss_height_seq.mean(),
 
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
             'Meta_Comp/2_Collision': loss_meta_coll,
             'Meta_Comp/3_Control': loss_meta_ctrl,
+            'Meta_Comp/4_Height': loss_meta_height,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -491,6 +568,8 @@ for i in pbar:
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),
             'Metrics/Max_Speed': v_norm.max(),
+            'Metrics/Episode_Length': actual_T,
+            'Metrics/Adaptive_Speed_Target': v_target_adaptive.mean(),
 
             # === [对齐] 归一化统计命名（与第二脚本风格一致） ===
             'Norm/State_Mean': state_normalizer.mean[0],

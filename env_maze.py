@@ -40,6 +40,11 @@ class RunFunction(torch.autograd.Function):
 run = RunFunction.apply
 
 
+def safe_normalize(x, dim=-1, eps=1e-6):
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return F.normalize(x, p=2, dim=dim, eps=eps)
+
+
 class Env:
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
@@ -120,7 +125,10 @@ class Env:
         # ---------------------------------------------------------------------
         # Grid: 8x18 cells -> 1m grid cells roughly covering x[0,8], y[-9,9]
         cols, rows = 8, 18
-        
+        self.maze_cols = cols
+        self.maze_rows = rows
+        self.maze_cell_size = 1.0
+
         # Iterative DFS for maze generation (single layout for batch efficiency)
         visited = set()
         stack = [(0, 0)]
@@ -228,13 +236,81 @@ class Env:
         self.dg = torch.randn((B, 3), device=device) * 0.2
 
         R = torch.zeros((B, 3, 3), device=device)
-        self.R = quadsim_cuda.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
+        self.R = quadsim_cuda.update_state_vec(R, self.act, torch.randn((B, 3), device=device) * 0.2 + safe_normalize(self.p_target - self.p),
             torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p
         self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
 
         # drag coef
+        self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
+        self.drag_2[:, 0] = 0
+        self.z_drag_coef = torch.ones((B, 1), device=device)
+
+    def reset_drone_only(self):
+        """Reset drone states (positions, velocities, attitudes) while keeping the current maze layout.
+        This enables training on the same maze for multiple episodes, giving LGN a stable
+        optimisation landscape and improving its bilevel gradient signal."""
+        B = self.batch_size
+        device = self.device
+        cols = self.maze_cols
+        rows = self.maze_rows
+
+        cam_angle = (self.cam_angle + torch.randn(B, device=device)) * math.pi / 180
+        zeros = torch.zeros_like(cam_angle)
+        ones = torch.ones_like(cam_angle)
+        self.R_cam = torch.stack([
+            torch.cos(cam_angle), zeros, -torch.sin(cam_angle),
+            zeros, ones, zeros,
+            torch.sin(cam_angle), zeros, torch.cos(cam_angle),
+        ], -1).reshape(B, 3, 3)
+
+        self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
+        self.drone_radius = random.uniform(0.1, 0.15)
+        if self.single:
+            self.n_drones_per_group = 1
+        else:
+            self.n_drones_per_group = 8
+
+        self.max_speed = 5.0 * self.speed_mtp
+        self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
+
+        # Generate random start/end points within the existing maze
+        starts = []
+        ends = []
+        for _ in range(B):
+            sc = random.randint(0, cols - 1)
+            sr = random.randint(0, rows - 1)
+            ec = random.randint(0, cols - 1)
+            er = random.randint(0, rows - 1)
+            while (sc, sr) == (ec, er):
+                ec = random.randint(0, cols - 1)
+                er = random.randint(0, rows - 1)
+            starts.append([sc + 0.5, sr - 9.0 + 0.5, 1.0])
+            ends.append([ec + 0.5, er - 9.0 + 0.5, 1.0])
+
+        p = torch.tensor(starts, device=device)
+        self.p_target = torch.tensor(ends, device=device)
+        self.p = p + torch.randn_like(p) * 0.1
+
+        self.pitch_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
+        self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
+
+        self.v = torch.randn((B, 3), device=device) * 0.2
+        self.v_wind = torch.randn((B, 3), device=device) * self.v_wind_w
+        self.act = torch.randn_like(self.v) * 0.1
+        self.a = self.act
+        self.dg = torch.randn((B, 3), device=device) * 0.2
+
+        R = torch.zeros((B, 3, 3), device=device)
+        self.R = quadsim_cuda.update_state_vec(
+            R, self.act,
+            torch.randn((B, 3), device=device) * 0.2 + safe_normalize(self.p_target - self.p),
+            torch.zeros_like(self.yaw_ctl_delay), 2)
+        self.R_old = self.R.clone()
+        self.p_old = self.p
+        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
         self.drag_2[:, 0] = 0
         self.z_drag_coef = torch.ones((B, 1), device=device)
@@ -279,16 +355,24 @@ class Env:
         return nearest_pt - p
 
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):
+        act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        if v_pred is not None:
+            v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
         self.act, self.p, self.v, self.a = run(
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
             self.grad_decay, ctl_dt, 0.5)
+        self.act = torch.nan_to_num(self.act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
+        self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        self.a = torch.nan_to_num(self.a, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
+        self.R = torch.nan_to_num(self.R, nan=0.0, posinf=1.0, neginf=-1.0)
 
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)

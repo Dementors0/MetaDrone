@@ -50,6 +50,7 @@ class RunningMeanStd(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, x, update=True):
+        x = sanitize_tensor(x, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if update:
             with torch.no_grad():
                 batch_mean = x.mean(dim=0)
@@ -82,10 +83,27 @@ class LossNormalizer:
         normalized = []
         for i, loss in enumerate(losses):
             with torch.no_grad():
-                batch_std = max(loss.std().item(), 1e-6)
+                batch_std = loss.detach().std()
+                if not torch.isfinite(batch_std):
+                    batch_std = torch.tensor(1.0, device=loss.device)
+                batch_std = max(batch_std.item(), 1e-6)
                 self.running_std[i] = (1 - self.momentum) * self.running_std[i] + self.momentum * batch_std
             normalized.append(loss / self.running_std[i])
         return normalized
+
+
+def safe_normalize(x, dim=-1, eps=1e-6):
+    return F.normalize(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, eps=eps)
+
+
+def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
+    return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+
+
+@torch.no_grad()
+def sanitize_module_(module, clamp_value=10.0):
+    for p in module.parameters():
+        p.data = sanitize_tensor(p.data, nan=0.0, posinf=clamp_value, neginf=-clamp_value).clamp(-clamp_value, clamp_value)
 
 ########### 1. 参数配置 ##########
 parser = argparse.ArgumentParser()
@@ -111,6 +129,8 @@ parser.add_argument('--detach_interval', type=int, default=12,
 parser.add_argument('--cam_angle', type=int, default=10)
 parser.add_argument('--goal_radius', type=float, default=0.5,
                     help='Episode terminates when all drones are within this radius of their goal')
+parser.add_argument('--maze_update_interval', type=int, default=50,
+                    help='Regenerate maze every N iterations; drone-only reset in between for stable LGN signal')
 
 # Transformer memory参数
 parser.add_argument('--worker_max_seq_len', type=int, default=32)
@@ -127,8 +147,8 @@ parser.add_argument('--no_odom', default=False, action='store_true')
 
 # 学习率
 parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--lgn_lr', type=float, default=5e-4)
-parser.add_argument('--inner_lr', type=float, default=5e-3,
+parser.add_argument('--lgn_lr', type=float, default=2e-4)
+parser.add_argument('--inner_lr', type=float, default=1e-3,
                     help='Inner loop LR for differentiable worker update in LGN phase')
 parser.add_argument('--inner_steps', type=int, default=3,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
@@ -248,10 +268,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     LGN is NOT needed here — meta_loss is purely task-performance based.
     Reuses the same maze layout for consistent LGN signal.
     """
-    # [问题5] 保存迷宫布局, reset后恢复, 确保emeta评估与proxy在同一张地图上
-    saved_voxels = env.voxels
-    env.reset()
-    env.voxels = saved_voxels
+    # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
+    env.reset_drone_only()
 
     p_list, v_list, vec_list = [], [], []
     act_buf = [env.act.detach()] * 2
@@ -260,6 +278,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     for t in range(args.lgn_timesteps):
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)
         depth, flow = env.render(ctl_dt)
+        depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
 
         p_list.append(env.p)
         v_list.append(env.v)
@@ -277,16 +296,20 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         if not args.no_odom:
             state_list.insert(0, local_v)
 
-        raw_state = torch.cat(state_list, -1)
+        raw_state = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         state_t = state_normalizer(raw_state, update=False)  # 不更新统计量
+        state_t = sanitize_tensor(state_t, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        x_pooled = F.max_pool2d((3 / depth.clamp_(0.3, 24) - 0.6)[:, None], 4, 4)
+        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
+        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         # Worker forward with virtually-updated params
         act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, state_t, h_val))
+        act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
+        real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw)
@@ -309,7 +332,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     if vec_val.dim() == 4:
         vec_val = vec_val.mean(1)
 
-    dist_val = vec_val.norm(2, -1) - env.margin
+    dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
     m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
     m_coll = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
@@ -319,13 +342,15 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
                + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = m_pos + m_coll * 5.0 + m_ctrl * 0.000001 + m_height * 2.0
+    meta_val = sanitize_tensor(m_pos + m_coll * 5.0 + m_ctrl * 0.000001 + m_height * 2.0,
+                               nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
 ########## 7. 训练主循环 ##########
 pbar = tqdm(range(args.num_iters), ncols=120)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
+maze_update_counter = 0
 
 state_normalizer.train()
 
@@ -334,7 +359,11 @@ for i in pbar:
     train_lgn_phase = cycle_pos < args.lgn_steps
     phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
 
-    env.reset()
+    if maze_update_counter % args.maze_update_interval == 0:
+        env.reset()          # full reset: new maze + new drones
+    else:
+        env.reset_drone_only()  # keep maze, reset drones only
+    maze_update_counter += 1
     worknet.reset()
 
     p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
@@ -351,6 +380,7 @@ for i in pbar:
     for t in range(rollout_steps):
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)
         depth, flow = env.render(ctl_dt)
+        depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
 
         if do_save_viz:
             depth_history.append(depth[0].detach().cpu().clone())
@@ -370,19 +400,24 @@ for i in pbar:
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
-        raw_state_tensor = torch.cat(state_list, -1)
+        raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         state_tensor = state_normalizer(raw_state_tensor, update=True)
+        state_tensor = sanitize_tensor(state_tensor, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        x_pooled = F.max_pool2d((3 / depth.clamp_(0.3, 24) - 0.6)[:, None], 4, 4)
+        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
+        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         # LGN Forward
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
+        current_weights = sanitize_tensor(current_weights, nan=0.2, posinf=1.0, neginf=0.05).clamp(0.05, 1.0)
         trajectory_lgn_weights.append(current_weights)
 
         # Worker Forward
         act, _, h = worknet(x_pooled, state_tensor, h)
+        act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
+        real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buffer.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
@@ -422,12 +457,12 @@ for i in pbar:
     v_target_adaptive = v_max * (0.3 + 0.7 * speed_factor_obs) * speed_factor_goal
     loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
 
-    target_dir = F.normalize(env.p_target - p_history, dim=-1)
-    v_dir = F.normalize(v_history, dim=-1)
+    target_dir = safe_normalize(env.p_target - p_history, dim=-1)
+    v_dir = safe_normalize(v_history, dim=-1)
     loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
 
     # [问题2] 多尺度避障 + 前瞻碰撞预测
-    vec_to_pt_dir = F.normalize(vec_to_pt, dim=-1)
+    vec_to_pt_dir = safe_normalize(vec_to_pt, dim=-1)
     approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
     dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
     dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
@@ -475,11 +510,25 @@ for i in pbar:
     loss_meta_height = loss_height_seq.mean()
 
     meta_loss = loss_meta_pos + loss_meta_coll * 5.0 + loss_meta_ctrl * 0.000001 + loss_meta_height * 2.0
+    proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
+    meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
     ###### C. Optimization ######
     optim_worker.zero_grad()
     optim_lgn.zero_grad()
     lgn_update_loss = 0.0
+
+    rollout_is_finite = bool(
+        torch.isfinite(proxy_loss).all()
+        and torch.isfinite(meta_loss).all()
+        and torch.isfinite(weights_seq).all()
+        and torch.isfinite(p_history).all()
+        and torch.isfinite(v_history).all()
+    )
+
+    if not rollout_is_finite:
+        pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
+        continue
 
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
@@ -492,13 +541,17 @@ for i in pbar:
                 create_graph=True, allow_unused=True, retain_graph=True,
             )
             fast_params = {
-                name: (p - args.inner_lr * g if g is not None else p)
+                name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+                       if g is not None else p)
                 for (name, p), g in zip(fast_params.items(), inner_grads)
             }
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
             unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
+        if not torch.isfinite(meta_loss_unrolled):
+            pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
+            continue
 
         # Step 3: 反向传播贯穿整条链路 + 熵正则化
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
@@ -508,12 +561,14 @@ for i in pbar:
         lgn_total.backward()
         nn.utils.clip_grad_norm_(lgn.parameters(), 1.0)
         optim_lgn.step()
+        sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
     else:
         proxy_loss.backward()
         nn.utils.clip_grad_norm_(worknet.parameters(), 5.0)
         optim_worker.step()
+        sanitize_module_(worknet, clamp_value=10.0)
         sched.step()
 
     ###### D. Logging & Saving (Enhanced) ######
@@ -595,6 +650,7 @@ for i in pbar:
                 writer.add_scalar(k, sum(v) / len(v), i + 1)
             scaler_q.clear()
             writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
+            writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
 
         if is_save_iter(i):
             torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))

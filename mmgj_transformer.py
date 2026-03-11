@@ -27,12 +27,12 @@ if torch.cuda.is_available():
     print("[SDP] flash=False, mem_efficient=False, math=True (for higher-order gradients)")
 
 try:
-    from env_maze import Env
+    from env_cuda import Env
 except ModuleNotFoundError:
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
-    from env_maze import Env
+    from env_cuda import Env
 try:
     from WorkNet_transformer import WorkNet
     from LossGenNet_transformer import LossGenNet
@@ -98,6 +98,26 @@ def safe_normalize(x, dim=-1, eps=1e-6):
 
 def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
     return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+
+
+def build_yaw_only_rotation(R_full, eps=1e-6):
+    """Build a navigation frame that keeps yaw only and removes roll/pitch.
+
+    This matches the coordinate convention used in main_cuda.py so pretrained
+    workers see the same local state semantics in mmgj training.
+    """
+    fwd = R_full[:, :, 0].clone()
+    fwd[:, 2] = 0.0
+
+    fwd_norm = torch.norm(fwd, 2, -1, keepdim=True)
+    fallback = torch.zeros_like(fwd)
+    fallback[:, 0] = 1.0
+    fwd = torch.where(fwd_norm > eps, fwd / fwd_norm.clamp_min(eps), fallback)
+
+    up = torch.zeros_like(fwd)
+    up[:, 2] = 1.0
+    left = safe_normalize(torch.cross(up, fwd, dim=-1), dim=-1, eps=eps)
+    return torch.stack([fwd, left, up], -1)
 
 
 @torch.no_grad()
@@ -203,7 +223,13 @@ state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
 def load_checkpoint(model, path, name):
     if path and os.path.isfile(path):
         print(f"Loading {name} from {path}")
-        model.load_state_dict(torch.load(path, map_location=device), strict=False)
+        missing_keys, unexpected_keys = model.load_state_dict(
+            torch.load(path, map_location=device), strict=False
+        )
+        if missing_keys:
+            print(f"{name} missing_keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"{name} unexpected_keys: {unexpected_keys}")
     elif path:
         print(f"Warning: {name} path provided but file not found: {path}")
 
@@ -290,9 +316,9 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                                     dtype=target_v_norm.dtype)
         target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
 
-        R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
+        R_local = build_yaw_only_rotation(env.R)
+        state_list = [torch.squeeze(target_v[:, None] @ R_local, 1), env.R[:, 2], env.margin[:, None]]
+        local_v = torch.squeeze(env.v[:, None] @ R_local, 1)
         if not args.no_odom:
             state_list.insert(0, local_v)
 
@@ -307,7 +333,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, state_t, h_val))
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
+        a_pred, v_pred, *_ = (R_local @ act_out.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
@@ -346,6 +372,170 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                                nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
+
+def log_trajectory_visualizations(writer, global_step, p_history, v_history, weights_seq, depth_history, env, title_prefix):
+    idx = 0
+
+    # 1. 轨迹时序图 (X,Y,Z vs T)
+    fig_p, ax = plt.subplots()
+    p_cpu = p_history[:, idx].cpu()
+    ax.plot(p_cpu[:, 0], label='x'); ax.plot(p_cpu[:, 1], label='y'); ax.plot(p_cpu[:, 2], label='z')
+    ax.legend(); ax.set_title(f"{title_prefix} Pos (Time Series)")
+    writer.add_figure('Trajectory/Position_Series', fig_p, global_step)
+    plt.close(fig_p)
+
+    # 2. 轨迹俯视图 + 障碍物 + 目标点 (速度热力图)
+    fig_map, ax = plt.subplots(figsize=(6, 10))
+    if hasattr(env, 'voxels'):
+        walls = env.voxels[0].detach().cpu().numpy()
+        for w in walls:
+            # 过滤地板/天花板，仅显示中间层障碍物
+            if w[2] < 0.1 or w[2] > 1.9:
+                continue
+            rect = plt.Rectangle((w[0] - w[3], w[1] - w[4]), 2 * w[3], 2 * w[4], color='gray', alpha=0.5)
+            ax.add_patch(rect)
+
+    # 速度热力图轨迹: 蓝(慢) -> 红(快), 范围 0-10 m/s
+    v_cpu = v_history[:, idx].cpu()
+    speed_cpu = v_cpu.norm(dim=-1).numpy()  # [T]
+    points = p_cpu[:, :2].numpy()            # [T, 2] (X, Y)
+    segments = []
+    seg_speeds = []
+    for si in range(len(points) - 1):
+        segments.append([points[si], points[si + 1]])
+        seg_speeds.append((speed_cpu[si] + speed_cpu[si + 1]) / 2.0)
+
+    norm = Normalize(vmin=0.0, vmax=10.0)
+    cmap = cm.get_cmap('coolwarm')  # 蓝(低速) -> 红(高速)
+    if segments:
+        lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=2)
+        lc.set_array(torch.tensor(seg_speeds).numpy())
+        ax.add_collection(lc)
+        fig_map.colorbar(lc, ax=ax, label='Speed (m/s)')
+    else:
+        ax.plot(points[:, 0], points[:, 1], color=cmap(norm(float(speed_cpu[0]) if len(speed_cpu) > 0 else 0.0)), linewidth=2)
+
+    ax.plot(p_cpu[0, 0], p_cpu[0, 1], 'go', markersize=8, label='Start')   # 起点
+    ax.plot(p_cpu[-1, 0], p_cpu[-1, 1], 'kx', markersize=8, label='End')    # 终点
+    if hasattr(env, 'p_target'):
+        target = env.p_target[idx].detach().cpu().numpy()
+        ax.plot(target[0], target[1], 'r*', markersize=10, label='Goal')
+
+    if all(hasattr(env, k) for k in ['maze_cols', 'maze_rows', 'maze_cell_size']):
+        maze_w = float(env.maze_cols) * float(env.maze_cell_size)
+        maze_h = float(env.maze_rows) * float(env.maze_cell_size)
+        ax.set_xlim(0.0, maze_w)
+        ax.set_ylim(-maze_h / 2.0, maze_h / 2.0)
+    else:
+        ax.autoscale_view()
+
+    ax.set_aspect('equal')
+    ax.legend(); ax.set_title(f"{title_prefix} Map & Trajectory (Speed Heatmap)")
+    writer.add_figure('Trajectory/Map_View', fig_map, global_step)
+    plt.close(fig_map)
+
+    # 3. 速度时序图 (Vx,Vy,Vz,Speed)
+    fig_v, ax = plt.subplots()
+    ax.plot(v_cpu[:, 0], label='vx'); ax.plot(v_cpu[:, 1], label='vy'); ax.plot(v_cpu[:, 2], label='vz')
+    ax.plot(v_cpu.norm(dim=-1), label='speed', linestyle='--')
+    ax.legend(); ax.set_title(f"{title_prefix} Velocity (Time Series)")
+    writer.add_figure('Trajectory/Velocity_Series', fig_v, global_step)
+    plt.close(fig_v)
+
+    # 4. 权重时序变化图 - 验证 Step-wise 效果
+    fig_w, ax = plt.subplots()
+    w_cpu = weights_seq[:, idx, :].cpu() # [T, 5]
+    labels = ['Speed', 'Dir', 'Avoid', 'Expl', 'Smooth']
+    for wi in range(5):
+        ax.plot(w_cpu[:, wi], label=labels[wi])
+    ax.legend(); ax.set_title(f"{title_prefix} Weights Profile (Per Step)")
+    writer.add_figure('Debug/Weights_StepWise', fig_w, global_step)
+    plt.close(fig_w)
+
+    # 5. 深度图视频
+    if len(depth_history) > 0:
+        depth_stack = torch.stack(depth_history)
+        d_min = depth_stack.min()
+        d_max = depth_stack.max()
+        depth_norm = (depth_stack - d_min) / (d_max - d_min + 1e-6)
+        vid_tensor = depth_norm.unsqueeze(0).unsqueeze(2)  # [1, T, 1, H, W]
+        writer.add_video('Video/Depth_View', vid_tensor, global_step, fps=15)
+
+
+@torch.no_grad()
+def save_initial_trajectory_snapshot(env, worknet, lgn, state_normalizer, args, writer, B):
+    env.reset()
+    worknet.reset()
+
+    p_history, v_history = [], []
+    depth_history = []
+    trajectory_lgn_weights = []
+    h = None
+    lgn_hx = None
+
+    for t in range(args.timesteps):
+        ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+        depth, flow = env.render(ctl_dt)
+        depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
+        depth_history.append(depth[0].detach().cpu().clone())
+
+        p_history.append(env.p.detach().clone())
+        v_history.append(env.v.detach().clone())
+
+        target_v_raw = env.p_target - env.p.detach()
+        target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
+        max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device, dtype=target_v_norm.dtype)
+        target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
+
+        R_local = build_yaw_only_rotation(env.R)
+        state_list = [torch.squeeze(target_v[:, None] @ R_local, 1), env.R[:, 2], env.margin[:, None]]
+        local_v = torch.squeeze(env.v[:, None] @ R_local, 1)
+        if not args.no_odom:
+            state_list.insert(0, local_v)
+
+        raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        state_tensor = state_normalizer(raw_state_tensor, update=False)
+        state_tensor = sanitize_tensor(state_tensor, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
+        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+        current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
+        current_weights = sanitize_tensor(current_weights, nan=0.2, posinf=1.0, neginf=0.05).clamp(0.05, 1.0)
+        trajectory_lgn_weights.append(current_weights.detach().clone())
+
+        act, _, h = worknet(x_pooled, state_tensor, h)
+        act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        a_pred, v_pred, *_ = (R_local @ act.reshape(B, 3, -1)).unbind(-1)
+        real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
+        real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+
+        env.run(real_act, ctl_dt, target_v_raw)
+
+        dist_to_goal = torch.norm(env.p - env.p_target, 2, -1)
+        if t >= 10 and (dist_to_goal < args.goal_radius).all():
+            break
+
+        if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
+            if h is not None:
+                h = h.detach()
+            if lgn_hx is not None:
+                lgn_hx = lgn_hx.detach()
+
+    if len(p_history) == 0 or len(v_history) == 0 or len(trajectory_lgn_weights) == 0:
+        return
+
+    log_trajectory_visualizations(
+        writer,
+        global_step=0,
+        p_history=torch.stack(p_history),
+        v_history=torch.stack(v_history),
+        weights_seq=torch.stack(trajectory_lgn_weights),
+        depth_history=depth_history,
+        env=env,
+        title_prefix='Initial'
+    )
+
 ########## 7. 训练主循环 ##########
 pbar = tqdm(range(args.num_iters), ncols=120)
 B = args.batch_size
@@ -353,6 +543,7 @@ cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
 
 state_normalizer.train()
+save_initial_trajectory_snapshot(env, worknet, lgn, state_normalizer, args, writer, B)
 
 for i in pbar:
     cycle_pos = i % cycle_len
@@ -395,9 +586,9 @@ for i in pbar:
         target_v = (target_v_raw_curr / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
         target_v_history.append(target_v)
 
-        R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
+        R_local = build_yaw_only_rotation(env.R)
+        state_list = [torch.squeeze(target_v[:, None] @ R_local, 1), env.R[:, 2], env.margin[:, None]]
+        local_v = torch.squeeze(env.v[:, None] @ R_local, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
         raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
@@ -415,7 +606,7 @@ for i in pbar:
         # Worker Forward
         act, _, h = worknet(x_pooled, state_tensor, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-        a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+        a_pred, v_pred, *_ = (R_local @ act.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buffer.append(real_act)
@@ -451,7 +642,7 @@ for i in pbar:
     # [问题3] 自适应速度目标: 近障碍物/近终点时自动减速
     speed_actual = v_history.norm(2, -1)  # [T, B]
     dist_to_goal = (env.p_target - p_history).norm(2, -1)  # [T, B]
-    v_max = float(env.max_speed)
+    v_max = torch.as_tensor(env.max_speed, device=speed_actual.device, dtype=speed_actual.dtype).reshape(1, -1)
     speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
     speed_factor_goal = torch.clamp(dist_to_goal / 1.0, 0.0, 1.0)  # 终点1m内线性减速
     v_target_adaptive = v_max * (0.3 + 0.7 * speed_factor_obs) * speed_factor_goal
@@ -584,7 +775,9 @@ for i in pbar:
         weight_entropy = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(dim=-1).mean()
         v_norm = v_history.norm(dim=-1)
         avg_speed = v_norm.mean()
-        min_speed_threshold = float(env.max_speed) * 0.7
+        min_speed_threshold = torch.as_tensor(
+            env.max_speed, device=v_norm.device, dtype=v_norm.dtype
+        ).mean() * 0.7
         
         log_data = {
             # === 主要Loss ===
@@ -656,91 +849,15 @@ for i in pbar:
             torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
             torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
             torch.save(state_normalizer.state_dict(), os.path.join(save_dir, f'norm_ckpt_{i:06d}.pth'))
-            
-            idx = 0
-            
-            # 1. 轨迹时序图 (X,Y,Z vs T)
-            fig_p, ax = plt.subplots()
-            p_cpu = p_history[:, idx].cpu()
-            ax.plot(p_cpu[:, 0], label='x'); ax.plot(p_cpu[:, 1], label='y'); ax.plot(p_cpu[:, 2], label='z')
-            ax.legend(); ax.set_title(f"Iter {i} Pos (Time Series)")
-            writer.add_figure('Trajectory/Position_Series', fig_p, i + 1)
-            plt.close(fig_p)
-
-            # 2. [增强] 轨迹俯视图 + 障碍物 + 目标点 (速度热力图)
-            fig_map, ax = plt.subplots(figsize=(6, 10))
-            if hasattr(env, 'voxels'):
-                walls = env.voxels[0].detach().cpu().numpy()
-                for w in walls:
-                    # 过滤地板/天花板，仅显示中间层障碍物
-                    if w[2] < 0.1 or w[2] > 1.9:
-                        continue
-                    rect = plt.Rectangle((w[0] - w[3], w[1] - w[4]), 2 * w[3], 2 * w[4], color='gray', alpha=0.5)
-                    ax.add_patch(rect)
-
-            # 速度热力图轨迹: 蓝(慢) -> 红(快), 范围 0-10 m/s
-            v_cpu = v_history[:, idx].cpu()
-            speed_cpu = v_cpu.norm(dim=-1).numpy()  # [T]
-            points = p_cpu[:, :2].numpy()            # [T, 2] (X, Y)
-            segments = []
-            seg_speeds = []
-            for si in range(len(points) - 1):
-                segments.append([points[si], points[si + 1]])
-                seg_speeds.append((speed_cpu[si] + speed_cpu[si + 1]) / 2.0)
-            seg_speeds = [speed_cpu[0]] if len(seg_speeds) == 0 else seg_speeds
-
-            norm = Normalize(vmin=0.0, vmax=10.0)
-            cmap = cm.get_cmap('coolwarm')  # 蓝(低速) -> 红(高速)
-            lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=2)
-            lc.set_array(torch.tensor(seg_speeds).numpy())
-            ax.add_collection(lc)
-            cbar = fig_map.colorbar(lc, ax=ax, label='Speed (m/s)')
-
-            ax.plot(p_cpu[0, 0], p_cpu[0, 1], 'go', markersize=8, label='Start')   # 起点
-            ax.plot(p_cpu[-1, 0], p_cpu[-1, 1], 'kx', markersize=8, label='End')    # 终点
-            if hasattr(env, 'p_target'):
-                target = env.p_target[idx].detach().cpu().numpy()
-                ax.plot(target[0], target[1], 'r*', markersize=10, label='Goal')
-
-            if all(hasattr(env, k) for k in ['maze_cols', 'maze_rows', 'maze_cell_size']):
-                maze_w = float(env.maze_cols) * float(env.maze_cell_size)
-                maze_h = float(env.maze_rows) * float(env.maze_cell_size)
-                ax.set_xlim(0.0, maze_w)
-                ax.set_ylim(-maze_h / 2.0, maze_h / 2.0)
-            else:
-                ax.autoscale_view()
-
-            ax.set_aspect('equal')
-            ax.legend(); ax.set_title(f"Iter {i} Map & Trajectory (Speed Heatmap)")
-            writer.add_figure('Trajectory/Map_View', fig_map, i + 1)
-            plt.close(fig_map)
-            
-            # 3. [新增] 速度时序图 (Vx,Vy,Vz,Speed)
-            fig_v, ax = plt.subplots()
-            v_cpu = v_history[:, idx].cpu()
-            ax.plot(v_cpu[:, 0], label='vx'); ax.plot(v_cpu[:, 1], label='vy'); ax.plot(v_cpu[:, 2], label='vz')
-            ax.plot(v_cpu.norm(dim=-1), label='speed', linestyle='--')
-            ax.legend(); ax.set_title(f"Iter {i} Velocity (Time Series)")
-            writer.add_figure('Trajectory/Velocity_Series', fig_v, i + 1)
-            plt.close(fig_v)
-
-            # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
-            fig_w, ax = plt.subplots()
-            w_cpu = weights_seq[:, idx, :].cpu() # [T, 5]
-            labels = ['Speed', 'Dir', 'Avoid', 'Expl', 'Smooth']
-            for wi in range(5):
-                ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step)")
-            writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
-            plt.close(fig_w)
-
-            # 5. [新增] 深度图视频
-            if len(depth_history) > 0:
-                depth_stack = torch.stack(depth_history)
-                d_min = depth_stack.min()
-                d_max = depth_stack.max()
-                depth_norm = (depth_stack - d_min) / (d_max - d_min + 1e-6)
-                vid_tensor = depth_norm.unsqueeze(0).unsqueeze(2)  # [1, T, 1, H, W]
-                writer.add_video('Video/Depth_View', vid_tensor, i + 1, fps=15)
+            log_trajectory_visualizations(
+                writer,
+                global_step=i + 1,
+                p_history=p_history,
+                v_history=v_history,
+                weights_seq=weights_seq,
+                depth_history=depth_history,
+                env=env,
+                title_prefix=f'Iter {i}'
+            )
 
 print(f"Training Finished. Artifacts in: {save_dir}")

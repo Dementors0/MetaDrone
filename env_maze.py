@@ -99,6 +99,11 @@ class Env:
         self.random_rotation = random_rotation
         self.cam_angle = cam_angle
         self.fov_x_half_tan = fov_x_half_tan
+        self.contact_buffer = 0.02
+        self.contact_softness = 0.02
+        self.contact_gate_softness = 0.04
+        self.contact_velocity_softness = 0.10
+        self.contact_normal_damping = 1.0
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
@@ -334,6 +339,57 @@ class Env:
             self_up_vec,
         ], -1)
 
+    def _apply_soft_contacts(self, p_prev, p_free, v_free, a_free, ctl_dt):
+        if self.voxels.numel() == 0:
+            return p_free, v_free, a_free
+
+        vox_centers = self.voxels[..., :3]
+        vox_half = self.voxels[..., 3:]
+        dtype = p_free.dtype
+        radius = torch.as_tensor(float(self.drone_radius), device=p_free.device, dtype=dtype)
+        buffer = torch.as_tensor(self.contact_buffer, device=p_free.device, dtype=dtype)
+        softness = torch.as_tensor(self.contact_softness, device=p_free.device, dtype=dtype)
+        gate_softness = torch.as_tensor(self.contact_gate_softness, device=p_free.device, dtype=dtype)
+        velocity_softness = torch.as_tensor(self.contact_velocity_softness, device=p_free.device, dtype=dtype)
+        dt = torch.as_tensor(max(float(ctl_dt), 1e-4), device=p_free.device, dtype=dtype)
+
+        dp = p_free - p_prev
+        p_mid = 0.5 * (p_prev + p_free)
+        sweep_half = 0.5 * dp.abs().unsqueeze(1) + vox_half + radius
+        overlap_margin = sweep_half - (p_mid.unsqueeze(1) - vox_centers).abs()
+
+        normal_axis = vox_half.argmin(dim=-1)
+        axis_idx = normal_axis.unsqueeze(-1)
+        axis_mask = F.one_hot(normal_axis, num_classes=3).to(dtype=dtype)
+
+        center_n = vox_centers.gather(2, axis_idx).squeeze(-1)
+        half_n = vox_half.gather(2, axis_idx).squeeze(-1)
+        p_prev_n = p_prev.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
+        p_free_n = p_free.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
+        v_free_n = v_free.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
+
+        side = torch.where(p_prev_n >= center_n, torch.ones_like(p_prev_n), -torch.ones_like(p_prev_n))
+        boundary = center_n + side * (half_n + radius + buffer)
+        clearance_free = side * (p_free_n - boundary)
+        penetration = softness * F.softplus(-clearance_free / softness)
+
+        overlap_gate = torch.sigmoid(overlap_margin / gate_softness)
+        overlap_gate = torch.where(axis_mask.bool(), torch.ones_like(overlap_gate), overlap_gate)
+        tangential_gate = overlap_gate.prod(dim=-1)
+        contact_gate = tangential_gate * torch.sigmoid(-clearance_free / gate_softness)
+
+        pos_corr_mag = penetration * tangential_gate
+        pos_corr = (axis_mask * (side * pos_corr_mag).unsqueeze(-1)).sum(dim=1)
+        p_contact = p_free + pos_corr
+
+        inward_speed = velocity_softness * F.softplus(-(side * v_free_n) / velocity_softness)
+        vel_corr_mag = self.contact_normal_damping * inward_speed * contact_gate
+        vel_corr = (axis_mask * (side * vel_corr_mag).unsqueeze(-1)).sum(dim=1)
+        v_contact = v_free + vel_corr
+        a_contact = a_free + (v_contact - v_free) / dt
+
+        return p_contact, v_contact, a_contact
+
     def render(self, ctl_dt):
         canvas = torch.empty((self.batch_size, self.height, self.width), device=self.device)
         # assert canvas.is_contiguous()
@@ -360,11 +416,15 @@ class Env:
             v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
-        self.act, self.p, self.v, self.a = run(
+        self.act, p_free, v_free, a_free = run(
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
             self.grad_decay, ctl_dt, 0.5)
         self.act = torch.nan_to_num(self.act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        p_free = torch.nan_to_num(p_free, nan=0.0, posinf=100.0, neginf=-100.0)
+        v_free = torch.nan_to_num(v_free, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        a_free = torch.nan_to_num(a_free, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
+        self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         self.a = torch.nan_to_num(self.a, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
@@ -387,9 +447,9 @@ class Env:
         drag = self.drag_2 * self.v * self.v.norm(2, -1, True)
         a_next = self.act + self.dg - z_drag - drag
         self.p_old = self.p
-        self.p = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
-        self.v = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
-        self.a = a_next
+        p_free = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
+        v_free = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
+        self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_next, ctl_dt)
 
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)

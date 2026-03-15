@@ -19,6 +19,10 @@ from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import matplotlib.cm as cm
+try:
+    import imageio.v2 as imageio
+except Exception:
+    imageio = None
 
 if torch.cuda.is_available():
     torch.backends.cuda.enable_flash_sdp(False)
@@ -27,12 +31,12 @@ if torch.cuda.is_available():
     print("[SDP] flash=False, mem_efficient=False, math=True (for higher-order gradients)")
 
 try:
-    from env_maze import Env
+    from env_maze_easy import Env
 except ModuleNotFoundError:
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
-    from env_maze import Env
+    from env_maze_easy import Env
 try:
     from WorkNet_transformer import WorkNet
     from LossGenNet_transformer import LossGenNet
@@ -154,6 +158,24 @@ parser.add_argument('--inner_steps', type=int, default=3,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
+# 避障/碰撞超参
+parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
+                    help='Proxy avoidance rises smoothly inside this clearance to walls')
+parser.add_argument('--proxy_avoid_floor', type=float, default=0.8,
+                    help='Minimum avoidance weight added to LGN output in proxy loss')
+parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
+                    help='Soft collision term weight in meta loss')
+parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
+                    help='Hard penetration-depth penalty weight in meta loss')
+parser.add_argument('--meta_coll_event_weight', type=float, default=80.0,
+                    help='Episode-level collision event penalty weight in meta loss')
+parser.add_argument('--meta_coll_event_temp', type=float, default=80.0,
+                    help='Sharpness for differentiable episode collision event penalty (sigmoid temperature)')
+parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
+                    help='Penetration-depth threshold (m) where differentiable collision-event penalty turns on')
+parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
+                    help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
+
 args = parser.parse_args()
 
 ########## 2. 目录与日志初始化 ##########
@@ -161,8 +183,10 @@ current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 script_name = os.path.splitext(os.path.basename(__file__))[0]
 save_dir_name = f"{script_name}_{args.exp_name}_{current_time}"
 save_dir = os.path.join("..", "checkpoints", save_dir_name)
+video_dir = os.path.join(save_dir, 'videos')
 
 os.makedirs(save_dir, exist_ok=True)
+os.makedirs(video_dir, exist_ok=True)
 print(f"Training artifacts will be saved to: {save_dir}")
 
 with open(os.path.join(save_dir, 'config.json'), 'w') as f:
@@ -200,20 +224,20 @@ except TypeError:
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
 
 ########## 4. 加载预训练模型 ##########
-def load_checkpoint(model, path, name):
-    if path and os.path.isfile(path):
-        print(f"Loading {name} from {path}")
-        model.load_state_dict(torch.load(path, map_location=device), strict=False)
-    elif path:
-        print(f"Warning: {name} path provided but file not found: {path}")
+# def load_checkpoint(model, path, name):
+#     if path and os.path.isfile(path):
+#         print(f"Loading {name} from {path}")
+#         model.load_state_dict(torch.load(path, map_location=device), strict=False)
+#     elif path:
+#         print(f"Warning: {name} path provided but file not found: {path}")
 
-load_checkpoint(worknet, args.resume_worker, "Worker")
-load_checkpoint(lgn, args.resume_lgn, "LGN")
-if args.resume_norm:
-    load_checkpoint(state_normalizer, args.resume_norm, "Norm Stats")
-elif args.resume_worker:
-    norm_path = args.resume_worker.replace('worker_', 'norm_')
-    load_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats")
+# load_checkpoint(worknet, args.resume_worker, "Worker")
+# load_checkpoint(lgn, args.resume_lgn, "LGN")
+# if args.resume_norm:
+#     load_checkpoint(state_normalizer, args.resume_norm, "Norm Stats")
+# elif args.resume_worker:
+#     norm_path = args.resume_worker.replace('worker_', 'norm_')
+#     load_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats")
 
 ########## 5. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
@@ -233,6 +257,25 @@ def smooth_dict(ori_dict):
 
 def is_save_iter(i):
     return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
+
+def get_grad_stats(module):
+    total_sq = 0.0
+    max_abs = 0.0
+    nonfinite_cnt = 0
+    grad_elem_cnt = 0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        finite_mask = torch.isfinite(g)
+        nonfinite_cnt += int((~finite_mask).sum().item())
+        if finite_mask.any():
+            g_finite = g[finite_mask]
+            total_sq += float((g_finite * g_finite).sum().item())
+            max_abs = max(max_abs, float(g_finite.abs().max().item()))
+        grad_elem_cnt += g.numel()
+    global_norm = math.sqrt(total_sq)
+    return global_norm, max_abs, nonfinite_cnt, grad_elem_cnt
 
 def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     """
@@ -335,14 +378,21 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
     m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
-    m_coll = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
+    collision_depth_val = F.relu(-dist_val)
+    m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
+    m_coll_hard = collision_depth_val.pow(2).mean()
+    m_coll_peak = collision_depth_val.max(dim=0).values
+    m_coll_event = torch.sigmoid((m_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp).mean()
+    m_coll = (args.meta_coll_soft_weight * m_coll_soft
+              + args.meta_coll_hard_weight * m_coll_hard
+              + args.meta_coll_event_weight * m_coll_event)
     m_ctrl = act_val.norm(2, -1).sum()
     # [问题1] Meta rollout也加入高度惩罚
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
                + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
                + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll * 5.0 + m_ctrl * 0.000001 + m_height * 2.0,
+    meta_val = sanitize_tensor(m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0,
                                nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
@@ -454,7 +504,7 @@ for i in pbar:
     v_max = float(env.max_speed)
     speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
     speed_factor_goal = torch.clamp(dist_to_goal / 1.0, 0.0, 1.0)  # 终点1m内线性减速
-    v_target_adaptive = v_max * (0.3 + 0.7 * speed_factor_obs) * speed_factor_goal
+    v_target_adaptive = v_max * (args.speed_near_obs_floor + (1.0 - args.speed_near_obs_floor) * speed_factor_obs) * speed_factor_goal
     loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
 
     target_dir = safe_normalize(env.p_target - p_history, dim=-1)
@@ -466,10 +516,15 @@ for i in pbar:
     approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
     dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
     dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
-    loss_avoidance_seq = (F.softplus(-dist_obj * 32.0) +
-                          0.5 * F.softplus(-dist_obj * 3.0) +
-                          0.3 * F.softplus(-dist_future_02 * 10.0) +
-                          0.2 * F.softplus(-dist_future_04 * 10.0))
+    collision_depth = F.relu(-dist_obj)
+    safe_margin = args.avoid_safe_margin
+    loss_avoidance_seq = (
+        F.softplus((safe_margin - dist_obj) * 12.0) +
+        0.5 * F.softplus(-dist_obj * 32.0) +
+        0.3 * F.softplus((safe_margin - dist_future_02) * 10.0) +
+        0.2 * F.softplus((safe_margin - dist_future_04) * 10.0) +
+        collision_depth.pow(2)
+    )
 
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
@@ -495,7 +550,7 @@ for i in pbar:
     weighted_loss_map = (
         weights_seq[:, :, 0] * loss_speed_n +
         weights_seq[:, :, 1] * loss_dir_n +
-        (weights_seq[:, :, 2] + 0.2) * loss_avoid_n +
+        (weights_seq[:, :, 2] + args.proxy_avoid_floor) * loss_avoid_n +
         (weights_seq[:, :, 3] + 0.1) * loss_expl_n +
         weights_seq[:, :, 4] * loss_smooth_n
     )
@@ -505,11 +560,22 @@ for i in pbar:
 
     # --- Meta Loss Components ---
     loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
-    loss_meta_coll = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
+    loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
+    loss_meta_coll_hard = collision_depth.pow(2).mean()
+    loss_meta_coll_peak = collision_depth.max(dim=0).values
+    loss_meta_coll_event = torch.sigmoid(
+        (loss_meta_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp
+    ).mean()
+    loss_meta_coll_event_rate = (loss_meta_coll_peak > 0).float().mean()
+    loss_meta_coll = (
+        args.meta_coll_soft_weight * loss_meta_coll_soft
+        + args.meta_coll_hard_weight * loss_meta_coll_hard
+        + args.meta_coll_event_weight * loss_meta_coll_event
+    )
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     loss_meta_height = loss_height_seq.mean()
 
-    meta_loss = loss_meta_pos + loss_meta_coll * 5.0 + loss_meta_ctrl * 0.000001 + loss_meta_height * 2.0
+    meta_loss = loss_meta_pos + loss_meta_coll + loss_meta_height * 2.0 #+ loss_meta_ctrl *0  
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
@@ -517,6 +583,16 @@ for i in pbar:
     optim_worker.zero_grad()
     optim_lgn.zero_grad()
     lgn_update_loss = 0.0
+    worker_grad_norm = 0.0
+    worker_grad_max = 0.0
+    worker_grad_nonfinite = 0.0
+    worker_grad_elems = 0.0
+    worker_clip_pre = 0.0
+    lgn_grad_norm = 0.0
+    lgn_grad_max = 0.0
+    lgn_grad_nonfinite = 0.0
+    lgn_grad_elems = 0.0
+    lgn_clip_pre = 0.0
 
     rollout_is_finite = bool(
         torch.isfinite(proxy_loss).all()
@@ -559,14 +635,16 @@ for i in pbar:
         weight_ent = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(-1).mean()
         lgn_total = meta_loss_unrolled - 0.1 * weight_ent
         lgn_total.backward()
-        nn.utils.clip_grad_norm_(lgn.parameters(), 1.0)
+        lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
+        lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
         optim_lgn.step()
         sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
     else:
         proxy_loss.backward()
-        nn.utils.clip_grad_norm_(worknet.parameters(), 5.0)
+        worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
+        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
         optim_worker.step()
         sanitize_module_(worknet, clamp_value=10.0)
         sched.step()
@@ -607,6 +685,7 @@ for i in pbar:
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
             'Proxy_Comp/1_Direction': loss_direction_seq.mean(),
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
+            'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Smoothness': loss_smooth_seq.mean(),
             'Proxy_Comp/5_Height': loss_height_seq.mean(),
@@ -614,6 +693,10 @@ for i in pbar:
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
             'Meta_Comp/2_Collision': loss_meta_coll,
+            'Meta_Comp/2_1_Collision_Soft': loss_meta_coll_soft,#软碰撞项（靠墙即升高，连续梯度）
+            'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对“已经进墙”的样本施加强惩罚，且穿得越深罚越重
+            'Meta_Comp/2_3_Collision_Event': loss_meta_coll_event,# 可微事件惩罚（用于训练）
+            'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
 
@@ -634,7 +717,19 @@ for i in pbar:
             # === [兼容] 保留旧命名 ===
             'Stats/Norm_Mean': state_normalizer.mean[0],
             'Stats/Norm_Var': state_normalizer.var[0],
-            'Stats/Norm_Count': state_normalizer.count
+            'Stats/Norm_Count': state_normalizer.count,
+
+            # === 梯度监控（用于判断梯度爆炸） ===
+            'Grad/Worker_Global_Norm': worker_grad_norm,
+            'Grad/Worker_Max_Abs': worker_grad_max,
+            'Grad/Worker_NonFinite_Count': worker_grad_nonfinite,
+            'Grad/Worker_GradElem_Count': worker_grad_elems,
+            'Grad/Worker_Clip_PreNorm': worker_clip_pre,
+            'Grad/LGN_Global_Norm': lgn_grad_norm,
+            'Grad/LGN_Max_Abs': lgn_grad_max,
+            'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
+            'Grad/LGN_GradElem_Count': lgn_grad_elems,
+            'Grad/LGN_Clip_PreNorm': lgn_clip_pre
         }
         
         if train_lgn_phase:
@@ -734,13 +829,35 @@ for i in pbar:
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 
-            # 5. [新增] 深度图视频
+            # 5. [新增] 深度图视频（保存到本地）
             if len(depth_history) > 0:
-                depth_stack = torch.stack(depth_history)
-                d_min = depth_stack.min()
-                d_max = depth_stack.max()
-                depth_norm = (depth_stack - d_min) / (d_max - d_min + 1e-6)
-                vid_tensor = depth_norm.unsqueeze(0).unsqueeze(2)  # [1, T, 1, H, W]
-                writer.add_video('Video/Depth_View', vid_tensor, i + 1, fps=15)
+                depth_stack = torch.stack(depth_history).float()  # [T, H, W], meters
+                # 使用逆深度增强近处障碍可见性，并做分位数拉伸避免整段几乎同值导致全黑
+                inv_depth = 3.0 / depth_stack.clamp(0.3, 24.0) - 0.6  # 与网络输入一致的尺度
+                p2 = torch.quantile(inv_depth, 0.02)
+                p98 = torch.quantile(inv_depth, 0.98)
+                inv_norm = ((inv_depth - p2) / (p98 - p2 + 1e-6)).clamp(0.0, 1.0)  # [T, H, W]
+
+                # 转为 RGB 彩色帧，避免灰度写视频时编码器/播放器显示发黑
+                cmap_np = cm.get_cmap('magma')
+                inv_np = inv_norm.cpu().numpy()  # [T, H, W], [0,1]
+                frames = []
+                for _k in range(inv_np.shape[0]):
+                    rgb = (cmap_np(inv_np[_k])[..., :3] * 255.0).astype('uint8')  # [H, W, 3]
+                    frames.append(rgb)
+
+                # fallback 给 TensorBoard 帧日志使用灰度uint8
+                depth_uint8 = (inv_norm * 255).to(torch.uint8)
+                mp4_path = os.path.join(video_dir, f'depth_iter_{i+1:06d}.mp4')
+                gif_path = os.path.join(video_dir, f'depth_iter_{i+1:06d}.gif')
+                if imageio is not None:
+                    try:
+                        imageio.mimsave(mp4_path, frames, fps=15, macro_block_size=None)
+                    except Exception:
+                        imageio.mimsave(gif_path, frames, format='GIF', fps=15)
+                else:
+                    # imageio 不可用时退化为逐帧图像记录到 TensorBoard
+                    for _fi, _frame in enumerate(depth_uint8):
+                        writer.add_image(f'Video/Depth_Frame/{_fi:03d}', _frame.unsqueeze(0), i + 1)
 
 print(f"Training Finished. Artifacts in: {save_dir}")

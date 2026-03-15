@@ -19,6 +19,7 @@ class GDecay(torch.autograd.Function):
 g_decay = GDecay.apply
 
 
+
 class RunFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, R, dg, z_drag_coef, drag_2, pitch_ctl_delay, act_pred, act, p, v, v_wind, a, grad_decay, ctl_dt, airmode):

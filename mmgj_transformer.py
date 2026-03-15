@@ -549,7 +549,7 @@ for i in pbar:
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
         weights_seq[:, :, 0] * loss_speed_n +
-        weights_seq[:, :, 1] * loss_dir_n +
+        # weights_seq[:, :, 1] * loss_dir_n +
         (weights_seq[:, :, 2] + args.proxy_avoid_floor) * loss_avoid_n +
         (weights_seq[:, :, 3] + 0.1) * loss_expl_n +
         weights_seq[:, :, 4] * loss_smooth_n
@@ -575,7 +575,7 @@ for i in pbar:
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     loss_meta_height = loss_height_seq.mean()
 
-    meta_loss = loss_meta_pos + loss_meta_coll + loss_meta_height * 2.0 #+ loss_meta_ctrl *0  
+    meta_loss =  loss_meta_coll + loss_meta_height * 2.0 #+ loss_meta_ctrl *0 + loss_meta_pos 
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 

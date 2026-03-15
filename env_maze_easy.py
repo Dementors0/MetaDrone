@@ -411,11 +411,16 @@ class Env:
         axis_idx = normal_axis.unsqueeze(-1)
         axis_mask = F.one_hot(normal_axis, num_classes=3).to(dtype=dtype)
 
+        point_expand = (-1, vox_centers.size(1), -1)
+        p_prev_expanded = p_prev.unsqueeze(1).expand(*point_expand)
+        p_free_expanded = p_free.unsqueeze(1).expand(*point_expand)
+        v_free_expanded = v_free.unsqueeze(1).expand(*point_expand)
+
         center_n = vox_centers.gather(2, axis_idx).squeeze(-1)
         half_n = vox_half.gather(2, axis_idx).squeeze(-1)
-        p_prev_n = p_prev.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
-        p_free_n = p_free.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
-        v_free_n = v_free.unsqueeze(1).gather(2, axis_idx).squeeze(-1)
+        p_prev_n = p_prev_expanded.gather(2, axis_idx).squeeze(-1)
+        p_free_n = p_free_expanded.gather(2, axis_idx).squeeze(-1)
+        v_free_n = v_free_expanded.gather(2, axis_idx).squeeze(-1)
 
         side = torch.where(p_prev_n >= center_n, torch.ones_like(p_prev_n), -torch.ones_like(p_prev_n))
         boundary = center_n + side * (half_n + radius + buffer)

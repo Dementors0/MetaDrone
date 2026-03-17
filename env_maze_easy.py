@@ -105,6 +105,8 @@ class Env:
         self.contact_gate_softness = 0.04
         self.contact_velocity_softness = 0.10
         self.contact_normal_damping = 1.0
+        self.contact_tangent_damping = 0.35
+        self.clearance_alpha = torch.linspace(0.0, 1.0, 9, device=device).reshape(-1, 1, 1)
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
@@ -302,6 +304,7 @@ class Env:
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
         self.drag_2[:, 0] = 0
         self.z_drag_coef = torch.ones((B, 1), device=device)
+        self._reset_contact_cache()
 
     def reset_drone_only(self):
         """Reset drone states while keeping the current easy-maze layout unchanged."""
@@ -369,6 +372,16 @@ class Env:
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
         self.drag_2[:, 0] = 0
         self.z_drag_coef = torch.ones((B, 1), device=device)
+        self._reset_contact_cache()
+
+    def _reset_contact_cache(self):
+        zeros = torch.zeros((self.batch_size,), device=self.device)
+        self.current_clearance = self._compute_signed_clearance(self.p)
+        self.last_step_clearance = self.current_clearance
+        self.last_contact_strength = zeros.clone()
+        self.last_contact_penetration = zeros.clone()
+        self.last_contact_tangent_speed = zeros.clone()
+        self.last_contact_normal_speed = zeros.clone()
 
     @staticmethod
     @torch.no_grad()
@@ -391,6 +404,11 @@ class Env:
 
     def _apply_soft_contacts(self, p_prev, p_free, v_free, a_free, ctl_dt):
         if self.voxels.numel() == 0:
+            zeros = torch.zeros((self.batch_size,), device=p_free.device, dtype=p_free.dtype)
+            self.last_contact_strength = zeros
+            self.last_contact_penetration = zeros
+            self.last_contact_tangent_speed = zeros
+            self.last_contact_normal_speed = zeros
             return p_free, v_free, a_free
 
         vox_centers = self.voxels[..., :3]
@@ -440,10 +458,54 @@ class Env:
         inward_speed = velocity_softness * F.softplus(-(side * v_free_n) / velocity_softness)
         vel_corr_mag = self.contact_normal_damping * inward_speed * contact_gate
         vel_corr = (axis_mask * (side * vel_corr_mag).unsqueeze(-1)).sum(dim=1)
-        v_contact = v_free + vel_corr
+        tangent_velocity = v_free_expanded - axis_mask * v_free_n.unsqueeze(-1)
+        tangent_drag = -(self.contact_tangent_damping * contact_gate).unsqueeze(-1) * tangent_velocity
+        tangent_drag = tangent_drag.sum(dim=1)
+        max_tangent_drag = 0.8 * v_free.norm(dim=-1, keepdim=True)
+        tangent_drag_norm = tangent_drag.norm(dim=-1, keepdim=True)
+        tangent_drag_scale = torch.clamp(max_tangent_drag / (tangent_drag_norm + 1e-6), max=1.0)
+        tangent_drag = tangent_drag * tangent_drag_scale
+        v_contact = v_free + vel_corr + tangent_drag
         a_contact = a_free + (v_contact - v_free) / dt
 
+        tangent_speed = tangent_velocity.norm(dim=-1)
+        self.last_contact_strength = contact_gate.max(dim=1).values
+        self.last_contact_penetration = pos_corr_mag.max(dim=1).values
+        self.last_contact_tangent_speed = (tangent_speed * contact_gate).max(dim=1).values
+        self.last_contact_normal_speed = (inward_speed * contact_gate).max(dim=1).values
+
         return p_contact, v_contact, a_contact
+
+    def _compute_signed_clearance(self, points):
+        if self.voxels.numel() == 0:
+            shape = points.shape[:-1]
+            return torch.full(shape, 1e3, device=points.device, dtype=points.dtype)
+
+        squeeze_result = False
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+            squeeze_result = True
+
+        inflate = torch.as_tensor(
+            float(self.drone_radius) + float(self.contact_buffer),
+            device=points.device,
+            dtype=points.dtype,
+        )
+        vox_centers = self.voxels[..., :3].unsqueeze(0)
+        vox_half = self.voxels[..., 3:].unsqueeze(0) + inflate
+        q = (points.unsqueeze(-2) - vox_centers).abs() - vox_half
+        outside = q.clamp_min(0.0)
+        outside_dist = outside.norm(dim=-1)
+        inside_dist = q.amax(dim=-1).clamp_max(0.0)
+        clearance = (outside_dist + inside_dist).amin(dim=-1)
+        if squeeze_result:
+            clearance = clearance.squeeze(0)
+        return clearance
+
+    def _compute_swept_clearance(self, p_start, p_end):
+        alpha = self.clearance_alpha.to(device=p_end.device, dtype=p_end.dtype)
+        sweep_points = p_start.unsqueeze(0) + alpha * (p_end - p_start).unsqueeze(0)
+        return self._compute_signed_clearance(sweep_points).amin(dim=0)
 
     def render(self, ctl_dt):
         canvas = torch.empty((self.batch_size, self.height, self.width), device=self.device)
@@ -547,6 +609,17 @@ class Env:
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         self.a = torch.nan_to_num(self.a, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
+        self.current_clearance = torch.nan_to_num(
+            self._compute_signed_clearance(self.p), nan=0.0, posinf=10.0, neginf=-10.0
+        ).clamp(-10.0, 10.0)
+        self.last_step_clearance = torch.nan_to_num(
+            torch.minimum(self._compute_swept_clearance(self.p_old, self.p), self.current_clearance),
+            nan=0.0, posinf=10.0, neginf=-10.0,
+        ).clamp(-10.0, 10.0)
+        self.last_contact_strength = torch.nan_to_num(self.last_contact_strength, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        self.last_contact_penetration = torch.nan_to_num(self.last_contact_penetration, nan=0.0, posinf=10.0, neginf=0.0).clamp_min(0.0)
+        self.last_contact_tangent_speed = torch.nan_to_num(self.last_contact_tangent_speed, nan=0.0, posinf=30.0, neginf=0.0).clamp_min(0.0)
+        self.last_contact_normal_speed = torch.nan_to_num(self.last_contact_normal_speed, nan=0.0, posinf=30.0, neginf=0.0).clamp_min(0.0)
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()

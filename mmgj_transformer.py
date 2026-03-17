@@ -1,8 +1,7 @@
 #5.5.2  在物理反馈仿真基础  INFRA
-#       + 单独画五个代理损失对 Worker 梯度的 norm
-#       + 碰撞可视化
-#       + 环境渲染的原始深度图可视化优化
-#       + 无人机旋转rpy姿态可视化
+#       + 每次新撞击单独计一次重罚
+#       + 惩罚“贴墙高速擦行
+
 import argparse
 import math
 from collections import defaultdict
@@ -174,10 +173,30 @@ parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
                     help='Hard penetration-depth penalty weight in meta loss')
 parser.add_argument('--meta_coll_event_weight', type=float, default=80.0,
                     help='Episode-level collision event penalty weight in meta loss')
+parser.add_argument('--meta_contact_slide_weight', type=float, default=10.0,
+                    help='Penalty weight for wall-assisted sliding/turning in meta loss')
+parser.add_argument('--meta_coll_incident_weight', type=float, default=120.0,
+                    help='Penalty weight for each new wall-hit incident in meta loss')
+parser.add_argument('--meta_wall_scrape_weight', type=float, default=12.0,
+                    help='Penalty weight for high-speed wall scraping in meta loss')
 parser.add_argument('--meta_coll_event_temp', type=float, default=80.0,
                     help='Sharpness for differentiable episode collision event penalty (sigmoid temperature)')
 parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
                     help='Penetration-depth threshold (m) where differentiable collision-event penalty turns on')
+parser.add_argument('--proxy_contact_slide_weight', type=float, default=0.6,
+                    help='Additional proxy penalty for tangential wall sliding while in contact')
+parser.add_argument('--proxy_coll_incident_weight', type=float, default=4.0,
+                    help='Strong penalty for each new wall-hit incident in proxy loss')
+parser.add_argument('--proxy_wall_scrape_weight', type=float, default=1.0,
+                    help='Penalty for sustained high-speed wall scraping in proxy loss')
+parser.add_argument('--contact_tangent_damping', type=float, default=0.35,
+                    help='Tangential damping applied by the environment during wall contacts')
+parser.add_argument('--coll_incident_threshold', type=float, default=0.005,
+                    help='Penetration threshold (m) that counts as a wall-hit incident')
+parser.add_argument('--wall_scrape_speed_limit', type=float, default=1.2,
+                    help='Tangential speed limit (m/s) allowed when flying very close to walls')
+parser.add_argument('--wall_scrape_clearance', type=float, default=0.22,
+                    help='Clearance (m) below which high tangential wall-following speed is penalized')
 parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
                     help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
 
@@ -207,6 +226,7 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           gate=args.gate, ground_voxels=args.ground_voxels,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle)
+env.contact_tangent_damping = args.contact_tangent_damping
 
 state_dim = 7 if args.no_odom else 10
 
@@ -427,7 +447,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
     env.reset_drone_only()
 
-    p_list, v_list, vec_list = [], [], []
+    p_list, v_list = [], []
+    clearance_list, contact_penetration_list, contact_slide_list = [], [], []
     act_buf = [env.act.detach()] * 2
     h_val = None
 
@@ -438,7 +459,6 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
         p_list.append(env.p)
         v_list.append(env.v)
-        vec_list.append(env.find_vec_to_nearest_pt())
 
         target_v_raw = env.p_target - env.p.detach()
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
@@ -447,7 +467,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
 
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.current_clearance[:, None]]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom:
             state_list.insert(0, local_v)
@@ -469,6 +489,9 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         act_buf.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw)
+        clearance_list.append(env.last_step_clearance)
+        contact_penetration_list.append(env.last_contact_penetration)
+        contact_slide_list.append(env.last_contact_tangent_speed)
 
         # Early termination when all drones reach their goals
         with torch.no_grad():
@@ -484,21 +507,29 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     # --- 计算 Meta Loss ---
     p_val = torch.stack(p_list)
     act_val = torch.stack(act_buf)
-    vec_val = torch.stack(vec_list)
-    if vec_val.dim() == 4:
-        vec_val = vec_val.mean(1)
+    clearance_val = sanitize_tensor(torch.stack(clearance_list), nan=0.0, posinf=10.0, neginf=-10.0)
+    contact_penetration_val = sanitize_tensor(torch.stack(contact_penetration_list), nan=0.0, posinf=10.0, neginf=0.0)
+    contact_slide_val = sanitize_tensor(torch.stack(contact_slide_list), nan=0.0, posinf=30.0, neginf=0.0)
 
-    dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
-
-    m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
-    collision_depth_val = F.relu(-dist_val)
-    m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
+    m_pos = torch.norm(env.p - env.p_target, 2, -1).mean()
+    collision_depth_val = torch.maximum(F.relu(-clearance_val), contact_penetration_val)
+    contact_prob_val = torch.sigmoid((collision_depth_val - args.coll_incident_threshold) * args.meta_coll_event_temp)
+    prev_contact_prob_val = torch.cat([torch.zeros_like(contact_prob_val[:1]), contact_prob_val[:-1]], dim=0)
+    collision_incident_val = (contact_prob_val * (1.0 - prev_contact_prob_val)).clamp(0.0, 1.0)
+    wall_scrape_excess_val = F.relu(contact_slide_val - args.wall_scrape_speed_limit)
+    m_coll_soft = F.softplus(-clearance_val * 32.0).clamp(max=100.0).mean()
     m_coll_hard = collision_depth_val.pow(2).mean()
     m_coll_peak = collision_depth_val.max(dim=0).values
     m_coll_event = torch.sigmoid((m_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp).mean()
+    m_contact_slide = contact_slide_val.mean()
+    m_coll_incident = collision_incident_val.sum(dim=0).mean()
+    m_wall_scrape = wall_scrape_excess_val.pow(2).mean()
     m_coll = (args.meta_coll_soft_weight * m_coll_soft
               + args.meta_coll_hard_weight * m_coll_hard
-              + args.meta_coll_event_weight * m_coll_event)
+              + args.meta_coll_event_weight * m_coll_event
+              + args.meta_contact_slide_weight * m_contact_slide
+              + args.meta_coll_incident_weight * m_coll_incident
+              + args.meta_wall_scrape_weight * m_wall_scrape)
     m_ctrl = act_val.norm(2, -1).sum()
     # [问题1] Meta rollout也加入高度惩罚
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
@@ -530,6 +561,7 @@ for i in pbar:
     worknet.reset()
 
     p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
+    clearance_history, step_clearance_history, contact_penetration_history, contact_slide_history = [], [], [], []
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
@@ -550,6 +582,7 @@ for i in pbar:
 
         p_history.append(env.p)
         v_history.append(env.v)
+        clearance_history.append(env.current_clearance)
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())
 
         target_v_raw_curr = env.p_target - env.p.detach()
@@ -559,7 +592,7 @@ for i in pbar:
         target_v_history.append(target_v)
 
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.current_clearance[:, None]]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
@@ -584,6 +617,9 @@ for i in pbar:
         act_buffer.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
+        step_clearance_history.append(env.last_step_clearance)
+        contact_penetration_history.append(env.last_contact_penetration)
+        contact_slide_history.append(env.last_contact_tangent_speed)
 
         # Early termination when all drones reach their goals
         with torch.no_grad():
@@ -600,6 +636,10 @@ for i in pbar:
     ###### B. Loss Calculation (Step-wise) ######
     p_history = torch.stack(p_history)     # [T, B, 3]
     v_history = torch.stack(v_history)     # [T, B, 3]
+    clearance_history = torch.stack(clearance_history)  # [T, B]
+    step_clearance = torch.stack(step_clearance_history)  # [T, B]
+    contact_penetration_seq = torch.stack(contact_penetration_history)  # [T, B]
+    contact_slide_seq = torch.stack(contact_slide_history)  # [T, B]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
     weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 5]
 
@@ -608,8 +648,11 @@ for i in pbar:
     
     # 1. 计算各项 Raw Loss (保留 [T, B] 维度用于 Step-wise 加权)
 
-    # 碰撞距离 (先计算, 后续速度目标依赖它)
-    dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
+    # 真实净空: clearance_history 是当前位置净空, step_clearance 是本步动作后的扫掠最小净空
+    dist_obj = sanitize_tensor(clearance_history, nan=0.0, posinf=10.0, neginf=-10.0)
+    step_clearance = sanitize_tensor(step_clearance, nan=0.0, posinf=10.0, neginf=-10.0)
+    contact_penetration_seq = sanitize_tensor(contact_penetration_seq, nan=0.0, posinf=10.0, neginf=0.0)
+    contact_slide_seq = sanitize_tensor(contact_slide_seq, nan=0.0, posinf=30.0, neginf=0.0)
 
     # [问题3] 自适应速度目标: 近障碍物/近终点时自动减速
     speed_actual = v_history.norm(2, -1)  # [T, B]
@@ -629,14 +672,27 @@ for i in pbar:
     approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
     dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
     dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
-    collision_depth = F.relu(-dist_obj)
+    collision_depth = torch.maximum(F.relu(-step_clearance), contact_penetration_seq)
+    collision_contact_prob = torch.sigmoid((collision_depth - args.coll_incident_threshold) * args.meta_coll_event_temp)
+    prev_collision_contact_prob = torch.cat([torch.zeros_like(collision_contact_prob[:1]), collision_contact_prob[:-1]], dim=0)
+    collision_incident_seq = (collision_contact_prob * (1.0 - prev_collision_contact_prob)).clamp(0.0, 1.0)
+    tangent_speed_near_wall = torch.sqrt((speed_actual.pow(2) - approach_speed.pow(2)).clamp_min(0.0))
+    near_wall_gate = torch.sigmoid((args.wall_scrape_clearance - dist_obj) * 16.0)
+    wall_scrape_speed_excess = F.relu(tangent_speed_near_wall - args.wall_scrape_speed_limit)
+    contact_slide_excess = F.relu(contact_slide_seq - args.wall_scrape_speed_limit)
+    loss_wall_scrape_seq = (
+        near_wall_gate * wall_scrape_speed_excess.pow(2)
+        + 2.0 * contact_slide_excess.pow(2)
+    )
     safe_margin = args.avoid_safe_margin
     loss_avoidance_seq = (
         F.softplus((safe_margin - dist_obj) * 12.0) +
-        0.5 * F.softplus(-dist_obj * 32.0) +
         0.3 * F.softplus((safe_margin - dist_future_02) * 10.0) +
         0.2 * F.softplus((safe_margin - dist_future_04) * 10.0) +
-        collision_depth.pow(2)
+        0.8 * F.softplus(-step_clearance * 32.0).clamp(max=100.0) +
+        collision_depth.pow(2) +
+        args.proxy_contact_slide_weight * contact_slide_seq +
+        args.proxy_wall_scrape_weight * loss_wall_scrape_seq
     )
 
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
@@ -669,21 +725,32 @@ for i in pbar:
     )
 
     # 3. 最终 Proxy Loss (含固定权重的高度约束)
-    proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
+    loss_coll_incident = collision_incident_seq.sum(dim=0).mean()
+    proxy_loss = (
+        weighted_loss_map.mean()
+        + 2.0 * loss_height_seq.mean()
+        + args.proxy_coll_incident_weight * loss_coll_incident
+    )
 
     # --- Meta Loss Components ---
-    loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
-    loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
+    loss_meta_pos = torch.norm(env.p - env.p_target, 2, -1).mean()
+    loss_meta_coll_soft = F.softplus(-step_clearance * 32.0).clamp(max=100.0).mean()
     loss_meta_coll_hard = collision_depth.pow(2).mean()
     loss_meta_coll_peak = collision_depth.max(dim=0).values
     loss_meta_coll_event = torch.sigmoid(
         (loss_meta_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp
     ).mean()
     loss_meta_coll_event_rate = (loss_meta_coll_peak > 0).float().mean()
+    loss_meta_contact_slide = contact_slide_seq.mean()
+    loss_meta_coll_incident = loss_coll_incident
+    loss_meta_wall_scrape = loss_wall_scrape_seq.mean()
     loss_meta_coll = (
         args.meta_coll_soft_weight * loss_meta_coll_soft
         + args.meta_coll_hard_weight * loss_meta_coll_hard
         + args.meta_coll_event_weight * loss_meta_coll_event
+        + args.meta_contact_slide_weight * loss_meta_contact_slide
+        + args.meta_coll_incident_weight * loss_meta_coll_incident
+        + args.meta_wall_scrape_weight * loss_meta_wall_scrape
     )
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     loss_meta_height = loss_height_seq.mean()
@@ -796,7 +863,7 @@ for i in pbar:
         pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
-        success = torch.all(dist_obj > 0, 0)
+        success = torch.all(step_clearance > 0, 0)
         # 计算平均权重 (用于 Scalar 显示)
         avg_weights = weights_seq.mean(dim=[0, 1]).cpu()
         weight_entropy = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(dim=-1).mean()
@@ -826,6 +893,10 @@ for i in pbar:
             'Proxy_Comp/1_Direction': loss_direction_seq.mean(),
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
+            'Proxy_Comp/2_2_Contact_Slide': contact_slide_seq.mean(),
+            'Proxy_Comp/2_3_Contact_Penetration': contact_penetration_seq.mean(),
+            'Proxy_Comp/2_4_Collision_Incident': loss_coll_incident,
+            'Proxy_Comp/2_5_Wall_Scrape': loss_wall_scrape_seq.mean(),
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Smoothness': loss_smooth_seq.mean(),
             'Proxy_Comp/5_Height': loss_height_seq.mean(),
@@ -837,11 +908,20 @@ for i in pbar:
             'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对“已经进墙”的样本施加强惩罚，且穿得越深罚越重
             'Meta_Comp/2_3_Collision_Event': loss_meta_coll_event,# 可微事件惩罚（用于训练）
             'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
+            'Meta_Comp/2_5_Contact_Slide': loss_meta_contact_slide,
+            'Meta_Comp/2_6_Collision_Incident': loss_meta_coll_incident,
+            'Meta_Comp/2_7_Wall_Scrape': loss_meta_wall_scrape,
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
+            'Metrics/Collision_Rate': (collision_depth.max(dim=0).values > 0).float().mean(),
+            'Metrics/Collision_Incident_Count': collision_incident_seq.sum(dim=0).mean(),
+            'Metrics/Wall_Scrape_Excess': wall_scrape_speed_excess.mean(),
+            'Metrics/Min_Clearance': step_clearance.min(),
+            'Metrics/Max_Penetration': collision_depth.max(),
+            'Metrics/Contact_Slide': contact_slide_seq.mean(),
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),

@@ -1,5 +1,5 @@
 #5.5.2  在物理反馈仿真基础  INFRA
-#       + 单独画五个代理损失对 Worker 梯度的 norm
+#       + 单独画四个代理损失对 Worker 梯度的 norm
 #       + 碰撞可视化
 #       + 环境渲染的原始深度图可视化优化
 #       + 无人机旋转rpy姿态可视化
@@ -249,7 +249,7 @@ optim_worker = AdamW(worknet.parameters(), args.lr)
 optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 
-loss_normalizer = LossNormalizer(5)  # normalize 5 loss components to equal scale
+loss_normalizer = LossNormalizer(4)  # normalize 4 loss components to equal scale
 
 ########## 6. 辅助函数 ##########
 scaler_q = defaultdict(list)
@@ -601,7 +601,7 @@ for i in pbar:
     p_history = torch.stack(p_history)     # [T, B, 3]
     v_history = torch.stack(v_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
-    weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 5]
+    weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
 
     vec_to_pt = torch.stack(vec_to_pt_history)
     if vec_to_pt.dim() == 4: vec_to_pt = vec_to_pt.mean(1)
@@ -642,9 +642,7 @@ for i in pbar:
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
 
-    # Smoothness: act_buffer 长度比 timestep 多, 取最后 actual_T 步 (支持 early termination)
     actual_T = p_history.shape[0]
-    loss_smooth_seq = act_buffer.diff(1, 0)[-actual_T:].pow(2).sum(-1)
 
     # [问题1] 高度约束损失 (固定权重, 不经LGN控制)
     z_pos = p_history[:, :, 2]  # [T, B]
@@ -655,17 +653,17 @@ for i in pbar:
                        + F.softplus((z_min - z_pos) * 20.0))
 
     # [问题5] 归一化各损失项到相同尺度 (可微除法, stats detached)
-    loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n, loss_smooth_n = \
-        loss_normalizer.normalize(loss_speed_seq, loss_direction_seq, loss_avoidance_seq,
-                                  loss_exploration_seq, loss_smooth_seq)
+    loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n = \
+        loss_normalizer.normalize(
+            loss_speed_seq, loss_direction_seq, loss_avoidance_seq, loss_exploration_seq
+        )
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
         weights_seq[:, :, 0] * loss_speed_n +
         weights_seq[:, :, 1] * loss_dir_n +
         (weights_seq[:, :, 2] + args.proxy_avoid_floor) * loss_avoid_n +
-        (weights_seq[:, :, 3] + 0.1) * loss_expl_n +
-        weights_seq[:, :, 4] * loss_smooth_n
+        (weights_seq[:, :, 3] + 0.1) * loss_expl_n
     )
 
     # 3. 最终 Proxy Loss (含固定权重的高度约束)
@@ -705,17 +703,14 @@ for i in pbar:
     proxy_grad_dir = 0.0
     proxy_grad_avoid = 0.0
     proxy_grad_expl = 0.0
-    proxy_grad_smooth = 0.0
     proxy_grad_speed_nonfinite = 0.0
     proxy_grad_dir_nonfinite = 0.0
     proxy_grad_avoid_nonfinite = 0.0
     proxy_grad_expl_nonfinite = 0.0
-    proxy_grad_smooth_nonfinite = 0.0
     proxy_grad_speed_elems = 0.0
     proxy_grad_dir_elems = 0.0
     proxy_grad_avoid_elems = 0.0
     proxy_grad_expl_elems = 0.0
-    proxy_grad_smooth_elems = 0.0
     lgn_grad_norm = 0.0
     lgn_grad_max = 0.0
     lgn_grad_nonfinite = 0.0
@@ -743,8 +738,6 @@ for i in pbar:
         get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
     proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
         get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
-    proxy_grad_smooth, proxy_grad_smooth_nonfinite, proxy_grad_smooth_elems = \
-        get_loss_to_worker_grad_norm(loss_smooth_seq.mean(), worker_params)
 
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
@@ -809,12 +802,11 @@ for i in pbar:
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
             
-            # === [增强] 5个权重均值 ===
+            # === [增强] 4个权重均值 ===
             'Weights/0_Speed': avg_weights[0],
             'Weights/1_Direction': avg_weights[1],
             'Weights/2_Avoidance': avg_weights[2],
             'Weights/3_Exploration': avg_weights[3],
-            'Weights/4_Smoothness': avg_weights[4],
 
             # === [新增] 权重分布监控 ===
             'Weight_Stats/Min': weights_seq.min(),
@@ -827,8 +819,7 @@ for i in pbar:
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
-            'Proxy_Comp/4_Smoothness': loss_smooth_seq.mean(),
-            'Proxy_Comp/5_Height': loss_height_seq.mean(),
+            'Proxy_Comp/4_Height': loss_height_seq.mean(),
 
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
@@ -871,22 +862,19 @@ for i in pbar:
             'Grad/LGN_GradElem_Count': lgn_grad_elems,
             'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
 
-            # === [新增] 五个代理损失对 Worker 梯度的 norm ===
+            # === [新增] 四个代理损失对 Worker 梯度的 norm ===
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
             'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
             'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
             'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
-            'Grad_ProxyWorker/4_Smoothness_Norm': proxy_grad_smooth,
             'Grad_ProxyWorker/0_Speed_NonFinite': proxy_grad_speed_nonfinite,
             'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
             'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
             'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
-            'Grad_ProxyWorker/4_Smoothness_NonFinite': proxy_grad_smooth_nonfinite,
             'Grad_ProxyWorker/0_Speed_GradElem': proxy_grad_speed_elems,
             'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
             'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
-            'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
-            'Grad_ProxyWorker/4_Smoothness_GradElem': proxy_grad_smooth_elems
+            'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems
         }
         
         if train_lgn_phase:
@@ -997,9 +985,9 @@ for i in pbar:
 
             # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
             fig_w, ax = plt.subplots()
-            w_cpu = weights_seq[:, idx, :].cpu() # [T, 5]
-            labels = ['Speed', 'Dir', 'Avoid', 'Expl', 'Smooth']
-            for wi in range(5):
+            w_cpu = weights_seq[:, idx, :].cpu() # [T, 4]
+            labels = ['Speed', 'Dir', 'Avoid', 'Expl']
+            for wi in range(4):
                 ax.plot(w_cpu[:, wi], label=labels[wi])
             ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step)")
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)

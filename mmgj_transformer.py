@@ -203,18 +203,18 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle)
 
-state_dim = 7 if args.no_odom else 10
+state_dim = 4 if args.no_odom else 7
 
 if args.no_odom:
+    try:
+        worknet = WorkNet(4, 6, max_seq_len=args.worker_max_seq_len)
+    except TypeError:
+        worknet = WorkNet(4, 6)
+else:
     try:
         worknet = WorkNet(7, 6, max_seq_len=args.worker_max_seq_len)
     except TypeError:
         worknet = WorkNet(7, 6)
-else:
-    try:
-        worknet = WorkNet(7 + 3, 6, max_seq_len=args.worker_max_seq_len)
-    except TypeError:
-        worknet = WorkNet(7 + 3, 6)
 worknet = worknet.to(device)
 
 try:
@@ -327,14 +327,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         v_list.append(env.v)
         vec_list.append(env.find_vec_to_nearest_pt())
 
-        target_v_raw = env.p_target - env.p.detach()
-        target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
-        max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device,
-                                    dtype=target_v_norm.dtype)
-        target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
-
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        state_list = [env.R[:, 2], env.margin[:, None]]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom:
             state_list.insert(0, local_v)
@@ -355,13 +349,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
 
-        env.run(real_act, ctl_dt, target_v_raw)
-
-        # Early termination when all drones reach their goals
-        with torch.no_grad():
-            _dist_to_goal_val = torch.norm(env.p - env.p_target, 2, -1)
-            if t >= 10 and (_dist_to_goal_val < args.goal_radius).all():
-                break
+        yaw_ref = torch.zeros_like(env.v)
+        env.run(real_act, ctl_dt, yaw_ref)
 
         # 周期性截断以限制显存
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
@@ -377,7 +366,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
-    m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
+    m_pos = torch.zeros((), device=p_val.device)
     collision_depth_val = F.relu(-dist_val)
     m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
     m_coll_hard = collision_depth_val.pow(2).mean()
@@ -392,7 +381,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
                + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0,
+    meta_val = sanitize_tensor(#m_pos + 
+                               m_coll + m_ctrl * 0.000001 + m_height * 2.0,
                                nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
@@ -416,7 +406,7 @@ for i in pbar:
     maze_update_counter += 1
     worknet.reset()
 
-    p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
+    p_history, v_history, vec_to_pt_history = [], [], []
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
@@ -439,14 +429,8 @@ for i in pbar:
         v_history.append(env.v)
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())
 
-        target_v_raw_curr = env.p_target - env.p.detach()
-        target_v_norm = torch.norm(target_v_raw_curr, 2, -1, keepdim=True)
-        max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device, dtype=target_v_norm.dtype)
-        target_v = (target_v_raw_curr / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
-        target_v_history.append(target_v)
-
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        state_list = [env.R[:, 2], env.margin[:, None]]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
@@ -470,13 +454,8 @@ for i in pbar:
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buffer.append(real_act)
 
-        env.run(real_act, ctl_dt, target_v_raw_curr)
-
-        # Early termination when all drones reach their goals
-        with torch.no_grad():
-            _dist_to_goal = torch.norm(env.p - env.p_target, 2, -1)
-            if t >= 10 and (_dist_to_goal < args.goal_radius).all():
-                break
+        yaw_ref = torch.zeros_like(env.v)
+        env.run(real_act, ctl_dt, yaw_ref)
 
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
             if h is not None:
@@ -498,18 +477,14 @@ for i in pbar:
     # 碰撞距离 (先计算, 后续速度目标依赖它)
     dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
 
-    # [问题3] 自适应速度目标: 近障碍物/近终点时自动减速
+    # [无目标] 自适应速度目标: 仅依据障碍物距离减速
     speed_actual = v_history.norm(2, -1)  # [T, B]
-    dist_to_goal = (env.p_target - p_history).norm(2, -1)  # [T, B]
     v_max = float(env.max_speed)
     speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
-    speed_factor_goal = torch.clamp(dist_to_goal / 1.0, 0.0, 1.0)  # 终点1m内线性减速
-    v_target_adaptive = v_max * (args.speed_near_obs_floor + (1.0 - args.speed_near_obs_floor) * speed_factor_obs) * speed_factor_goal
+    v_target_adaptive = v_max * (args.speed_near_obs_floor + (1.0 - args.speed_near_obs_floor) * speed_factor_obs)
     loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
 
-    target_dir = safe_normalize(env.p_target - p_history, dim=-1)
-    v_dir = safe_normalize(v_history, dim=-1)
-    loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
+    loss_direction_seq = torch.zeros_like(loss_speed_seq)
 
     # [问题2] 多尺度避障 + 前瞻碰撞预测
     vec_to_pt_dir = safe_normalize(vec_to_pt, dim=-1)
@@ -559,7 +534,7 @@ for i in pbar:
     proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
 
     # --- Meta Loss Components ---
-    loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
+    loss_meta_pos = torch.zeros((), device=p_history.device)
     loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
     loss_meta_coll_hard = collision_depth.pow(2).mean()
     loss_meta_coll_peak = collision_depth.max(dim=0).values
@@ -793,9 +768,7 @@ for i in pbar:
 
             ax.plot(p_cpu[0, 0], p_cpu[0, 1], 'go', markersize=8, label='Start')   # 起点
             ax.plot(p_cpu[-1, 0], p_cpu[-1, 1], 'kx', markersize=8, label='End')    # 终点
-            if hasattr(env, 'p_target'):
-                target = env.p_target[idx].detach().cpu().numpy()
-                ax.plot(target[0], target[1], 'r*', markersize=10, label='Goal')
+            # 无目标训练，不显示终点
 
             if all(hasattr(env, k) for k in ['maze_cols', 'maze_rows', 'maze_cell_size']):
                 maze_w = float(env.maze_cols) * float(env.maze_cell_size)

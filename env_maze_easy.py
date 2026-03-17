@@ -284,9 +284,11 @@ class Env:
         self.dg = torch.randn((B, 3), device=device) * 0.2
 
         R = torch.zeros((B, 3, 3), device=device)
+        # Goal-free initialization: start with random velocity reference for attitude.
+        v_ref_init = safe_normalize(torch.randn((B, 3), device=device), dim=-1)
         self.R = quadsim_cuda.update_state_vec(
             R, self.act,
-            torch.randn((B, 3), device=device) * 0.2 + safe_normalize(self.p_target - self.p),
+            v_ref_init,
             torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p
@@ -352,9 +354,11 @@ class Env:
         self.dg = torch.randn((B, 3), device=device) * 0.2
 
         R = torch.zeros((B, 3, 3), device=device)
+        # Goal-free initialization: start with random velocity reference for attitude.
+        v_ref_init = safe_normalize(torch.randn((B, 3), device=device), dim=-1)
         self.R = quadsim_cuda.update_state_vec(
             R, self.act,
-            torch.randn((B, 3), device=device) * 0.2 + safe_normalize(self.p_target - self.p),
+            v_ref_init,
             torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p

@@ -1,3 +1,4 @@
+#速度硬约束5m/s
 import math
 import random
 import time
@@ -105,6 +106,7 @@ class Env:
         self.contact_gate_softness = 0.04
         self.contact_velocity_softness = 0.10
         self.contact_normal_damping = 1.0
+        self.speed_limit_softness = 0.05
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
@@ -256,7 +258,7 @@ class Env:
         else:
             self.n_drones_per_group = 8 # Default to 8 or choice
 
-        self.max_speed = 5.0 * self.speed_mtp
+        self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
         
         # Generate random start/end points
@@ -328,7 +330,7 @@ class Env:
         else:
             self.n_drones_per_group = 8
 
-        self.max_speed = 5.0 * self.speed_mtp
+        self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
         starts = []
@@ -445,6 +447,26 @@ class Env:
 
         return p_contact, v_contact, a_contact
 
+    def _smooth_cap_magnitude(self, vec, cap, softness):
+        norm = torch.norm(vec, 2, -1, keepdim=True)
+        cap = torch.as_tensor(cap, device=vec.device, dtype=vec.dtype)
+        softness = torch.as_tensor(softness, device=vec.device, dtype=vec.dtype)
+        capped_norm = norm - softness * F.softplus((norm - cap) / softness)
+        scale = capped_norm / (norm + 1e-6)
+        return vec * scale
+
+    def _apply_speed_limit(self, p_prev, p_curr, v_curr, a_curr, ctl_dt):
+        dt = torch.as_tensor(max(float(ctl_dt), 1e-4), device=v_curr.device, dtype=v_curr.dtype)
+        speed_cap = torch.as_tensor(float(self.max_speed), device=v_curr.device, dtype=v_curr.dtype)
+        speed_softness = torch.as_tensor(self.speed_limit_softness, device=v_curr.device, dtype=v_curr.dtype)
+        disp_softness = torch.clamp(speed_softness * dt, min=1e-4)
+
+        p_disp_limited = self._smooth_cap_magnitude(p_curr - p_prev, speed_cap * dt, disp_softness)
+        v_limited = self._smooth_cap_magnitude(v_curr, speed_cap, speed_softness)
+        p_limited = p_prev + p_disp_limited
+        a_limited = a_curr + (v_limited - v_curr) / dt
+        return p_limited, v_limited, a_limited
+
     def render(self, ctl_dt):
         canvas = torch.empty((self.batch_size, self.height, self.width), device=self.device)
         # assert canvas.is_contiguous()
@@ -544,6 +566,7 @@ class Env:
         v_free = torch.nan_to_num(v_free, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         a_free = torch.nan_to_num(a_free, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
         self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
+        self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         self.a = torch.nan_to_num(self.a, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
@@ -569,6 +592,7 @@ class Env:
         p_free = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
         v_free = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
         self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_next, ctl_dt)
+        self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
 
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)

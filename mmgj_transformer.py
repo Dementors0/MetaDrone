@@ -1,3 +1,8 @@
+#代码5.5.1.1 去掉smooth损失
+#       + 单独画五个代理损失对 Worker 梯度的 norm
+#       + 碰撞可视化
+#       + 环境渲染的原始深度图可视化优化
+#       + 无人机旋转rpy姿态可视化
 import argparse
 import math
 from collections import defaultdict

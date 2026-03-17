@@ -1,7 +1,7 @@
-#5.5.2  在物理反馈仿真基础  INFRA
+#5.5.2.2  在物理反馈仿真基础  INFRA
 #       + 每次新撞击单独计一次重罚
 #       + 惩罚“贴墙高速擦行
-
+#速度硬约束5m/s
 import argparse
 import math
 from collections import defaultdict

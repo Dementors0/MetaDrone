@@ -1,5 +1,6 @@
 #5.5.2.1  去掉smooth损失
 #速度硬约束5m/s
+#速度软约束3m/s
 import argparse
 import math
 from collections import defaultdict

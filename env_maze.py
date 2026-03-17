@@ -1,4 +1,5 @@
 #速度硬约束5m/s
+#速度软约束3m/s
 import math
 import random
 import time

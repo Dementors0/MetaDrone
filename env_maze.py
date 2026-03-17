@@ -99,6 +99,7 @@ class Env:
         self.random_rotation = random_rotation
         self.cam_angle = cam_angle
         self.fov_x_half_tan = fov_x_half_tan
+        self.speed_limit_softness = 0.05
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
@@ -202,7 +203,7 @@ class Env:
         else:
             self.n_drones_per_group = 8 # Default to 8 or choice
 
-        self.max_speed = 5.0 * self.speed_mtp
+        self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
         
         # Generate random start/end points
@@ -272,7 +273,7 @@ class Env:
         else:
             self.n_drones_per_group = 8
 
-        self.max_speed = 5.0 * self.speed_mtp
+        self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
         # Generate random start/end points within the existing maze
@@ -354,6 +355,25 @@ class Env:
         quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
         return nearest_pt - p
 
+    def _smooth_cap_magnitude(self, vec, cap, softness):
+        norm = torch.norm(vec, 2, -1, keepdim=True)
+        cap = torch.as_tensor(cap, device=vec.device, dtype=vec.dtype)
+        softness = torch.as_tensor(softness, device=vec.device, dtype=vec.dtype)
+        capped_norm = norm - softness * F.softplus((norm - cap) / softness)
+        return vec * (capped_norm / (norm + 1e-6))
+
+    def _apply_speed_limit(self, p_prev, p_curr, v_curr, a_curr, ctl_dt):
+        dt = torch.as_tensor(max(float(ctl_dt), 1e-4), device=v_curr.device, dtype=v_curr.dtype)
+        speed_cap = torch.as_tensor(float(self.max_speed), device=v_curr.device, dtype=v_curr.dtype)
+        speed_softness = torch.as_tensor(self.speed_limit_softness, device=v_curr.device, dtype=v_curr.dtype)
+        disp_softness = torch.clamp(speed_softness * dt, min=1e-4)
+
+        disp_limited = self._smooth_cap_magnitude(p_curr - p_prev, speed_cap * dt, disp_softness)
+        v_limited = self._smooth_cap_magnitude(v_curr, speed_cap, speed_softness)
+        p_limited = p_prev + disp_limited
+        a_limited = a_curr + (v_limited - v_curr) / dt
+        return p_limited, v_limited, a_limited
+
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):
         act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         if v_pred is not None:
@@ -364,6 +384,7 @@ class Env:
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
             self.grad_decay, ctl_dt, 0.5)
+        self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
         self.act = torch.nan_to_num(self.act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
@@ -390,6 +411,7 @@ class Env:
         self.p = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
         self.v = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
         self.a = a_next
+        self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
 
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)

@@ -3,6 +3,8 @@
 #       + 碰撞可视化
 #       + 环境渲染的原始深度图可视化优化
 #       + 无人机旋转rpy姿态可视化
+#速度硬约束5m/s
+#速度软约束3m/s
 import argparse
 import math
 from collections import defaultdict
@@ -178,6 +180,10 @@ parser.add_argument('--meta_coll_event_temp', type=float, default=80.0,
                     help='Sharpness for differentiable episode collision event penalty (sigmoid temperature)')
 parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
                     help='Penetration-depth threshold (m) where differentiable collision-event penalty turns on')
+parser.add_argument('--meta_speed_limit', type=float, default=3.0,
+                    help='Per-step speed threshold (m/s) above which meta loss starts penalizing')
+parser.add_argument('--meta_speed_over_weight', type=float, default=1.0,
+                    help='Weight of per-step speed-over-limit penalty in meta loss')
 parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
                     help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
 
@@ -392,14 +398,16 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
               + args.meta_coll_hard_weight * m_coll_hard
               + args.meta_coll_event_weight * m_coll_event)
     m_ctrl = act_val.norm(2, -1).sum()
+    m_speed = F.relu(v_val.norm(2, -1) - args.meta_speed_limit).pow(2).mean()
     # [问题1] Meta rollout也加入高度惩罚
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
                + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
                + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0,
+    meta_val = sanitize_tensor(
+        m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0 + args.meta_speed_over_weight * m_speed,
                                nan=1e3, posinf=1e3, neginf=1e3)
-    return meta_val, m_pos, m_coll, m_ctrl
+    return meta_val, m_pos, m_coll, m_ctrl, m_speed
 
 ########## 7. 训练主循环 ##########
 pbar = tqdm(range(args.num_iters), ncols=120)
@@ -578,9 +586,14 @@ for i in pbar:
         + args.meta_coll_event_weight * loss_meta_coll_event
     )
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
+    loss_meta_speed = F.relu(v_history.norm(2, -1) - args.meta_speed_limit).pow(2).mean()
     loss_meta_height = loss_height_seq.mean()
 
-    meta_loss =  loss_meta_coll + loss_meta_height * 2.0 #+ loss_meta_ctrl *0 + loss_meta_pos 
+    meta_loss = (
+        loss_meta_coll
+        + loss_meta_height * 2.0
+        + args.meta_speed_over_weight * loss_meta_speed
+    ) #+ loss_meta_ctrl *0 + loss_meta_pos
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
@@ -628,7 +641,7 @@ for i in pbar:
             }
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
-        meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
+        meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur, meta_speed_ur = \
             unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
         if not torch.isfinite(meta_loss_unrolled):
             pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
@@ -704,6 +717,7 @@ for i in pbar:
             'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
+            'Meta_Comp/5_Speed_Over': loss_meta_speed,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -742,6 +756,7 @@ for i in pbar:
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
             log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur
+            log_data['Meta_Unrolled/4_Speed_Over'] = meta_speed_ur
 
         smooth_dict(log_data)
 

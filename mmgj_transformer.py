@@ -1,3 +1,8 @@
+#5.5.2  在物理反馈仿真基础  INFRA
+#       + 单独画五个代理损失对 Worker 梯度的 norm
+#       + 碰撞可视化
+#       + 环境渲染的原始深度图可视化优化
+#       + 无人机旋转rpy姿态可视化
 import argparse
 import math
 from collections import defaultdict
@@ -276,6 +281,114 @@ def get_grad_stats(module):
         grad_elem_cnt += g.numel()
     global_norm = math.sqrt(total_sq)
     return global_norm, max_abs, nonfinite_cnt, grad_elem_cnt
+
+def get_grad_norm_from_grads(grads):
+    total_sq = 0.0
+    nonfinite_cnt = 0
+    grad_elem_cnt = 0
+    for g in grads:
+        if g is None:
+            continue
+        g = g.detach()
+        finite_mask = torch.isfinite(g)
+        nonfinite_cnt += int((~finite_mask).sum().item())
+        if finite_mask.any():
+            g_finite = g[finite_mask]
+            total_sq += float((g_finite * g_finite).sum().item())
+        grad_elem_cnt += g.numel()
+    return math.sqrt(total_sq), nonfinite_cnt, grad_elem_cnt
+
+def get_loss_to_worker_grad_norm(loss, params):
+    if not loss.requires_grad:
+        return 0.0, 0, 0
+    grads = torch.autograd.grad(
+        loss, params, allow_unused=True, retain_graph=True, create_graph=False,
+    )
+    return get_grad_norm_from_grads(grads)
+
+
+def merge_intervals(intervals, min_gap=1e-4):
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1] + min_gap:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+@torch.no_grad()
+def get_collision_wall_patches(points_xyz, walls, drone_radius, segment_len=0.45, contact_eps=0.02):
+    if points_xyz.numel() == 0 or walls.numel() == 0:
+        return []
+
+    wall_mask = (
+        (walls[:, 2] >= 0.1)
+        & (walls[:, 2] <= 1.9)
+        & (walls[:, 5] > 0.5)
+    )
+    walls = walls[wall_mask]
+    if walls.numel() == 0:
+        return []
+
+    centers = walls[:, :3]
+    half = walls[:, 3:]
+    wall_min = centers - half
+    wall_max = centers + half
+    axis_is_x = half[:, 0] <= half[:, 1]
+
+    points_expanded = points_xyz.unsqueeze(1)
+    nearest = torch.minimum(torch.maximum(points_expanded, wall_min.unsqueeze(0)), wall_max.unsqueeze(0))
+    clearance = (nearest - points_expanded).norm(dim=-1) - float(drone_radius)
+    contact_steps = torch.nonzero(clearance.min(dim=1).values <= contact_eps, as_tuple=False).flatten().tolist()
+
+    wall_intervals = defaultdict(list)
+    for step_idx in contact_steps:
+        wall_idx = int(clearance[step_idx].argmin().item())
+        if float(clearance[step_idx, wall_idx].item()) > contact_eps:
+            continue
+
+        point = points_xyz[step_idx]
+        center = centers[wall_idx]
+        wall_half = half[wall_idx]
+
+        if bool(axis_is_x[wall_idx]):
+            tangent_min = float(center[1] - wall_half[1])
+            tangent_max = float(center[1] + wall_half[1])
+            tangent_center = min(max(float(point[1]), tangent_min), tangent_max)
+        else:
+            tangent_min = float(center[0] - wall_half[0])
+            tangent_max = float(center[0] + wall_half[0])
+            tangent_center = min(max(float(point[0]), tangent_min), tangent_max)
+
+        seg_half = min(0.5 * float(segment_len), 0.5 * (tangent_max - tangent_min))
+        seg_start = max(tangent_min, tangent_center - seg_half)
+        seg_end = min(tangent_max, tangent_center + seg_half)
+        if seg_end - seg_start <= 1e-4:
+            continue
+        wall_intervals[wall_idx].append((seg_start, seg_end))
+
+    patches = []
+    for wall_idx, intervals in wall_intervals.items():
+        center = centers[wall_idx]
+        wall_half = half[wall_idx]
+        for seg_start, seg_end in merge_intervals(intervals, min_gap=0.02):
+            if bool(axis_is_x[wall_idx]):
+                patches.append({
+                    'xy': (float(center[0] - wall_half[0]), seg_start),
+                    'width': float(2.0 * wall_half[0]),
+                    'height': float(seg_end - seg_start),
+                })
+            else:
+                patches.append({
+                    'xy': (seg_start, float(center[1] - wall_half[1])),
+                    'width': float(seg_end - seg_start),
+                    'height': float(2.0 * wall_half[1]),
+                })
+    return patches
 
 def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     """
@@ -588,6 +701,21 @@ for i in pbar:
     worker_grad_nonfinite = 0.0
     worker_grad_elems = 0.0
     worker_clip_pre = 0.0
+    proxy_grad_speed = 0.0
+    proxy_grad_dir = 0.0
+    proxy_grad_avoid = 0.0
+    proxy_grad_expl = 0.0
+    proxy_grad_smooth = 0.0
+    proxy_grad_speed_nonfinite = 0.0
+    proxy_grad_dir_nonfinite = 0.0
+    proxy_grad_avoid_nonfinite = 0.0
+    proxy_grad_expl_nonfinite = 0.0
+    proxy_grad_smooth_nonfinite = 0.0
+    proxy_grad_speed_elems = 0.0
+    proxy_grad_dir_elems = 0.0
+    proxy_grad_avoid_elems = 0.0
+    proxy_grad_expl_elems = 0.0
+    proxy_grad_smooth_elems = 0.0
     lgn_grad_norm = 0.0
     lgn_grad_max = 0.0
     lgn_grad_nonfinite = 0.0
@@ -605,6 +733,18 @@ for i in pbar:
     if not rollout_is_finite:
         pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
         continue
+
+    worker_params = tuple(worknet.parameters())
+    proxy_grad_speed, proxy_grad_speed_nonfinite, proxy_grad_speed_elems = \
+        get_loss_to_worker_grad_norm(loss_speed_seq.mean(), worker_params)
+    proxy_grad_dir, proxy_grad_dir_nonfinite, proxy_grad_dir_elems = \
+        get_loss_to_worker_grad_norm(loss_direction_seq.mean(), worker_params)
+    proxy_grad_avoid, proxy_grad_avoid_nonfinite, proxy_grad_avoid_elems = \
+        get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
+    proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
+        get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
+    proxy_grad_smooth, proxy_grad_smooth_nonfinite, proxy_grad_smooth_elems = \
+        get_loss_to_worker_grad_norm(loss_smooth_seq.mean(), worker_params)
 
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
@@ -729,7 +869,24 @@ for i in pbar:
             'Grad/LGN_Max_Abs': lgn_grad_max,
             'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
             'Grad/LGN_GradElem_Count': lgn_grad_elems,
-            'Grad/LGN_Clip_PreNorm': lgn_clip_pre
+            'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
+
+            # === [新增] 五个代理损失对 Worker 梯度的 norm ===
+            'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
+            'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
+            'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
+            'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
+            'Grad_ProxyWorker/4_Smoothness_Norm': proxy_grad_smooth,
+            'Grad_ProxyWorker/0_Speed_NonFinite': proxy_grad_speed_nonfinite,
+            'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
+            'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
+            'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
+            'Grad_ProxyWorker/4_Smoothness_NonFinite': proxy_grad_smooth_nonfinite,
+            'Grad_ProxyWorker/0_Speed_GradElem': proxy_grad_speed_elems,
+            'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
+            'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
+            'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
+            'Grad_ProxyWorker/4_Smoothness_GradElem': proxy_grad_smooth_elems
         }
         
         if train_lgn_phase:
@@ -764,13 +921,31 @@ for i in pbar:
 
             # 2. [增强] 轨迹俯视图 + 障碍物 + 目标点 (速度热力图)
             fig_map, ax = plt.subplots(figsize=(6, 10))
+            wall_patches = []
             if hasattr(env, 'voxels'):
-                walls = env.voxels[0].detach().cpu().numpy()
-                for w in walls:
+                walls_tensor = env.voxels[0].detach().cpu()
+                for w in walls_tensor.numpy():
                     # 过滤地板/天花板，仅显示中间层障碍物
                     if w[2] < 0.1 or w[2] > 1.9:
                         continue
                     rect = plt.Rectangle((w[0] - w[3], w[1] - w[4]), 2 * w[3], 2 * w[4], color='gray', alpha=0.5)
+                    ax.add_patch(rect)
+
+                collision_segment_len = 0.35 * float(getattr(env, 'maze_cell_size', 1.5))
+                wall_patches = get_collision_wall_patches(
+                    p_cpu,
+                    walls_tensor,
+                    drone_radius=float(getattr(env, 'drone_radius', 0.12)),
+                    segment_len=collision_segment_len,
+                    contact_eps=0.02,
+                )
+                for patch_idx, patch in enumerate(wall_patches):
+                    rect = plt.Rectangle(
+                        patch['xy'], patch['width'], patch['height'],
+                        facecolor='red', edgecolor='firebrick', linewidth=0.8,
+                        alpha=0.85, zorder=2.5,
+                        label='Collision Wall' if patch_idx == 0 else None,
+                    )
                     ax.add_patch(rect)
 
             # 速度热力图轨迹: 蓝(慢) -> 红(快), 范围 0-10 m/s
@@ -788,6 +963,7 @@ for i in pbar:
             cmap = cm.get_cmap('coolwarm')  # 蓝(低速) -> 红(高速)
             lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=2)
             lc.set_array(torch.tensor(seg_speeds).numpy())
+            lc.set_zorder(3.0)
             ax.add_collection(lc)
             cbar = fig_map.colorbar(lc, ax=ax, label='Speed (m/s)')
 

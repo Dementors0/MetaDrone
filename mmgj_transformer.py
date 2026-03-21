@@ -1,6 +1,6 @@
-#5.5.2.1  去掉smooth损失
-#速度硬约束5m/s
-#速度软约束3m/s
+#代碼6 infra
+#
+
 import argparse
 import math
 from collections import defaultdict
@@ -57,26 +57,8 @@ class RunningMeanStd(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, x, update=True):
-        x = sanitize_tensor(x, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        if update:
-            with torch.no_grad():
-                batch_mean = x.mean(dim=0)
-                batch_var = x.var(dim=0, unbiased=False)
-                batch_count = x.shape[0]
-
-                delta = batch_mean - self.mean
-                tot_count = self.count + batch_count
-
-                new_mean = self.mean + delta * batch_count / tot_count
-                m_a = self.var * self.count
-                m_b = batch_var * batch_count
-                M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
-                new_var = M2 / tot_count
-
-                self.mean.copy_(new_mean)
-                self.var.copy_(new_var)
-                self.count.copy_(tot_count)
-        return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
+        # USER REQUEST: remove normalization (return raw input)
+        return x
 
 class LossNormalizer:
     """Tracks running std of each loss component for scale normalization.
@@ -87,16 +69,8 @@ class LossNormalizer:
         self.momentum = momentum
 
     def normalize(self, *losses):
-        normalized = []
-        for i, loss in enumerate(losses):
-            with torch.no_grad():
-                batch_std = loss.detach().std()
-                if not torch.isfinite(batch_std):
-                    batch_std = torch.tensor(1.0, device=loss.device)
-                batch_std = max(batch_std.item(), 1e-6)
-                self.running_std[i] = (1 - self.momentum) * self.running_std[i] + self.momentum * batch_std
-            normalized.append(loss / self.running_std[i])
-        return normalized
+        # USER REQUEST: remove normalization (return raw losses)
+        return list(losses)
 
 
 def safe_normalize(x, dim=-1, eps=1e-6):
@@ -259,7 +233,7 @@ def smooth_dict(ori_dict):
         scaler_q[k].append(float(v))
 
 def is_save_iter(i):
-    return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
+    return (i + 1) % 1000 == 0
 
 def get_grad_stats(module):
     total_sq = 0.0
@@ -503,7 +477,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
                + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0,
+    # USER REQUEST: remove control loss (m_ctrl)
+    meta_val = sanitize_tensor(m_pos + m_coll + m_height * 2.0,
                                nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
@@ -529,6 +504,8 @@ for i in pbar:
 
     p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
     depth_history = []
+    rpy_history = []
+    act_net_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
 
@@ -557,6 +534,22 @@ for i in pbar:
         target_v_history.append(target_v)
 
         R = env.R
+        # Recalculate RPY from Rotation Matrix for Logging
+        sy = torch.sqrt(R[:, 0, 0] ** 2 + R[:, 1, 0] ** 2)
+        singular = sy < 1e-6
+        roll = torch.zeros_like(sy)
+        pitch = torch.zeros_like(sy)
+        yaw = torch.zeros_like(sy)
+        
+        roll[~singular] = torch.atan2(R[~singular, 2, 1], R[~singular, 2, 2])
+        pitch[~singular] = torch.atan2(-R[~singular, 2, 0], sy[~singular])
+        yaw[~singular] = torch.atan2(R[~singular, 1, 0], R[~singular, 0, 0])
+        
+        roll[singular] = torch.atan2(-R[singular, 1, 2], R[singular, 1, 1])
+        pitch[singular] = torch.atan2(-R[singular, 2, 0], sy[singular])
+        yaw[singular] = 0.0
+        rpy_history.append(torch.stack([roll, pitch, yaw], dim=-1).detach())
+
         state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
@@ -575,6 +568,7 @@ for i in pbar:
 
         # Worker Forward
         act, _, h = worknet(x_pooled, state_tensor, h)
+        act_net_history.append(act.detach())
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
@@ -763,21 +757,24 @@ for i in pbar:
         # Step 3: 反向传播贯穿整条链路 + 熵正则化
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
         # [问题5] 熵正则化: 鼓励LGN权重多样性, 防止坍缩
-        weight_ent = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(-1).mean()
-        lgn_total = meta_loss_unrolled - 0.1 * weight_ent
+        # USER REQUEST: remove regularization (weight entropy)
+        # weight_ent = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(-1).mean()
+        lgn_total = meta_loss_unrolled # - 0.1 * weight_ent
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
-        lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
+        # USER REQUEST: remove regularization (gradient clipping / clamping)
+        lgn_clip_pre = 0.0 # float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
         optim_lgn.step()
-        sanitize_module_(lgn, clamp_value=5.0)
+        # sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
     else:
         proxy_loss.backward()
         worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
-        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
+        # USER REQUEST: remove regularization (gradient clipping / clamping)
+        worker_clip_pre = 0.0 # float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
         optim_worker.step()
-        sanitize_module_(worknet, clamp_value=10.0)
+        # sanitize_module_(worknet, clamp_value=10.0)
         sched.step()
 
     ###### D. Logging & Saving (Enhanced) ######
@@ -991,6 +988,25 @@ for i in pbar:
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 
+            # 6. [新增] 无人机姿态 RPY 显示
+            fig_rpy, ax = plt.subplots(3, 1, sharex=True, figsize=(6, 8))
+            rpy_cpu = torch.stack(rpy_history)[:, idx].cpu() # [T, 3]
+            ax[0].plot(rpy_cpu[:, 0]); ax[0].set_ylabel('Roll (rad)')
+            ax[1].plot(rpy_cpu[:, 1]); ax[1].set_ylabel('Pitch (rad)')
+            ax[2].plot(rpy_cpu[:, 2]); ax[2].set_ylabel('Yaw (rad)')
+            ax[0].set_title(f"Iter {i} RPY (Time Series)")
+            writer.add_figure('Trajectory/RPY_Series', fig_rpy, i + 1)
+            plt.close(fig_rpy)
+
+            # 7. [新增] 记录 Worker Network 输出 Action
+            fig_act, ax = plt.subplots()
+            act_cpu = torch.stack(act_net_history)[:, idx].cpu() # [T, Dim]
+            for dim_i in range(act_cpu.shape[1]):
+                ax.plot(act_cpu[:, dim_i], label=f'Dim {dim_i}')
+            ax.legend(); ax.set_title(f"Iter {i} Network Action (Time Series)")
+            writer.add_figure('Trajectory/Action_Network_Series', fig_act, i + 1)
+            plt.close(fig_act)
+
             # 5. [新增] 深度图视频（保存到本地）
             if len(depth_history) > 0:
                 depth_stack = torch.stack(depth_history).float()  # [T, H, W], meters
@@ -1012,14 +1028,21 @@ for i in pbar:
                 depth_uint8 = (inv_norm * 255).to(torch.uint8)
                 mp4_path = os.path.join(video_dir, f'depth_iter_{i+1:06d}.mp4')
                 gif_path = os.path.join(video_dir, f'depth_iter_{i+1:06d}.gif')
+
+                # USER REQUEST: save video to TensorBoard
+                if len(frames) > 0:
+                     # frames is list of [H,W,3] numpy arrays. Stack -> [T, H, W, 3] -> [1, T, 3, H, W]
+                     video_tensor = torch.stack([torch.from_numpy(f) for f in frames]).permute(0, 3, 1, 2).unsqueeze(0)
+                     writer.add_video('Trajectory/Depth_Video', video_tensor, i + 1, fps=15)
+
                 if imageio is not None:
                     try:
                         imageio.mimsave(mp4_path, frames, fps=15, macro_block_size=None)
                     except Exception:
                         imageio.mimsave(gif_path, frames, format='GIF', fps=15)
-                else:
-                    # imageio 不可用时退化为逐帧图像记录到 TensorBoard
-                    for _fi, _frame in enumerate(depth_uint8):
-                        writer.add_image(f'Video/Depth_Frame/{_fi:03d}', _frame.unsqueeze(0), i + 1)
+                # else:
+                #     # imageio 不可用时退化为逐帧图像记录到 TensorBoard
+                #     for _fi, _frame in enumerate(depth_uint8):
+                #         writer.add_image(f'Video/Depth_Frame/{_fi:03d}', _frame.unsqueeze(0), i + 1)
 
 print(f"Training Finished. Artifacts in: {save_dir}")

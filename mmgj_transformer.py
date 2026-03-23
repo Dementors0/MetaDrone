@@ -1,6 +1,7 @@
 #5.5.2.1  去掉smooth损失
 #速度硬约束5m/s
 #速度软约束3m/s
+#換上交地圖
 import argparse
 import math
 from collections import defaultdict
@@ -9,6 +10,7 @@ import os
 import datetime
 import json
 import sys
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -21,11 +23,15 @@ from tqdm import tqdm
 from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
-import matplotlib.cm as cm
 try:
     import imageio.v2 as imageio
 except Exception:
     imageio = None
+
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
 
 if torch.cuda.is_available():
     torch.backends.cuda.enable_flash_sdp(False)
@@ -34,12 +40,12 @@ if torch.cuda.is_available():
     print("[SDP] flash=False, mem_efficient=False, math=True (for higher-order gradients)")
 
 try:
-    from env_maze_easy import Env
+    from env import Env
 except ModuleNotFoundError:
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
-    from env_maze_easy import Env
+    from env import Env
 try:
     from WorkNet_transformer import WorkNet
     from LossGenNet_transformer import LossGenNet
@@ -155,17 +161,29 @@ parser.add_argument('--no_odom', default=False, action='store_true')
 # 学习率
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--lgn_lr', type=float, default=2e-4)
-parser.add_argument('--inner_lr', type=float, default=1e-3,
+parser.add_argument('--inner_lr', type=float, default=3e-3,
                     help='Inner loop LR for differentiable worker update in LGN phase')
-parser.add_argument('--inner_steps', type=int, default=3,
+parser.add_argument('--inner_steps', type=int, default=1,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
 # 避障/碰撞超参
 parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
                     help='Proxy avoidance rises smoothly inside this clearance to walls')
-parser.add_argument('--proxy_avoid_floor', type=float, default=0.8,
-                    help='Minimum avoidance weight added to LGN output in proxy loss')
+parser.add_argument('--proxy_avoid_floor', type=float, default=0.2,
+                    help='Avoidance prior boost used in normalized proxy weighting')
+parser.add_argument('--proxy_expl_floor', type=float, default=0.05,
+                    help='Exploration prior boost used in normalized proxy weighting')
+parser.add_argument('--proxy_prior_mix', type=float, default=0.15,
+                    help='Blend ratio between LGN dynamic weights and fixed safety prior (0~1)')
+parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
+                    help='Temperature for LGN softmax output (lower = sharper)')
+parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
+                    help='Minimum per-channel LGN weight after simplex projection')
+parser.add_argument('--lgn_entropy_coeff', type=float, default=0.1,
+                    help='Entropy penalty coefficient for LGN weights (higher = more extreme weights)')
+parser.add_argument('--lgn_direct_coeff', type=float, default=0.5,
+                    help='Coefficient for direct LGN supervision signal (danger-aware weight adjustment)')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
                     help='Soft collision term weight in meta loss')
 parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
@@ -221,10 +239,23 @@ else:
 worknet = worknet.to(device)
 
 try:
-    lgn = LossGenNet(state_dim=state_dim, max_seq_len=args.lgn_max_seq_len).to(device)
+    lgn = LossGenNet(
+        state_dim=state_dim,
+        max_seq_len=args.lgn_max_seq_len,
+        output_temperature=args.lgn_output_temperature,
+        weight_floor=args.lgn_weight_floor,
+    ).to(device)
 except TypeError:
     lgn = LossGenNet(state_dim=state_dim).to(device)
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
+
+proxy_prior_mix = float(min(max(args.proxy_prior_mix, 0.0), 1.0))
+proxy_weight_prior = torch.tensor(
+    [1.0, 1.0, 1.0 + args.proxy_avoid_floor, 1.0 + args.proxy_expl_floor],
+    device=device,
+    dtype=torch.float32,
+)
+proxy_weight_prior = proxy_weight_prior / proxy_weight_prior.sum().clamp_min(1e-6)
 
 ########## 4. 加载预训练模型 ##########
 # def load_checkpoint(model, path, name):
@@ -260,6 +291,24 @@ def smooth_dict(ori_dict):
 
 def is_save_iter(i):
     return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
+
+
+def is_save_trajectory_iter(i):
+    return i == 0 or (i + 1) % 500 == 0
+
+
+def rotation_matrix_to_rpy_deg(R):
+    """Convert rotation matrix to roll-pitch-yaw in degrees (ZYX convention)."""
+    r20 = R[..., 2, 0]
+    r21 = R[..., 2, 1]
+    r22 = R[..., 2, 2]
+    r10 = R[..., 1, 0]
+    r00 = R[..., 0, 0]
+
+    pitch = torch.asin(torch.clamp(-r20, -1.0, 1.0))
+    roll = torch.atan2(r21, r22)
+    yaw = torch.atan2(r10, r00)
+    return torch.rad2deg(torch.stack([roll, pitch, yaw], dim=-1))
 
 def get_grad_stats(module):
     total_sq = 0.0
@@ -316,6 +365,258 @@ def merge_intervals(intervals, min_gap=1e-4):
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+@torch.no_grad()
+def get_map_view_bounds(env, traj_xy, target_xy=None, pad=0.5):
+    """Auto-fit map bounds for both maze-like and random obstacle layouts."""
+    x_vals = [traj_xy[:, 0]]
+    y_vals = [traj_xy[:, 1]]
+
+    if target_xy is not None:
+        x_vals.append(target_xy[0:1])
+        y_vals.append(target_xy[1:2])
+
+    if hasattr(env, 'voxels') and env.voxels.numel() > 0:
+        walls = env.voxels[0].detach().cpu()
+        c = walls[:, :2]
+        h = walls[:, 3:5]
+        x_vals.extend([c[:, 0] - h[:, 0], c[:, 0] + h[:, 0]])
+        y_vals.extend([c[:, 1] - h[:, 1], c[:, 1] + h[:, 1]])
+
+    x_all = torch.cat(x_vals)
+    y_all = torch.cat(y_vals)
+
+    x_min = float(x_all.min().item()) - pad
+    x_max = float(x_all.max().item()) + pad
+    y_min = float(y_all.min().item()) - pad
+    y_max = float(y_all.max().item()) + pad
+
+    if (x_max - x_min) < 1e-3:
+        x_min -= 0.5
+        x_max += 0.5
+    if (y_max - y_min) < 1e-3:
+        y_min -= 0.5
+        y_max += 0.5
+    return x_min, x_max, y_min, y_max
+
+
+def draw_sphere(ax, cx, cy, cz, r, color='royalblue', alpha=0.18, res=12):
+    u = np.linspace(0.0, 2.0 * np.pi, res)
+    v = np.linspace(0.0, np.pi, res)
+    x = cx + r * np.outer(np.cos(u), np.sin(v))
+    y = cy + r * np.outer(np.sin(u), np.sin(v))
+    z = cz + r * np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
+
+
+def draw_cylinder_z(ax, cx, cy, r, z0, z1, color='teal', alpha=0.14, res_theta=18, res_h=2):
+    theta = np.linspace(0.0, 2.0 * np.pi, res_theta)
+    z = np.linspace(z0, z1, res_h)
+    th_grid, z_grid = np.meshgrid(theta, z)
+    x = cx + r * np.cos(th_grid)
+    y = cy + r * np.sin(th_grid)
+    ax.plot_surface(x, y, z_grid, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
+
+
+def draw_cylinder_y(ax, cx, zc, r, y0, y1, color='darkorange', alpha=0.16, res_theta=18, res_h=2):
+    theta = np.linspace(0.0, 2.0 * np.pi, res_theta)
+    y = np.linspace(y0, y1, res_h)
+    th_grid, y_grid = np.meshgrid(theta, y)
+    x = cx + r * np.cos(th_grid)
+    z = zc + r * np.sin(th_grid)
+    ax.plot_surface(x, y_grid, z, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
+
+
+def _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.65):
+    x0, x1 = cx - hx, cx + hx
+    y0, y1 = cy - hy, cy + hy
+    z0, z1 = cz - hz, cz + hz
+    x = [x0, x1, x1, x0, x0, x1, x1, x0]
+    y = [y0, y0, y1, y1, y0, y0, y1, y1]
+    z = [z0, z0, z0, z0, z1, z1, z1, z1]
+    i = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 0, 4]
+    k = [2, 3, 6, 7, 5, 4, 6, 5, 7, 6, 4, 7]
+    fig.add_trace(go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k,
+                            color=color, opacity=opacity, flatshading=True,
+                            hoverinfo='skip', showscale=False))
+
+
+def _plotly_add_sphere(fig, cx, cy, cz, r, color='royalblue', opacity=0.75, res=16):
+    u = np.linspace(0.0, 2.0 * np.pi, res)
+    v = np.linspace(0.0, np.pi, res)
+    x = cx + r * np.outer(np.cos(u), np.sin(v))
+    y = cy + r * np.outer(np.sin(u), np.sin(v))
+    z = cz + r * np.outer(np.ones_like(u), np.cos(v))
+    c = np.zeros_like(x)
+    fig.add_trace(go.Surface(x=x, y=y, z=z, surfacecolor=c,
+                             colorscale=[[0, color], [1, color]], showscale=False,
+                             opacity=opacity, hoverinfo='skip'))
+
+
+def _plotly_add_cylinder_z(fig, cx, cy, r, z0, z1, color='teal', opacity=0.72, res_theta=22):
+    th = np.linspace(0.0, 2.0 * np.pi, res_theta)
+    z = np.array([z0, z1])
+    th_grid, z_grid = np.meshgrid(th, z)
+    x = cx + r * np.cos(th_grid)
+    y = cy + r * np.sin(th_grid)
+    c = np.zeros_like(x)
+    fig.add_trace(go.Surface(x=x, y=y, z=z_grid, surfacecolor=c,
+                             colorscale=[[0, color], [1, color]], showscale=False,
+                             opacity=opacity, hoverinfo='skip'))
+
+
+def _plotly_add_cylinder_y(fig, cx, zc, r, y0, y1, color='darkorange', opacity=0.72, res_theta=22):
+    th = np.linspace(0.0, 2.0 * np.pi, res_theta)
+    y = np.array([y0, y1])
+    th_grid, y_grid = np.meshgrid(th, y)
+    x = cx + r * np.cos(th_grid)
+    z = zc + r * np.sin(th_grid)
+    c = np.zeros_like(x)
+    fig.add_trace(go.Surface(x=x, y=y_grid, z=z, surfacecolor=c,
+                             colorscale=[[0, color], [1, color]], showscale=False,
+                             opacity=opacity, hoverinfo='skip'))
+
+
+def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5):
+    """保存交互式3D轨迹HTML，带有无人机姿态坐标系
+
+    Args:
+        R_cpu: 姿态矩阵 [T, 3, 3]，如果提供则绘制坐标系
+        axis_len: 坐标轴长度(米)
+        axis_step: 每隔多少个时间步绘制一次坐标系
+    """
+    if go is None:
+        return False
+
+    traj_xyz = p_cpu.numpy()
+    speed_cpu = v_cpu.norm(dim=-1).numpy()
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter3d(
+        x=traj_xyz[:, 0], y=traj_xyz[:, 1], z=traj_xyz[:, 2],
+        mode='lines+markers',
+        marker=dict(size=3, color=speed_cpu, colorscale='Turbo', colorbar=dict(title='Speed (m/s)')),
+        line=dict(color='limegreen', width=5),
+        name='Trajectory'
+    ))
+
+    # 绘制无人机姿态坐标系 (X-红, Y-绿, Z-蓝)
+    if R_cpu is not None:
+        R_np = R_cpu.numpy()  # [T, 3, 3]
+        T = len(traj_xyz)
+        # 每隔 axis_step 个点绘制一次坐标系
+        for t in range(0, T, axis_step):
+            pos = traj_xyz[t]
+            R = R_np[t]  # [3, 3], 列向量为机体坐标系的X,Y,Z轴
+            # X轴 (红色) - 机头方向
+            x_axis = R[:, 0] * axis_len
+            fig.add_trace(go.Scatter3d(
+                x=[pos[0], pos[0] + x_axis[0]],
+                y=[pos[1], pos[1] + x_axis[1]],
+                z=[pos[2], pos[2] + x_axis[2]],
+                mode='lines',
+                line=dict(color='red', width=4),
+                showlegend=(t == 0),
+                name='X-axis (Forward)' if t == 0 else None,
+                legendgroup='x_axis'
+            ))
+            # Y轴 (绿色) - 左侧方向
+            y_axis = R[:, 1] * axis_len
+            fig.add_trace(go.Scatter3d(
+                x=[pos[0], pos[0] + y_axis[0]],
+                y=[pos[1], pos[1] + y_axis[1]],
+                z=[pos[2], pos[2] + y_axis[2]],
+                mode='lines',
+                line=dict(color='green', width=4),
+                showlegend=(t == 0),
+                name='Y-axis (Left)' if t == 0 else None,
+                legendgroup='y_axis'
+            ))
+            # Z轴 (蓝色) - 上方向 (推力方向)
+            z_axis = R[:, 2] * axis_len
+            fig.add_trace(go.Scatter3d(
+                x=[pos[0], pos[0] + z_axis[0]],
+                y=[pos[1], pos[1] + z_axis[1]],
+                z=[pos[2], pos[2] + z_axis[2]],
+                mode='lines',
+                line=dict(color='blue', width=4),
+                showlegend=(t == 0),
+                name='Z-axis (Up/Thrust)' if t == 0 else None,
+                legendgroup='z_axis'
+            ))
+
+    x_vals = [traj_xyz[:, 0]]
+    y_vals = [traj_xyz[:, 1]]
+    z_vals = [traj_xyz[:, 2]]
+
+    if hasattr(env, 'voxels') and env.voxels.numel() > 0:
+        vox = env.voxels[idx].detach().cpu().numpy()
+        vox = vox[(vox[:, 3:6] < 20).all(axis=1)]
+        for box in vox[:180]:
+            cx, cy, cz, hx, hy, hz = box.tolist()
+            _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.7)
+            x_vals.extend([[cx - hx], [cx + hx]])
+            y_vals.extend([[cy - hy], [cy + hy]])
+            z_vals.extend([[cz - hz], [cz + hz]])
+
+    if hasattr(env, 'balls') and env.balls.numel() > 0:
+        balls = env.balls[idx].detach().cpu().numpy()
+        for bx, by, bz, br in balls[:80]:
+            _plotly_add_sphere(fig, float(bx), float(by), float(bz), float(br), color='royalblue', opacity=0.78, res=14)
+            x_vals.extend([[bx - br], [bx + br]])
+            y_vals.extend([[by - br], [by + br]])
+            z_vals.extend([[bz - br], [bz + br]])
+
+    z0_vis, z1_vis = -0.2, 2.2
+    if hasattr(env, 'cyl') and env.cyl.numel() > 0:
+        cyl = env.cyl[idx].detach().cpu().numpy()
+        for cx, cy, cr in cyl[:100]:
+            _plotly_add_cylinder_z(fig, float(cx), float(cy), float(cr), z0_vis, z1_vis, color='teal', opacity=0.76)
+            x_vals.extend([[cx - cr], [cx + cr]])
+            y_vals.extend([[cy - cr], [cy + cr]])
+
+    y0_vis, y1_vis = -9.5, 9.5
+    if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
+        cyl_h = env.cyl_h[idx].detach().cpu().numpy()
+        for cx, cz, cr in cyl_h[:100]:
+            _plotly_add_cylinder_y(fig, float(cx), float(cz), float(cr), y0_vis, y1_vis, color='darkorange', opacity=0.76)
+            x_vals.extend([[cx - cr], [cx + cr]])
+            z_vals.extend([[cz - cr], [cz + cr]])
+
+    fig.add_trace(go.Scatter3d(x=[traj_xyz[0, 0]], y=[traj_xyz[0, 1]], z=[traj_xyz[0, 2]], mode='markers',
+                               marker=dict(size=6, color='green', symbol='circle'), name='Start'))
+    fig.add_trace(go.Scatter3d(x=[traj_xyz[-1, 0]], y=[traj_xyz[-1, 1]], z=[traj_xyz[-1, 2]], mode='markers',
+                               marker=dict(size=6, color='black', symbol='x'), name='End'))
+    if hasattr(env, 'p_target'):
+        tgt = env.p_target[idx].detach().cpu().numpy()
+        fig.add_trace(go.Scatter3d(x=[tgt[0]], y=[tgt[1]], z=[tgt[2]], mode='markers',
+                                   marker=dict(size=8, color='red', symbol='diamond'), name='Goal'))
+        x_vals.append([tgt[0]])
+        y_vals.append([tgt[1]])
+        z_vals.append([tgt[2]])
+
+    x_all = np.concatenate([np.asarray(v) for v in x_vals])
+    y_all = np.concatenate([np.asarray(v) for v in y_vals])
+    z_all = np.concatenate([np.asarray(v) for v in z_vals])
+
+    fig.update_layout(
+        title='Interactive 3D Trajectory & Obstacles',
+        scene=dict(
+            xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)',
+            xaxis=dict(range=[float(x_all.min()) - 0.5, float(x_all.max()) + 0.5]),
+            yaxis=dict(range=[float(y_all.min()) - 0.5, float(y_all.max()) + 0.5]),
+            zaxis=dict(range=[float(z_all.min()) - 0.2, float(z_all.max()) + 0.2]),
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.6, y=1.4, z=1.2))
+        ),
+        template='plotly_white',
+        showlegend=True,
+        margin=dict(l=5, r=5, t=40, b=5)
+    )
+    fig.write_html(html_path, include_plotlyjs='cdn')
+    return True
 
 
 @torch.no_grad()
@@ -410,10 +711,39 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     # 计算每个时间步的能量总和
     energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2) 
     mask_sum = mask.sum(dim=1).unsqueeze(0) + 1e-6
-    
+
     # 返回 [Batch, Time]
     loss_per_step = energy_sum / mask_sum
     return loss_per_step
+
+
+def compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=0.35):
+    """
+    直接监督信号，不经过 inner loop，为 LGN 提供强梯度路径。
+
+    参数:
+        weights_seq_norm: [T, B, 4] 归一化后的 LGN 权重
+        dist_obj: [T, B] 到障碍物的距离
+        safe_margin: 安全边距
+
+    监督逻辑:
+        1. 接近障碍时，avoid 权重应该高
+        2. 接近障碍时，speed 权重应该低
+    """
+    # danger_level: [T, B], 越接近障碍越高 (0~1)
+    danger_level = torch.sigmoid((safe_margin - dist_obj) * 10.0)
+
+    # 期望: 危险时 avoid 权重高，speed 权重低
+    avoid_weight = weights_seq_norm[:, :, 2]  # [T, B]
+    speed_weight = weights_seq_norm[:, :, 0]
+
+    # 危险时惩罚 avoid 权重不够高
+    loss_avoid_signal = (danger_level * (1.0 - avoid_weight)).mean()
+    # 危险时惩罚 speed 权重太高
+    loss_speed_signal = (danger_level * speed_weight).mean()
+
+    return loss_avoid_signal + 0.5 * loss_speed_signal
+
 
 def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
     """
@@ -528,13 +858,16 @@ for i in pbar:
     worknet.reset()
 
     p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
+    rpy_history = []
+    R_history = []  # 记录姿态矩阵用于可视化
+    real_act_history = []
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
 
     h = None
     lgn_hx = None
-    do_save_viz = is_save_iter(i)
+    do_save_viz = is_save_trajectory_iter(i)
     rollout_steps = args.lgn_timesteps if train_lgn_phase else args.timesteps
 
     ###### A. Rollout ######
@@ -549,6 +882,8 @@ for i in pbar:
         p_history.append(env.p)
         v_history.append(env.v)
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())
+        rpy_history.append(rotation_matrix_to_rpy_deg(env.R))
+        R_history.append(env.R.detach().clone())  # 保存姿态矩阵
 
         target_v_raw_curr = env.p_target - env.p.detach()
         target_v_norm = torch.norm(target_v_raw_curr, 2, -1, keepdim=True)
@@ -568,9 +903,9 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        # LGN Forward
+        # LGN Forward (输出非负权重，不限于0-1)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
-        current_weights = sanitize_tensor(current_weights, nan=0.2, posinf=1.0, neginf=0.05).clamp(0.05, 1.0)
+        current_weights = sanitize_tensor(current_weights, nan=1.0, posinf=100.0, neginf=0.0).clamp(0.01, 100.0)
         trajectory_lgn_weights.append(current_weights)
 
         # Worker Forward
@@ -579,6 +914,7 @@ for i in pbar:
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        real_act_history.append(real_act)
         act_buffer.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
@@ -592,7 +928,8 @@ for i in pbar:
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
             if h is not None:
                 h = h.detach()
-            if lgn_hx is not None:
+            # LGN phase 时保留 lgn_hx 梯度，Worker phase 时截断
+            if lgn_hx is not None and not train_lgn_phase:
                 lgn_hx = lgn_hx.detach()
 
     ###### B. Loss Calculation (Step-wise) ######
@@ -600,6 +937,9 @@ for i in pbar:
     v_history = torch.stack(v_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
     weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
+    rpy_history = torch.stack(rpy_history) # [T, B, 3]
+    R_history = torch.stack(R_history)     # [T, B, 3, 3]
+    real_act_history = torch.stack(real_act_history) # [T, B, 3]
 
     vec_to_pt = torch.stack(vec_to_pt_history)
     if vec_to_pt.dim() == 4: vec_to_pt = vec_to_pt.mean(1)
@@ -656,12 +996,21 @@ for i in pbar:
             loss_speed_seq, loss_direction_seq, loss_avoidance_seq, loss_exploration_seq
         )
 
+    # 先归一化 LGN 原始权重，使其与 prior 同尺度
+    weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    effective_weights_seq = (
+        (1.0 - proxy_prior_mix) * weights_seq_norm
+        + proxy_prior_mix * proxy_weight_prior.view(1, 1, 4).to(weights_seq.dtype)
+    )
+    effective_weights_seq = effective_weights_seq / effective_weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
-        weights_seq[:, :, 0] * loss_speed_n +
-        weights_seq[:, :, 1] * loss_dir_n +
-        (weights_seq[:, :, 2] + args.proxy_avoid_floor) * loss_avoid_n +
-        (weights_seq[:, :, 3] + 0.1) * loss_expl_n
+        effective_weights_seq[:, :, 0] * loss_speed_n +
+        effective_weights_seq[:, :, 1] * loss_dir_n +
+        effective_weights_seq[:, :, 2] * loss_avoid_n +
+        effective_weights_seq[:, :, 3] * loss_expl_n
     )
 
     # 3. 最终 Proxy Loss (含固定权重的高度约束)
@@ -692,6 +1041,7 @@ for i in pbar:
     optim_worker.zero_grad()
     optim_lgn.zero_grad()
     lgn_update_loss = 0.0
+    lgn_direct_loss_val = 0.0
     worker_grad_norm = 0.0
     worker_grad_max = 0.0
     worker_grad_nonfinite = 0.0
@@ -748,7 +1098,7 @@ for i in pbar:
                 create_graph=True, allow_unused=True, retain_graph=True,
             )
             fast_params = {
-                name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+                name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
                        if g is not None else p)
                 for (name, p), g in zip(fast_params.items(), inner_grads)
             }
@@ -760,11 +1110,13 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             continue
 
-        # Step 3: 反向传播贯穿整条链路 + 熵正则化
+        # Step 3: 反向传播贯穿整条链路 + 正则化
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # [问题5] 熵正则化: 鼓励LGN权重多样性, 防止坍缩
-        weight_ent = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(-1).mean()
-        lgn_total = meta_loss_unrolled - 0.1 * weight_ent
+        # 熵正则化: 惩罚高熵(均匀分布), 鼓励LGN输出极端权重
+        weight_ent = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(-1).mean() / math.log(4.0)
+        # 直接监督损失: 不经过 inner loop，为 LGN 提供强梯度路径
+        lgn_direct_loss = compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=args.avoid_safe_margin)
+        lgn_total = meta_loss_unrolled + args.lgn_entropy_coeff * weight_ent + args.lgn_direct_coeff * lgn_direct_loss
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
         lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
@@ -772,6 +1124,7 @@ for i in pbar:
         sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
+        lgn_direct_loss_val = lgn_direct_loss.detach()
     else:
         proxy_loss.backward()
         worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
@@ -789,26 +1142,41 @@ for i in pbar:
     with torch.no_grad():
         success = torch.all(dist_obj > 0, 0)
         # 计算平均权重 (用于 Scalar 显示)
-        avg_weights = weights_seq.mean(dim=[0, 1]).cpu()
-        weight_entropy = (-weights_seq * torch.log(weights_seq.clamp_min(1e-8))).sum(dim=-1).mean()
+        avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始非归一化权重
+        avg_weights = weights_seq_norm.mean(dim=[0, 1]).cpu()  # 归一化后的权重
+        avg_effective_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()
+        weight_entropy = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(dim=-1).mean()
         v_norm = v_history.norm(dim=-1)
         avg_speed = v_norm.mean()
         min_speed_threshold = float(env.max_speed) * 0.7
+        act_cmd_mean = real_act_history.mean(dim=(0, 1))
+        act_cmd_abs_mean = real_act_history.abs().mean(dim=(0, 1))
+        act_cmd_norm_mean = real_act_history.norm(dim=-1).mean()
         
         log_data = {
             # === 主要Loss ===
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
-            
-            # === [增强] 4个权重均值 ===
+
+            # === [增强] 4个权重均值 (归一化后) ===
             'Weights/0_Speed': avg_weights[0],
             'Weights/1_Direction': avg_weights[1],
             'Weights/2_Avoidance': avg_weights[2],
             'Weights/3_Exploration': avg_weights[3],
+            # === 原始非归一化权重 ===
+            'Weights_Raw/0_Speed': avg_weights_raw[0],
+            'Weights_Raw/1_Direction': avg_weights_raw[1],
+            'Weights_Raw/2_Avoidance': avg_weights_raw[2],
+            'Weights_Raw/3_Exploration': avg_weights_raw[3],
+            'Weights_Effective/0_Speed': avg_effective_weights[0],
+            'Weights_Effective/1_Direction': avg_effective_weights[1],
+            'Weights_Effective/2_Avoidance': avg_effective_weights[2],
+            'Weights_Effective/3_Exploration': avg_effective_weights[3],
 
             # === [新增] 权重分布监控 ===
-            'Weight_Stats/Min': weights_seq.min(),
-            'Weight_Stats/Max': weights_seq.max(),
+            'Weight_Stats/Raw_Min': weights_seq.min(),
+            'Weight_Stats/Raw_Max': weights_seq.max(),
+            'Weight_Stats/Raw_Mean': weights_seq.mean(),
             'Weight_Stats/Entropy': weight_entropy,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
@@ -837,6 +1205,13 @@ for i in pbar:
             'Metrics/Max_Speed': v_norm.max(),
             'Metrics/Episode_Length': actual_T,
             'Metrics/Adaptive_Speed_Target': v_target_adaptive.mean(),
+            'Control/Accel_Cmd_Norm_Mean': act_cmd_norm_mean,
+            'Control/Accel_Cmd_X_Mean': act_cmd_mean[0],
+            'Control/Accel_Cmd_Y_Mean': act_cmd_mean[1],
+            'Control/Accel_Cmd_Z_Mean': act_cmd_mean[2],
+            'Control/Accel_Cmd_X_AbsMean': act_cmd_abs_mean[0],
+            'Control/Accel_Cmd_Y_AbsMean': act_cmd_abs_mean[1],
+            'Control/Accel_Cmd_Z_AbsMean': act_cmd_abs_mean[2],
 
             # === [对齐] 归一化统计命名（与第二脚本风格一致） ===
             'Norm/State_Mean': state_normalizer.mean[0],
@@ -874,9 +1249,10 @@ for i in pbar:
             'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
             'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems
         }
-        
+
         if train_lgn_phase:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss
+            log_data['Loss/4_LGN_Direct'] = lgn_direct_loss_val
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
             log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur
@@ -894,7 +1270,8 @@ for i in pbar:
             torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
             torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
             torch.save(state_normalizer.state_dict(), os.path.join(save_dir, f'norm_ckpt_{i:06d}.pth'))
-            
+
+        if is_save_trajectory_iter(i):
             idx = 0
             
             # 1. 轨迹时序图 (X,Y,Z vs T)
@@ -905,72 +1282,106 @@ for i in pbar:
             writer.add_figure('Trajectory/Position_Series', fig_p, i + 1)
             plt.close(fig_p)
 
-            # 2. [增强] 轨迹俯视图 + 障碍物 + 目标点 (速度热力图)
-            fig_map, ax = plt.subplots(figsize=(6, 10))
-            wall_patches = []
-            if hasattr(env, 'voxels'):
-                walls_tensor = env.voxels[0].detach().cpu()
-                for w in walls_tensor.numpy():
-                    # 过滤地板/天花板，仅显示中间层障碍物
-                    if w[2] < 0.1 or w[2] > 1.9:
-                        continue
-                    rect = plt.Rectangle((w[0] - w[3], w[1] - w[4]), 2 * w[3], 2 * w[4], color='gray', alpha=0.5)
-                    ax.add_patch(rect)
+            # 2. [改造] 三维轨迹 + 障碍物显示（非俯视图）
+            fig_map = plt.figure(figsize=(8, 6))
+            ax = fig_map.add_subplot(111, projection='3d')
 
-                collision_segment_len = 0.35 * float(getattr(env, 'maze_cell_size', 1.5))
-                wall_patches = get_collision_wall_patches(
-                    p_cpu,
-                    walls_tensor,
-                    drone_radius=float(getattr(env, 'drone_radius', 0.12)),
-                    segment_len=collision_segment_len,
-                    contact_eps=0.02,
-                )
-                for patch_idx, patch in enumerate(wall_patches):
-                    rect = plt.Rectangle(
-                        patch['xy'], patch['width'], patch['height'],
-                        facecolor='red', edgecolor='firebrick', linewidth=0.8,
-                        alpha=0.85, zorder=2.5,
-                        label='Collision Wall' if patch_idx == 0 else None,
-                    )
-                    ax.add_patch(rect)
-
-            # 速度热力图轨迹: 蓝(慢) -> 红(快), 范围 0-10 m/s
+            # 速度着色三维轨迹
             v_cpu = v_history[:, idx].cpu()
-            speed_cpu = v_cpu.norm(dim=-1).numpy()  # [T]
-            points = p_cpu[:, :2].numpy()            # [T, 2] (X, Y)
-            segments = []
-            seg_speeds = []
-            for si in range(len(points) - 1):
-                segments.append([points[si], points[si + 1]])
-                seg_speeds.append((speed_cpu[si] + speed_cpu[si + 1]) / 2.0)
-            seg_speeds = [speed_cpu[0]] if len(seg_speeds) == 0 else seg_speeds
-
+            speed_cpu = v_cpu.norm(dim=-1).numpy()
+            traj_xyz = p_cpu.numpy()
+            cmap = plt.get_cmap('coolwarm')
             norm = Normalize(vmin=0.0, vmax=10.0)
-            cmap = cm.get_cmap('coolwarm')  # 蓝(低速) -> 红(高速)
-            lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=2)
-            lc.set_array(torch.tensor(seg_speeds).numpy())
-            lc.set_zorder(3.0)
-            ax.add_collection(lc)
-            cbar = fig_map.colorbar(lc, ax=ax, label='Speed (m/s)')
+            sc = ax.scatter(traj_xyz[:, 0], traj_xyz[:, 1], traj_xyz[:, 2],
+                            c=speed_cpu, cmap=cmap, norm=norm, s=9, alpha=0.95, label='Trajectory')
+            ax.plot(traj_xyz[:, 0], traj_xyz[:, 1], traj_xyz[:, 2], color='steelblue', linewidth=1.0, alpha=0.55)
+            fig_map.colorbar(sc, ax=ax, pad=0.08, shrink=0.75, label='Speed (m/s)')
 
-            ax.plot(p_cpu[0, 0], p_cpu[0, 1], 'go', markersize=8, label='Start')   # 起点
-            ax.plot(p_cpu[-1, 0], p_cpu[-1, 1], 'kx', markersize=8, label='End')    # 终点
+            # 三维障碍物盒体显示
+            x_all = [p_cpu[:, 0]]
+            y_all = [p_cpu[:, 1]]
+            z_all = [p_cpu[:, 2]]
+            if hasattr(env, 'voxels') and env.voxels.numel() > 0:
+                vox = env.voxels[0].detach().cpu()
+                # 过滤掉用于roof占位的超大盒体，避免坐标轴被极端值拉爆
+                valid_vox = vox[(vox[:, 3:6] < 20).all(dim=1)]
+                for box in valid_vox.numpy():
+                    cx, cy, cz, hx, hy, hz = box.tolist()
+                    ax.bar3d(cx - hx, cy - hy, cz - hz, 2 * hx, 2 * hy, 2 * hz,
+                             color='lightgray', alpha=0.65, edgecolor='dimgray', linewidth=0.25, shade=True)
+                if valid_vox.numel() > 0:
+                    c = valid_vox[:, :3]
+                    h = valid_vox[:, 3:]
+                    x_all.extend([c[:, 0] - h[:, 0], c[:, 0] + h[:, 0]])
+                    y_all.extend([c[:, 1] - h[:, 1], c[:, 1] + h[:, 1]])
+                    z_all.extend([c[:, 2] - h[:, 2], c[:, 2] + h[:, 2]])
+
+            # balls: 球形障碍物 (cx, cy, cz, r)
+            if hasattr(env, 'balls') and env.balls.numel() > 0:
+                balls = env.balls[0].detach().cpu().numpy()
+                for bx, by, bz, br in balls:
+                    draw_sphere(ax, float(bx), float(by), float(bz), float(br), color='royalblue', alpha=0.72, res=14)
+                    x_all.extend([torch.tensor([bx - br]), torch.tensor([bx + br])])
+                    y_all.extend([torch.tensor([by - br]), torch.tensor([by + br])])
+                    z_all.extend([torch.tensor([bz - br]), torch.tensor([bz + br])])
+
+            # cyl: 竖直圆柱障碍物 (cx, cy, r), 沿 z 方向
+            z0_vis, z1_vis = -0.2, 2.2
+            if len(z_all) > 0:
+                z_stack = torch.cat(z_all)
+                z0_vis = min(z0_vis, float(z_stack.min().item()) - 0.1)
+                z1_vis = max(z1_vis, float(z_stack.max().item()) + 0.1)
+            if hasattr(env, 'cyl') and env.cyl.numel() > 0:
+                cyl = env.cyl[0].detach().cpu().numpy()
+                for cx, cy, cr in cyl:
+                    draw_cylinder_z(ax, float(cx), float(cy), float(cr), z0_vis, z1_vis, color='teal', alpha=0.72)
+                    x_all.extend([torch.tensor([cx - cr]), torch.tensor([cx + cr])])
+                    y_all.extend([torch.tensor([cy - cr]), torch.tensor([cy + cr])])
+
+            # cyl_h: 水平圆柱障碍物 (cx, cz, r), 沿 y 方向
+            y0_vis, y1_vis = -9.5, 9.5
+            if len(y_all) > 0:
+                y_stack = torch.cat(y_all)
+                y0_vis = min(y0_vis, float(y_stack.min().item()) - 0.1)
+                y1_vis = max(y1_vis, float(y_stack.max().item()) + 0.1)
+            if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
+                cyl_h = env.cyl_h[0].detach().cpu().numpy()
+                for cx, cz, cr in cyl_h:
+                    draw_cylinder_y(ax, float(cx), float(cz), float(cr), y0_vis, y1_vis, color='darkorange', alpha=0.74)
+                    x_all.extend([torch.tensor([cx - cr]), torch.tensor([cx + cr])])
+                    z_all.extend([torch.tensor([cz - cr]), torch.tensor([cz + cr])])
+
+            # 起点、终点、目标点
+            ax.scatter([traj_xyz[0, 0]], [traj_xyz[0, 1]], [traj_xyz[0, 2]], c='green', s=45, marker='o', label='Start')
+            ax.scatter([traj_xyz[-1, 0]], [traj_xyz[-1, 1]], [traj_xyz[-1, 2]], c='black', s=45, marker='x', label='End')
             if hasattr(env, 'p_target'):
-                target = env.p_target[idx].detach().cpu().numpy()
-                ax.plot(target[0], target[1], 'r*', markersize=10, label='Goal')
+                target_xyz = env.p_target[idx].detach().cpu()
+                ax.scatter([float(target_xyz[0])], [float(target_xyz[1])], [float(target_xyz[2])],
+                           c='red', s=70, marker='*', label='Goal')
+                x_all.append(target_xyz[0:1])
+                y_all.append(target_xyz[1:2])
+                z_all.append(target_xyz[2:3])
 
-            if all(hasattr(env, k) for k in ['maze_cols', 'maze_rows', 'maze_cell_size']):
-                maze_w = float(env.maze_cols) * float(env.maze_cell_size)
-                maze_h = float(env.maze_rows) * float(env.maze_cell_size)
-                ax.set_xlim(0.0, maze_w)
-                ax.set_ylim(-maze_h / 2.0, maze_h / 2.0)
-            else:
-                ax.autoscale_view()
+            x_cat = torch.cat(x_all)
+            y_cat = torch.cat(y_all)
+            z_cat = torch.cat(z_all)
+            ax.set_xlim(float(x_cat.min().item()) - 0.5, float(x_cat.max().item()) + 0.5)
+            ax.set_ylim(float(y_cat.min().item()) - 0.5, float(y_cat.max().item()) + 0.5)
+            ax.set_zlim(float(z_cat.min().item()) - 0.2, float(z_cat.max().item()) + 0.2)
 
-            ax.set_aspect('equal')
-            ax.legend(); ax.set_title(f"Iter {i} Map & Trajectory (Speed Heatmap)")
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
+            ax.set_zlabel('Z (m)')
+            ax.view_init(elev=28, azim=38)
+            ax.legend(loc='upper left')
+            ax.set_title(f"Iter {i} 3D Trajectory & Obstacles")
             writer.add_figure('Trajectory/Map_View', fig_map, i + 1)
             plt.close(fig_map)
+
+            interactive_html = os.path.join(video_dir, f'trajectory3d_iter_{i+1:06d}.html')
+            R_cpu = R_history[:, idx].cpu()  # [T, 3, 3] 姿态矩阵
+            if save_interactive_3d_html(interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx):
+                writer.add_text('Trajectory/Interactive3D_HTML', interactive_html, i + 1)
             
             # 3. [新增] 速度时序图 (Vx,Vy,Vz,Speed)
             fig_v, ax = plt.subplots()
@@ -981,15 +1392,47 @@ for i in pbar:
             writer.add_figure('Trajectory/Velocity_Series', fig_v, i + 1)
             plt.close(fig_v)
 
+            # 3.1 [新增] 姿态时序图 (Roll/Pitch/Yaw, deg)
+            fig_rpy, ax = plt.subplots()
+            rpy_cpu = rpy_history[:, idx].cpu()
+            ax.plot(rpy_cpu[:, 0], label='roll(deg)')
+            ax.plot(rpy_cpu[:, 1], label='pitch(deg)')
+            ax.plot(rpy_cpu[:, 2], label='yaw(deg)')
+            ax.legend(); ax.set_title(f"Iter {i} Attitude RPY (Time Series)")
+            writer.add_figure('Trajectory/Attitude_RPY_Series', fig_rpy, i + 1)
+            plt.close(fig_rpy)
+
+            # 3.2 [新增] WorkNet映射到真实环境的控制量 (加速度) 时序图
+            fig_act, ax = plt.subplots()
+            act_cpu = real_act_history[:, idx].cpu()
+            ax.plot(act_cpu[:, 0], label='ax_cmd')
+            ax.plot(act_cpu[:, 1], label='ay_cmd')
+            ax.plot(act_cpu[:, 2], label='az_cmd')
+            ax.plot(act_cpu.norm(dim=-1), label='|a_cmd|', linestyle='--')
+            ax.legend(); ax.set_title(f"Iter {i} Control Accel Cmd (Time Series)")
+            writer.add_figure('Trajectory/Control_Accel_Cmd_Series', fig_act, i + 1)
+            plt.close(fig_act)
+
             # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
             fig_w, ax = plt.subplots()
-            w_cpu = weights_seq[:, idx, :].cpu() # [T, 4]
+            w_cpu = weights_seq_norm[:, idx, :].cpu() # [T, 4] 归一化后的权重
             labels = ['Speed', 'Dir', 'Avoid', 'Expl']
             for wi in range(4):
                 ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step)")
+            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Normalized)")
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
+
+            # 4.1 [新增] 权重精确值记录（与轨迹同步，用于分析权重动态变化）
+            writer.add_scalar('Weights_Snapshot/0_Speed', avg_weights[0], i + 1)
+            writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
+            writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
+            writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)
+            writer.add_scalar('Weights_Snapshot/Entropy', weight_entropy, i + 1)
+            # 权重统计
+            writer.add_scalar('Weights_Snapshot/Raw_Min', weights_seq.min(), i + 1)
+            writer.add_scalar('Weights_Snapshot/Raw_Max', weights_seq.max(), i + 1)
+            writer.add_scalar('Weights_Snapshot/Raw_Mean', weights_seq.mean(), i + 1)
 
             # 5. [新增] 深度图视频（保存到本地）
             if len(depth_history) > 0:
@@ -1001,7 +1444,7 @@ for i in pbar:
                 inv_norm = ((inv_depth - p2) / (p98 - p2 + 1e-6)).clamp(0.0, 1.0)  # [T, H, W]
 
                 # 转为 RGB 彩色帧，避免灰度写视频时编码器/播放器显示发黑
-                cmap_np = cm.get_cmap('magma')
+                cmap_np = plt.get_cmap('magma')
                 inv_np = inv_norm.cpu().numpy()  # [T, H, W], [0,1]
                 frames = []
                 for _k in range(inv_np.shape[0]):

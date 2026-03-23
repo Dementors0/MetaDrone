@@ -8,10 +8,21 @@ class LossGenNet(nn.Module):
     CNN (视觉) + MLP (状态) -> Token Fusion -> Transformer (时序记忆) -> MLP (输出)
     """
 
-    def __init__(self, state_dim, hidden_dim=128, nhead=4, num_layers=2, max_seq_len=64):
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim=128,
+        nhead=4,
+        num_layers=2,
+        max_seq_len=64,
+        output_temperature=1.0,
+        weight_floor=0.01,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
+        self.output_temperature = float(max(output_temperature, 1e-3))
+        self.weight_floor = float(min(max(weight_floor, 0.0), 0.249))
         
         # 1. 增强视觉特征提取 (3层卷积)
         # Input: [B, 1, 12, 16]
@@ -50,13 +61,12 @@ class LossGenNet(nn.Module):
         self.pre_norm = nn.LayerNorm(hidden_dim)
         self.out_norm = nn.LayerNorm(hidden_dim)
 
-        # 4. 输出头 (Sigmoid独立激活, 打破Softmax零和竞争)
+        # 4. 输出头
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, 4),  # [Vel, Dir, Obs, Expl]
         )
-        self.weight_floor = 0.05  # 每通道最小权重, 防止坍缩至0
 
     def forward(self, depth_feat, state, hx=None):
         """
@@ -95,9 +105,10 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成权重 (Sigmoid独立激活 + 下界保护)
+        # 5. 生成权重 (非负输出，不做归一化，允许自由动态范围)
         raw = self.head(last_token)
-        weights = torch.sigmoid(raw) * (1.0 - self.weight_floor) + self.weight_floor
-        
+        # 使用 softplus 保证非负，输出范围 [weight_floor, +inf)
+        weights = F.softplus(raw / self.output_temperature) + self.weight_floor
+
         # 返回 weights 和 新的记忆序列
         return weights, seq

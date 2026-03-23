@@ -180,9 +180,9 @@ parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
                     help='Temperature for LGN softmax output (lower = sharper)')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
                     help='Minimum per-channel LGN weight after simplex projection')
-parser.add_argument('--lgn_entropy_coeff', type=float, default=0.1,
-                    help='Entropy penalty coefficient for LGN weights (higher = more extreme weights)')
-parser.add_argument('--lgn_direct_coeff', type=float, default=0.5,
+parser.add_argument('--lgn_entropy_coeff', type=float, default=0.02,
+                    help='Entropy penalty coefficient for LGN weights (higher = more uniform weights)')
+parser.add_argument('--lgn_direct_coeff', type=float, default=0.1,
                     help='Coefficient for direct LGN supervision signal (danger-aware weight adjustment)')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
                     help='Soft collision term weight in meta loss')
@@ -719,30 +719,36 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
 
 def compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=0.35):
     """
-    直接监督信号，不经过 inner loop，为 LGN 提供强梯度路径。
+    直接监督信号，不经过 inner loop，为 LGN 提供温和的梯度引导。
 
     参数:
         weights_seq_norm: [T, B, 4] 归一化后的 LGN 权重
         dist_obj: [T, B] 到障碍物的距离
         safe_margin: 安全边距
 
-    监督逻辑:
-        1. 接近障碍时，avoid 权重应该高
-        2. 接近障碍时，speed 权重应该低
+    监督逻辑 (温和版本):
+        1. 非常接近障碍时 (dist < 0.1)，轻微提升 avoid 权重
+        2. 安全时 (dist > safe_margin)，允许更多 speed/direction 权重
+        3. 使用 soft 目标而非强制推向极端值
     """
-    # danger_level: [T, B], 越接近障碍越高 (0~1)
-    danger_level = torch.sigmoid((safe_margin - dist_obj) * 10.0)
+    # danger_level: [T, B], 只在非常接近障碍时才高 (使用更陡的 sigmoid)
+    danger_level = torch.sigmoid((0.15 - dist_obj) * 15.0)  # 只在 dist < 0.15 时显著
 
-    # 期望: 危险时 avoid 权重高，speed 权重低
+    # safe_level: [T, B], 安全区域
+    safe_level = torch.sigmoid((dist_obj - safe_margin) * 8.0)
+
+    # 期望: 危险时 avoid 权重适度高 (目标 ~0.4)，而非强制到 1.0
     avoid_weight = weights_seq_norm[:, :, 2]  # [T, B]
     speed_weight = weights_seq_norm[:, :, 0]
+    dir_weight = weights_seq_norm[:, :, 1]
 
-    # 危险时惩罚 avoid 权重不够高
-    loss_avoid_signal = (danger_level * (1.0 - avoid_weight)).mean()
-    # 危险时惩罚 speed 权重太高
-    loss_speed_signal = (danger_level * speed_weight).mean()
+    # 危险时轻微惩罚 avoid 权重过低 (目标 ≥ 0.35)
+    loss_avoid_low = (danger_level * F.relu(0.35 - avoid_weight)).mean()
 
-    return loss_avoid_signal + 0.5 * loss_speed_signal
+    # 安全时允许 speed+direction 权重更高，但不强制
+    loss_safe_balance = (safe_level * F.relu(0.15 - (speed_weight + dir_weight))).mean()
+
+    return loss_avoid_low + 0.3 * loss_safe_balance
 
 
 def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
@@ -1112,11 +1118,12 @@ for i in pbar:
 
         # Step 3: 反向传播贯穿整条链路 + 正则化
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # 熵正则化: 惩罚高熵(均匀分布), 鼓励LGN输出极端权重
+        # 熵正则化: 鼓励高熵(均匀分布), 防止权重过早收敛到极端值
         weight_ent = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(-1).mean() / math.log(4.0)
-        # 直接监督损失: 不经过 inner loop，为 LGN 提供强梯度路径
+        # 直接监督损失: 不经过 inner loop，为 LGN 提供温和的梯度引导
         lgn_direct_loss = compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=args.avoid_safe_margin)
-        lgn_total = meta_loss_unrolled + args.lgn_entropy_coeff * weight_ent + args.lgn_direct_coeff * lgn_direct_loss
+        # 注意: -weight_ent 鼓励高熵（更均匀的权重分布）
+        lgn_total = meta_loss_unrolled - args.lgn_entropy_coeff * weight_ent + args.lgn_direct_coeff * lgn_direct_loss
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
         lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())

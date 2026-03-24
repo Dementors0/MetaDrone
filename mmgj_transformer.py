@@ -1,5 +1,7 @@
 #7.1
-#增加代碼動態性
+#修改地圖起始位置和終點
+#可調整障礙物密度
+
 import argparse
 import math
 from collections import defaultdict
@@ -131,6 +133,20 @@ parser.add_argument('--worker_steps', type=int, default=5)
 # 基础物理参数
 parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
+parser.add_argument('--scene_scale', type=float, default=0.5,#調節環境大小
+                    help='Global scene size scale for obstacle field extent and spawn area')
+parser.add_argument('--obstacle_count_scale', type=float, default=1.0,#調節障礙物數量
+                    help='Global multiplier for obstacle counts (balls/voxels/cylinders)')
+parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,#物理軟限速的平滑度（越小越接近硬截斷，越大越平滑）。
+                    help='Softness for physical speed cap in env._apply_speed_limit (smaller = harder cap)')
+parser.add_argument('--max_speed_ceiling', type=float, default=10.0,#env.max_speed 的上限值（軟限速的速度天花板）。
+                    help='Upper bound of env max_speed used by soft speed limiter')
+parser.add_argument('--hard_vpred_clip', type=float, default=20.0,#env.run 中 v_pred 的硬截斷閾值（原本固定 20）。
+                    help='Hard clip magnitude for v_pred in env.run')
+parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v_free/self.v 的硬截斷閾值（原本固定 30）。
+                    help='Hard clip magnitude for velocity tensors (v_free/self.v) in env.run')
+parser.add_argument('--start_goal_plane_y_abs', type=float, default=20.0,#調節起點和終點的位置
+                    help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--lgn_timesteps', type=int, default=48,
@@ -153,7 +169,6 @@ parser.add_argument('--gate', default=False, action='store_true')
 parser.add_argument('--ground_voxels', default=False, action='store_true')
 parser.add_argument('--scaffold', default=False, action='store_true')
 parser.add_argument('--random_rotation', default=False, action='store_true')
-parser.add_argument('--yaw_drift', default=False, action='store_true')
 parser.add_argument('--no_odom', default=False, action='store_true')
 
 # 学习率
@@ -168,20 +183,12 @@ parser.add_argument('--exp_name', type=str, default="default", help="Extra tag f
 # 避障/碰撞超参
 parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
                     help='Proxy avoidance rises smoothly inside this clearance to walls')
-parser.add_argument('--proxy_avoid_floor', type=float, default=0.2,
-                    help='Avoidance prior boost used in normalized proxy weighting')
-parser.add_argument('--proxy_expl_floor', type=float, default=0.05,
-                    help='Exploration prior boost used in normalized proxy weighting')
-parser.add_argument('--proxy_prior_mix', type=float, default=0.15,
-                    help='Blend ratio between LGN dynamic weights and fixed safety prior (0~1)')
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
                     help='Temperature for LGN softmax output (lower = sharper)')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
                     help='Minimum per-channel LGN weight after simplex projection')
-parser.add_argument('--lgn_entropy_coeff', type=float, default=0.02,
-                    help='Entropy penalty coefficient for LGN weights (higher = more uniform weights)')
-parser.add_argument('--lgn_direct_coeff', type=float, default=0.1,
-                    help='Coefficient for direct LGN supervision signal (danger-aware weight adjustment)')
+parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
+                    help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
                     help='Soft collision term weight in meta loss')
 parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
@@ -220,7 +227,14 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           fov_x_half_tan=args.fov_x_half_tan, single=args.single,
           gate=args.gate, ground_voxels=args.ground_voxels,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
-          random_rotation=args.random_rotation, cam_angle=args.cam_angle)
+          scene_scale=args.scene_scale,
+          random_rotation=args.random_rotation, cam_angle=args.cam_angle,
+          obstacle_count_scale=args.obstacle_count_scale,
+          speed_limit_softness=args.soft_speed_limit_softness,
+          max_speed_ceiling=args.max_speed_ceiling,
+          hard_vpred_clip=args.hard_vpred_clip,
+          hard_speed_clip=args.hard_speed_clip,
+          start_goal_plane_y_abs=args.start_goal_plane_y_abs)
 
 state_dim = 7 if args.no_odom else 10
 
@@ -246,14 +260,6 @@ try:
 except TypeError:
     lgn = LossGenNet(state_dim=state_dim).to(device)
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
-
-proxy_prior_mix = float(min(max(args.proxy_prior_mix, 0.0), 1.0))
-proxy_weight_prior = torch.tensor(
-    [1.0, 1.0, 1.0 + args.proxy_avoid_floor, 1.0 + args.proxy_expl_floor],
-    device=device,
-    dtype=torch.float32,
-)
-proxy_weight_prior = proxy_weight_prior / proxy_weight_prior.sum().clamp_min(1e-6)
 
 ########## 4. 加载预训练模型 ##########
 # def load_checkpoint(model, path, name):
@@ -495,7 +501,14 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
     fig.add_trace(go.Scatter3d(
         x=traj_xyz[:, 0], y=traj_xyz[:, 1], z=traj_xyz[:, 2],
         mode='lines+markers',
-        marker=dict(size=3, color=speed_cpu, colorscale='Turbo', colorbar=dict(title='Speed (m/s)')),
+        marker=dict(
+            size=3,
+            color=speed_cpu,
+            colorscale='Turbo',
+            cmin=0.0,
+            cmax=15.0,
+            colorbar=dict(title='Speed (m/s)')
+        ),
         line=dict(color='limegreen', width=5),
         name='Trajectory'
     ))
@@ -715,45 +728,12 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     return loss_per_step
 
 
-def compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=0.35):
-    """
-    直接监督信号，不经过 inner loop，为 LGN 提供温和的梯度引导。
-
-    参数:
-        weights_seq_norm: [T, B, 4] 归一化后的 LGN 权重
-        dist_obj: [T, B] 到障碍物的距离
-        safe_margin: 安全边距
-
-    监督逻辑 (温和版本):
-        1. 非常接近障碍时 (dist < 0.1)，轻微提升 avoid 权重
-        2. 安全时 (dist > safe_margin)，允许更多 speed/direction 权重
-        3. 使用 soft 目标而非强制推向极端值
-    """
-    # danger_level: [T, B], 只在非常接近障碍时才高 (使用更陡的 sigmoid)
-    danger_level = torch.sigmoid((0.15 - dist_obj) * 15.0)  # 只在 dist < 0.15 时显著
-
-    # safe_level: [T, B], 安全区域
-    safe_level = torch.sigmoid((dist_obj - safe_margin) * 8.0)
-
-    # 期望: 危险时 avoid 权重适度高 (目标 ~0.4)，而非强制到 1.0
-    avoid_weight = weights_seq_norm[:, :, 2]  # [T, B]
-    speed_weight = weights_seq_norm[:, :, 0]
-    dir_weight = weights_seq_norm[:, :, 1]
-
-    # 危险时轻微惩罚 avoid 权重过低 (目标 ≥ 0.35)
-    loss_avoid_low = (danger_level * F.relu(0.35 - avoid_weight)).mean()
-
-    # 安全时允许 speed+direction 权重更高，但不强制
-    loss_safe_balance = (safe_level * F.relu(0.15 - (speed_weight + dir_weight))).mean()
-
-    return loss_avoid_low + 0.3 * loss_safe_balance
-
-
 def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
     """
     Validation rollout with virtually-updated worker params (via functional_call).
-    Computes and returns meta_loss (position + collision + control) plus components.
-    LGN is NOT needed here — meta_loss is purely task-performance based.
+    Computes and returns meta_loss (position + collision + height) plus components.
+    Control effort is tracked for monitoring but is not included in optimization target.
+    LGN is NOT needed here; this meta loss is task-performance based.
     Reuses the same maze layout for consistent LGN signal.
     """
     # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
@@ -832,12 +812,12 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
               + args.meta_coll_hard_weight * m_coll_hard
               + args.meta_coll_event_weight * m_coll_event)
     m_ctrl = act_val.norm(2, -1).sum()
-    # [问题1] Meta rollout也加入高度惩罚
+    # Meta rollout 的高度惩罚，与主训练分支保持一致
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
-               + F.softplus((p_val[:, :, 2] - 1.85) * 20.0)
-               + F.softplus((0.15 - p_val[:, :, 2]) * 20.0)).mean()
+               + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
+               + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll + m_ctrl * 0.000001 + m_height * 2.0,
+    meta_val = sanitize_tensor(m_pos + m_coll + m_height * 2.0,
                                nan=1e3, posinf=1e3, neginf=1e3)
     return meta_val, m_pos, m_coll, m_ctrl
 
@@ -953,12 +933,12 @@ for i in pbar:
     # 碰撞距离 (先计算, 后续速度目标依赖它)
     dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
 
-    # [问题3] 自适应速度目标: 近障碍物/近终点时自动减速
+    # 自适应速度目标: 近障碍物/近终点时自动减速
     speed_actual = v_history.norm(2, -1)  # [T, B]
     dist_to_goal = (env.p_target - p_history).norm(2, -1)  # [T, B]
     v_max = float(env.max_speed)
     speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
-    speed_factor_goal = torch.clamp(dist_to_goal / 1.0, 0.0, 1.0)  # 终点1m内线性减速
+    speed_factor_goal = torch.clamp(dist_to_goal / args.speed_goal_slow_dist, 0.0, 1.0)
     v_target_adaptive = v_max * (args.speed_near_obs_floor + (1.0 - args.speed_near_obs_floor) * speed_factor_obs) * speed_factor_goal
     loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
 
@@ -966,7 +946,7 @@ for i in pbar:
     v_dir = safe_normalize(v_history, dim=-1)
     loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
 
-    # [问题2] 多尺度避障 + 前瞻碰撞预测
+    # 多尺度避障 + 前瞻碰撞预测
     vec_to_pt_dir = safe_normalize(vec_to_pt, dim=-1)
     approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
     dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
@@ -986,28 +966,23 @@ for i in pbar:
 
     actual_T = p_history.shape[0]
 
-    # [问题1] 高度约束损失 (固定权重, 不经LGN控制)
+    # 高度约束损失 (固定权重, 不经LGN控制)
     z_pos = p_history[:, :, 2]  # [T, B]
     z_target = 1.0  # 迷宫中层高度
-    z_min, z_max = 0.15, 1.85
+    z_min, z_max = 0.0, 5.0
     loss_height_seq = (F.smooth_l1_loss(z_pos, torch.full_like(z_pos, z_target), reduction='none')
                        + F.softplus((z_pos - z_max) * 20.0)
                        + F.softplus((z_min - z_pos) * 20.0))
 
-    # [问题5] 归一化各损失项到相同尺度 (可微除法, stats detached)
+    # 归一化各损失项到相同尺度 (可微除法, 统计量不反传)
     loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n = \
         loss_normalizer.normalize(
             loss_speed_seq, loss_direction_seq, loss_avoidance_seq, loss_exploration_seq
         )
 
-    # 先归一化 LGN 原始权重，使其与 prior 同尺度
+    # 纯学习模式: 仅使用 LGN 动态权重，不叠加先验或规则门控
     weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-    effective_weights_seq = (
-        (1.0 - proxy_prior_mix) * weights_seq_norm
-        + proxy_prior_mix * proxy_weight_prior.view(1, 1, 4).to(weights_seq.dtype)
-    )
-    effective_weights_seq = effective_weights_seq / effective_weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    effective_weights_seq = weights_seq_norm
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
@@ -1037,7 +1012,8 @@ for i in pbar:
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     loss_meta_height = loss_height_seq.mean()
 
-    meta_loss = loss_meta_pos + loss_meta_coll + loss_meta_height * 2.0 #+ loss_meta_ctrl *0  
+    # 训练目标仅使用位置/碰撞/高度; 控制项仅用于日志监控
+    meta_loss = loss_meta_pos + loss_meta_coll + loss_meta_height * 2.0
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
@@ -1045,7 +1021,6 @@ for i in pbar:
     optim_worker.zero_grad()
     optim_lgn.zero_grad()
     lgn_update_loss = 0.0
-    lgn_direct_loss_val = 0.0
     worker_grad_norm = 0.0
     worker_grad_max = 0.0
     worker_grad_nonfinite = 0.0
@@ -1114,14 +1089,10 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             continue
 
-        # Step 3: 反向传播贯穿整条链路 + 正则化
+        # Step 3: 反向传播贯穿整条链路
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # 熵正则化: 鼓励高熵(均匀分布), 防止权重过早收敛到极端值
-        weight_ent = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(-1).mean() / math.log(4.0)
-        # 直接监督损失: 不经过 inner loop，为 LGN 提供温和的梯度引导
-        lgn_direct_loss = compute_lgn_direct_loss(weights_seq_norm, dist_obj, safe_margin=args.avoid_safe_margin)
-        # 注意: -weight_ent 鼓励高熵（更均匀的权重分布）
-        lgn_total = meta_loss_unrolled - args.lgn_entropy_coeff * weight_ent + args.lgn_direct_coeff * lgn_direct_loss
+        # 纯学习模式: LGN 仅由 unrolled meta loss 驱动
+        lgn_total = meta_loss_unrolled
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
         lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
@@ -1129,7 +1100,6 @@ for i in pbar:
         sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
-        lgn_direct_loss_val = lgn_direct_loss.detach()
     else:
         proxy_loss.backward()
         worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
@@ -1257,7 +1227,6 @@ for i in pbar:
 
         if train_lgn_phase:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss
-            log_data['Loss/4_LGN_Direct'] = lgn_direct_loss_val
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
             log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur
@@ -1296,7 +1265,7 @@ for i in pbar:
             speed_cpu = v_cpu.norm(dim=-1).numpy()
             traj_xyz = p_cpu.numpy()
             cmap = plt.get_cmap('coolwarm')
-            norm = Normalize(vmin=0.0, vmax=10.0)
+            norm = Normalize(vmin=0.0, vmax=15.0)
             sc = ax.scatter(traj_xyz[:, 0], traj_xyz[:, 1], traj_xyz[:, 2],
                             c=speed_cpu, cmap=cmap, norm=norm, s=9, alpha=0.95, label='Trajectory')
             ax.plot(traj_xyz[:, 0], traj_xyz[:, 1], traj_xyz[:, 2], color='steelblue', linewidth=1.0, alpha=0.55)

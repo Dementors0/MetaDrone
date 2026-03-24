@@ -48,24 +48,30 @@ def safe_normalize(x, dim=-1, eps=1e-6):
 class Env:
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
-                 random_rotation=False, cam_angle=10) -> None:
+                 scene_scale=1.0, random_rotation=False, cam_angle=10, obstacle_count_scale=1.0,
+                 speed_limit_softness=0.05, max_speed_ceiling=5.0,
+                 hard_vpred_clip=20.0, hard_speed_clip=30.0,
+                 start_goal_plane_y_abs=50.0) -> None:
         self.device = device
         self.batch_size = batch_size
         self.width = width
         self.height = height
         self.grad_decay = grad_decay
-        self.ball_w = torch.tensor([8., 18, 6, 0.2], device=device)
-        self.ball_b = torch.tensor([0., -9, -1, 0.4], device=device)
-        self.voxel_w = torch.tensor([8., 18, 6, 0.1, 0.1, 0.1], device=device)
-        self.voxel_b = torch.tensor([0., -9, -1, 0.2, 0.2, 0.2], device=device)
-        self.ground_voxel_w = torch.tensor([8., 18,  0, 2.9, 2.9, 1.9], device=device)
-        self.ground_voxel_b = torch.tensor([0., -9, -1, 0.1, 0.1, 0.1], device=device)
-        self.cyl_w = torch.tensor([8., 18, 0.35], device=device)
-        self.cyl_b = torch.tensor([0., -9, 0.05], device=device)
-        self.cyl_h_w = torch.tensor([8., 6, 0.1], device=device)
+        self.scene_scale = max(0.2, float(scene_scale))
+        self.scene_x_half = 8.0 * self.scene_scale
+        self.scene_y_half = 9.0 * self.scene_scale
+        self.ball_w = torch.tensor([self.scene_x_half, self.scene_y_half * 2.0, 6, 0.2], device=device)
+        self.ball_b = torch.tensor([0., -self.scene_y_half, -1, 0.4], device=device)
+        self.voxel_w = torch.tensor([self.scene_x_half, self.scene_y_half * 2.0, 6, 0.1, 0.1, 0.1], device=device)
+        self.voxel_b = torch.tensor([0., -self.scene_y_half, -1, 0.2, 0.2, 0.2], device=device)
+        self.ground_voxel_w = torch.tensor([self.scene_x_half, self.scene_y_half * 2.0,  0, 2.9, 2.9, 1.9], device=device)
+        self.ground_voxel_b = torch.tensor([0., -self.scene_y_half, -1, 0.1, 0.1, 0.1], device=device)
+        self.cyl_w = torch.tensor([self.scene_x_half, self.scene_y_half * 2.0, 0.35], device=device)
+        self.cyl_b = torch.tensor([0., -self.scene_y_half, 0.05], device=device)
+        self.cyl_h_w = torch.tensor([self.scene_x_half, 6, 0.1], device=device)
         self.cyl_h_b = torch.tensor([0., 0, 0.05], device=device)
-        self.gate_w = torch.tensor([2.,  2,  1.0, 0.5], device=device)
-        self.gate_b = torch.tensor([3., -1,  0.0, 0.5], device=device)
+        self.gate_w = torch.tensor([2. * self.scene_scale,  2. * self.scene_scale,  1.0, 0.5], device=device)
+        self.gate_b = torch.tensor([3. * self.scene_scale, -1. * self.scene_scale,  0.0, 0.5], device=device)
         self.v_wind_w = torch.tensor([1,  1,  0.2], device=device)
         self.g_std = torch.tensor([0., 0, -9.80665], device=device)
         self.roof_add = torch.tensor([0., 0., 2.5, 1.5, 1.5, 1.5], device=device)
@@ -96,6 +102,7 @@ class Env:
         self.ground_voxels = ground_voxels
         self.scaffold = scaffold
         self.speed_mtp = speed_mtp
+        self.obstacle_count_scale = max(0.1, float(obstacle_count_scale))
         self.random_rotation = random_rotation
         self.cam_angle = cam_angle
         self.fov_x_half_tan = fov_x_half_tan
@@ -104,9 +111,16 @@ class Env:
         self.contact_gate_softness = 0.04
         self.contact_velocity_softness = 0.10
         self.contact_normal_damping = 1.0
-        self.speed_limit_softness = 0.05
+        self.speed_limit_softness = max(1e-4, float(speed_limit_softness))
+        self.max_speed_ceiling = max(0.1, float(max_speed_ceiling))
+        self.hard_vpred_clip = max(0.1, float(hard_vpred_clip))
+        self.hard_speed_clip = max(0.1, float(hard_speed_clip))
+        self.start_goal_plane_y_abs = abs(float(start_goal_plane_y_abs))
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
+
+    def _scaled_count(self, base_count, min_count=1):
+        return max(min_count, int(round(base_count * self.obstacle_count_scale)))
 
     def reset(self):
         B = self.batch_size
@@ -126,11 +140,15 @@ class Env:
         self.maze_rows = 18
         self.maze_cell_size = 1.0
 
-        # env obstacles (aligned with env_cuda)
-        self.balls = torch.rand((B, 30, 4), device=device) * self.ball_w + self.ball_b
-        self.voxels = torch.rand((B, 30, 6), device=device) * self.voxel_w + self.voxel_b
-        self.cyl = torch.rand((B, 30, 3), device=device) * self.cyl_w + self.cyl_b
-        self.cyl_h = torch.rand((B, 2, 3), device=device) * self.cyl_h_w + self.cyl_h_b
+        # env obstacles (aligned with env_cuda), count controlled by obstacle_count_scale
+        n_ball = self._scaled_count(30)
+        n_voxel = self._scaled_count(30)
+        n_cyl = self._scaled_count(30)
+        n_cyl_h = self._scaled_count(2)
+        self.balls = torch.rand((B, n_ball, 4), device=device) * self.ball_w + self.ball_b
+        self.voxels = torch.rand((B, n_voxel, 6), device=device) * self.voxel_w + self.voxel_b
+        self.cyl = torch.rand((B, n_cyl, 3), device=device) * self.cyl_w + self.cyl_b
+        self.cyl_h = torch.rand((B, n_cyl_h, 3), device=device) * self.cyl_h_w + self.cyl_h_b
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.n_drones_per_group = random.choice([4, 8])
@@ -142,19 +160,21 @@ class Env:
         speed_profile = (0.75 + 2.5 * rd_speed) * self.speed_mtp
         obstacle_scale = (speed_profile - 0.5).clamp_min(1)
         self._obstacle_scale = obstacle_scale
-        self.max_speed = float(min(5.0 * self.speed_mtp, 5.0))
+        self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
 
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
         roof = torch.rand((B,), device=device) < 0.5
-        self.balls[~roof, :15, :2] = self.cyl[~roof, :15, :2]
-        self.voxels[~roof, :15, :2] = self.cyl[~roof, 15:, :2]
-        self.balls[~roof, :15] = self.balls[~roof, :15] + self.roof_add[:4]
-        self.voxels[~roof, :15] = self.voxels[~roof, :15] + self.roof_add
-        self.balls[..., 0] = torch.minimum(torch.maximum(self.balls[..., 0], self.balls[..., 3] + 0.3 / obstacle_scale), 8 - 0.3 / obstacle_scale - self.balls[..., 3])
-        self.voxels[..., 0] = torch.minimum(torch.maximum(self.voxels[..., 0], self.voxels[..., 3] + 0.3 / obstacle_scale), 8 - 0.3 / obstacle_scale - self.voxels[..., 3])
-        self.cyl[..., 0] = torch.minimum(torch.maximum(self.cyl[..., 0], self.cyl[..., 2] + 0.3 / obstacle_scale), 8 - 0.3 / obstacle_scale - self.cyl[..., 2])
-        self.cyl_h[..., 0] = torch.minimum(torch.maximum(self.cyl_h[..., 0], self.cyl_h[..., 2] + 0.3 / obstacle_scale), 8 - 0.3 / obstacle_scale - self.cyl_h[..., 2])
+        paired_cnt = min(self.balls.shape[1], self.voxels.shape[1], self.cyl.shape[1] // 2)
+        if paired_cnt > 0:
+            self.balls[~roof, :paired_cnt, :2] = self.cyl[~roof, :paired_cnt, :2]
+            self.voxels[~roof, :paired_cnt, :2] = self.cyl[~roof, paired_cnt:paired_cnt * 2, :2]
+            self.balls[~roof, :paired_cnt] = self.balls[~roof, :paired_cnt] + self.roof_add[:4]
+            self.voxels[~roof, :paired_cnt] = self.voxels[~roof, :paired_cnt] + self.roof_add
+        self.balls[..., 0] = torch.minimum(torch.maximum(self.balls[..., 0], self.balls[..., 3] + 0.3 / obstacle_scale), self.scene_x_half - 0.3 / obstacle_scale - self.balls[..., 3])
+        self.voxels[..., 0] = torch.minimum(torch.maximum(self.voxels[..., 0], self.voxels[..., 3] + 0.3 / obstacle_scale), self.scene_x_half - 0.3 / obstacle_scale - self.voxels[..., 3])
+        self.cyl[..., 0] = torch.minimum(torch.maximum(self.cyl[..., 0], self.cyl[..., 2] + 0.3 / obstacle_scale), self.scene_x_half - 0.3 / obstacle_scale - self.cyl[..., 2])
+        self.cyl_h[..., 0] = torch.minimum(torch.maximum(self.cyl_h[..., 0], self.cyl_h[..., 2] + 0.3 / obstacle_scale), self.scene_x_half - 0.3 / obstacle_scale - self.cyl_h[..., 2])
         self.voxels[roof, 0, 2] = self.voxels[roof, 0, 2] * 0.5 + 201
         self.voxels[roof, 0, 3:] = 200
 
@@ -165,7 +185,8 @@ class Env:
             self.balls[:, :2, 3] = ground_balls_r
             self.balls[:, :2, 2] = ground_balls_h - ground_balls_r - 1
 
-            ground_voxels = torch.rand((B, 10, 6), device=device) * self.ground_voxel_w + self.ground_voxel_b
+            n_ground_voxels = self._scaled_count(10)
+            ground_voxels = torch.rand((B, n_ground_voxels, 6), device=device) * self.ground_voxel_w + self.ground_voxel_b
             ground_voxels[:, :, 2] = ground_voxels[:, :, 5] - 1
             self.voxels = torch.cat([self.voxels, ground_voxels], 1)
 
@@ -194,7 +215,7 @@ class Env:
         self.cyl[..., 0] *= obstacle_scale
         self.cyl_h[..., 0] *= obstacle_scale
         if self.ground_voxels:
-            self.balls[:, :2, 0] = torch.minimum(torch.maximum(self.balls[:, :2, 0], ground_balls_r_ground + 0.3), obstacle_scale * 8 - 0.3 - ground_balls_r_ground)
+            self.balls[:, :2, 0] = torch.minimum(torch.maximum(self.balls[:, :2, 0], ground_balls_r_ground + 0.3), obstacle_scale * self.scene_x_half - 0.3 - ground_balls_r_ground)
 
         if self.scaffold and random.random() < 0.5:
             x = torch.arange(1, 6, dtype=torch.float, device=device)
@@ -251,7 +272,7 @@ class Env:
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.drone_radius = random.uniform(0.1, 0.15)
-        self.max_speed = float(min(5.0 * self.speed_mtp, 5.0))
+        self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
 
         obstacle_scale = getattr(self, '_obstacle_scale', None)
         if obstacle_scale is None:
@@ -273,20 +294,18 @@ class Env:
 
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
-        # 随机将起点和终点分别放置在环境长边(Y方向)的两端
-        # 环境 Y 范围: -9 到 9 (rows=18, y_offset=9)
-        # 环境 X 范围: 0 到 8 (cols=8)
-        # 起点放在 Y 负端 (Y ≈ -8.5)，终点放在 Y 正端 (Y ≈ 8.5)
-        x_start = torch.rand(B, device=device) * 6 + 1  # X in [1, 7] 避开边界
-        y_start = torch.rand(B, device=device) * 1.0 - 8.5  # Y in [-8.5, -7.5]
-        z_start = torch.ones(B, device=device) * 1.0  # Z = 1
+        # 起点/终点分别放置在固定平面: Y=+A 与 Y=-A，A 由 start_goal_plane_y_abs 控制
+        x_span = self.scene_x_half * obstacle_scale.squeeze(-1)
+        x_start = torch.rand(B, device=device) * x_span
+        x_end = torch.rand(B, device=device) * x_span
+        z_start = 0.8 + torch.rand(B, device=device) * 1.6
+        z_end = 0.8 + torch.rand(B, device=device) * 1.6
+        y_plane = float(self.start_goal_plane_y_abs)
+        y_start = torch.full((B,), y_plane, device=device)
+        y_end = torch.full((B,), -y_plane, device=device)
 
-        x_end = torch.rand(B, device=device) * 6 + 1  # X in [1, 7]
-        y_end = torch.rand(B, device=device) * 1.0 + 7.5  # Y in [7.5, 8.5]
-        z_end = torch.ones(B, device=device) * 1.0  # Z = 1
-
-        self.p = torch.stack([x_start, y_start, z_start], dim=-1) * obstacle_scale + torch.randn(B, 3, device=device) * 0.1
-        self.p_target = torch.stack([x_end, y_end, z_end], dim=-1) * obstacle_scale + torch.randn(B, 3, device=device) * 0.1
+        self.p = torch.stack([x_start, y_start, z_start], dim=-1)
+        self.p_target = torch.stack([x_end, y_end, z_end], dim=-1)
 
         self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
         self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
@@ -428,7 +447,7 @@ class Env:
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):
         act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         if v_pred is not None:
-            v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+            v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=self.hard_vpred_clip, neginf=-self.hard_vpred_clip).clamp(-self.hard_vpred_clip, self.hard_vpred_clip)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
         self.act, p_free, v_free, a_free = run(
@@ -437,14 +456,14 @@ class Env:
             self.grad_decay, ctl_dt, 0.5)
         self.act = torch.nan_to_num(self.act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         p_free = torch.nan_to_num(p_free, nan=0.0, posinf=100.0, neginf=-100.0)
-        v_free = torch.nan_to_num(v_free, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        v_free = torch.nan_to_num(v_free, nan=0.0, posinf=self.hard_speed_clip, neginf=-self.hard_speed_clip).clamp(-self.hard_speed_clip, self.hard_speed_clip)
         a_free = torch.nan_to_num(a_free, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
         # 去掉碰撞物理反馈，直接使用自由运动结果
         # self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
         self.p, self.v, self.a = p_free, v_free, a_free
         self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
-        self.v = torch.nan_to_num(self.v, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        self.v = torch.nan_to_num(self.v, nan=0.0, posinf=self.hard_speed_clip, neginf=-self.hard_speed_clip).clamp(-self.hard_speed_clip, self.hard_speed_clip)
         self.a = torch.nan_to_num(self.a, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)

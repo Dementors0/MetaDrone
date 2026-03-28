@@ -1,8 +1,9 @@
 #7.1
 #修改地圖起始位置和終點
-#可調整障礙物密度
+#可調整地圖大小和障礙物密度
 
 import argparse
+import atexit
 import math
 from collections import defaultdict
 from random import normalvariate
@@ -10,7 +11,11 @@ import os
 import datetime
 import json
 import sys
+import multiprocessing as mp
 import numpy as np
+import matplotlib
+
+matplotlib.use('Agg', force=True)
 
 import torch
 import torch.nn as nn
@@ -135,7 +140,7 @@ parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
 parser.add_argument('--scene_scale', type=float, default=0.5,#調節環境大小
                     help='Global scene size scale for obstacle field extent and spawn area')
-parser.add_argument('--obstacle_count_scale', type=float, default=1.0,#調節障礙物數量
+parser.add_argument('--obstacle_count_scale', type=float, default=0.5,#調節障礙物數量
                     help='Global multiplier for obstacle counts (balls/voxels/cylinders)')
 parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,#物理軟限速的平滑度（越小越接近硬截斷，越大越平滑）。
                     help='Softness for physical speed cap in env._apply_speed_limit (smaller = harder cap)')
@@ -145,10 +150,10 @@ parser.add_argument('--hard_vpred_clip', type=float, default=20.0,#env.run 中 v
                     help='Hard clip magnitude for v_pred in env.run')
 parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v_free/self.v 的硬截斷閾值（原本固定 30）。
                     help='Hard clip magnitude for velocity tensors (v_free/self.v) in env.run')
-parser.add_argument('--start_goal_plane_y_abs', type=float, default=20.0,#調節起點和終點的位置
+parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
-parser.add_argument('--timesteps', type=int, default=150)
+parser.add_argument('--timesteps', type=int, default=180)
 parser.add_argument('--lgn_timesteps', type=int, default=48,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--detach_interval', type=int, default=12,
@@ -202,7 +207,56 @@ parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
 parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
                     help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
 
+# 全局规划引导元损失参数
+parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
+                    help='Weight for global guidance meta loss (path-guiding dense supervision)')
+parser.add_argument('--guide_sample_count', type=int, default=10,
+                    help='Number of keypoints to sample for guidance loss computation')
+parser.add_argument('--guide_sample_strategy', type=str, default='random',
+                    choices=['random', 'uniform', 'adaptive', 'critical'],
+                    help='Sampling strategy: random/uniform/adaptive(danger+curvature)/critical(start+end+danger)')
+parser.add_argument('--guide_max_accel', type=float, default=5.0,
+                    help='Max acceleration for trapezoidal velocity profile (m/s^2)')
+parser.add_argument('--guide_max_decel', type=float, default=6.0,
+                    help='Max deceleration for trapezoidal velocity profile (m/s^2)')
+parser.add_argument('--guide_dir_weight', type=float, default=0.5,
+                    help='Weight for direction alignment loss within guidance loss')
+parser.add_argument('--guide_speed_weight', type=float, default=0.3,
+                    help='Weight for overspeed penalty within guidance loss')
+parser.add_argument('--guide_lateral_weight', type=float, default=0.3,
+                    help='Weight for lateral error penalty (geometric distance to planned path)')
+parser.add_argument('--guide_speed_diff_weight', type=float, default=0.2,
+                    help='Weight for speed difference penalty (overspeed + underspeed)')
+parser.add_argument('--guide_escape_weight', type=float, default=1.0,
+                    help='Weight for escape penalty on collided points')
+parser.add_argument('--guide_recovery_speed_weight', type=float, default=0.15,
+                    help='Extra speed damping weight on planner-invalid sampled points')
+parser.add_argument('--guide_collision_threshold', type=float, default=-0.05,
+                    help='Penetration threshold below which point is considered collided')
+parser.add_argument('--guide_accel_weight', type=float, default=0.1,
+                    help='Weight for acceleration mismatch penalty (deceleration requirement)')
+parser.add_argument('--planner_resolution', type=float, default=0.3,
+                    help='Resolution of the occupancy grid for A* planning (meters)')
+parser.add_argument('--planner_margin', type=float, default=0.15,
+                    help='Safety margin for obstacle inflation in planner (meters)')
+parser.add_argument('--planner_parallel', dest='planner_parallel', action='store_true',
+                    help='Enable sample-level parallel global planning with multiprocessing pool')
+parser.add_argument('--no_planner_parallel', dest='planner_parallel', action='store_false',
+                    help='Disable sample-level parallel global planning')
+parser.set_defaults(planner_parallel=True)
+parser.add_argument('--planner_workers', type=int, default=0,
+                    help='Number of planner worker processes (<=0 means auto)')
+parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
+                    help='maxtasksperchild for planner process pool to avoid long-run memory growth')
+
 args = parser.parse_args()
+
+# Planner parallel runtime config (used by guidance reference computation)
+PLANNER_PARALLEL_ENABLE = bool(args.planner_parallel)
+PLANNER_NUM_WORKERS = int(args.planner_workers)
+PLANNER_POOL_MAXTASKS = max(1, int(args.planner_pool_maxtasks))
+_PLANNER_POOL = None
+_PLANNER_POOL_SIZE = 0
 
 ########## 2. 目录与日志初始化 ##########
 current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -369,6 +423,1157 @@ def merge_intervals(intervals, min_gap=1e-4):
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+########## 6.1 全局规划引导元损失辅助函数 ##########
+
+import heapq
+from typing import List, Tuple, Optional, Dict
+
+class GlobalPlanner:
+    """
+    3D A* 全局路径规划器
+
+    构建占用栅格地图并使用 A* 算法规划从起点到终点的最优路径，
+    然后从路径中提取参考方向、速度和加速度。
+    """
+
+    def __init__(self, resolution: float = 0.3, margin: float = 0.15,
+                 z_min: float = 0.0, z_max: float = 2.5, device='cuda'):
+        """
+        Args:
+            resolution: 栅格分辨率 (米)
+            margin: 安全边距 (米)，障碍物膨胀量
+            z_min, z_max: Z轴范围
+            device: 计算设备
+        """
+        self.resolution = resolution
+        self.margin = margin
+        self.z_min = z_min
+        self.z_max = z_max
+        self.device = device
+
+        # 缓存的占用栅格地图
+        self.occupancy_grid = None
+        self.grid_origin = None  # [x_min, y_min, z_min]
+        self.grid_shape = None   # [nx, ny, nz]
+
+        # 缓存的规划路径 (每个 batch 元素一条路径)
+        self.cached_paths = {}   # batch_idx -> path tensor [N, 3]
+        self.plan_stats = {'success': 0, 'total': 0}
+
+        # 3D 邻居偏移 (26-连通)
+        self._neighbors_26 = []
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for dz in [-1, 0, 1]:
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+                    cost = math.sqrt(dx**2 + dy**2 + dz**2)
+                    self._neighbors_26.append((dx, dy, dz, cost))
+
+    def build_occupancy_grid(self, env, batch_idx: int = 0):
+        """
+        从环境障碍物构建 3D 占用栅格地图
+
+        Args:
+            env: 环境对象，包含 voxels, balls, cyl, cyl_h 等障碍物
+            batch_idx: batch 索引
+        """
+        # 确定地图边界
+        x_min, x_max = -15.0, 15.0
+        y_min, y_max = -25.0, 25.0
+
+        if hasattr(env, 'p_target') and env.p_target is not None:
+            target = env.p_target[batch_idx].detach().cpu()
+            y_min = min(y_min, float(target[1]) - 5.0)
+            y_max = max(y_max, float(target[1]) + 5.0)
+
+        # 栅格尺寸
+        nx = int(math.ceil((x_max - x_min) / self.resolution))
+        ny = int(math.ceil((y_max - y_min) / self.resolution))
+        nz = int(math.ceil((self.z_max - self.z_min) / self.resolution))
+
+        self.grid_origin = np.array([x_min, y_min, self.z_min])
+        self.grid_shape = (nx, ny, nz)
+
+        # 初始化为空闲
+        self.occupancy_grid = np.zeros((nx, ny, nz), dtype=np.uint8)
+
+        # 填充障碍物
+        total_margin = self.margin + 0.15  # 额外的安全边距
+
+        # 1. 体素盒体障碍物
+        if hasattr(env, 'voxels') and env.voxels.numel() > 0:
+            voxels = env.voxels[batch_idx].detach().cpu().numpy()
+            for vox in voxels:
+                cx, cy, cz, hx, hy, hz = vox[:6]
+                if hx > 15 or hy > 15 or hz > 15:  # 跳过占位大盒体
+                    continue
+                # 膨胀障碍物
+                x0 = max(0, int((cx - hx - total_margin - x_min) / self.resolution))
+                x1 = min(nx, int((cx + hx + total_margin - x_min) / self.resolution) + 1)
+                y0 = max(0, int((cy - hy - total_margin - y_min) / self.resolution))
+                y1 = min(ny, int((cy + hy + total_margin - y_min) / self.resolution) + 1)
+                z0 = max(0, int((cz - hz - total_margin - self.z_min) / self.resolution))
+                z1 = min(nz, int((cz + hz + total_margin - self.z_min) / self.resolution) + 1)
+                self.occupancy_grid[x0:x1, y0:y1, z0:z1] = 1
+
+        # 2. 球形障碍物
+        if hasattr(env, 'balls') and env.balls.numel() > 0:
+            balls = env.balls[batch_idx].detach().cpu().numpy()
+            for ball in balls:
+                bx, by, bz, br = ball[:4]
+                r_inflated = br + total_margin
+                # 球的包围盒
+                x0 = max(0, int((bx - r_inflated - x_min) / self.resolution))
+                x1 = min(nx, int((bx + r_inflated - x_min) / self.resolution) + 1)
+                y0 = max(0, int((by - r_inflated - y_min) / self.resolution))
+                y1 = min(ny, int((by + r_inflated - y_min) / self.resolution) + 1)
+                z0 = max(0, int((bz - r_inflated - self.z_min) / self.resolution))
+                z1 = min(nz, int((bz + r_inflated - self.z_min) / self.resolution) + 1)
+                # 精确球形检测
+                for ix in range(x0, x1):
+                    for iy in range(y0, y1):
+                        for iz in range(z0, z1):
+                            px = x_min + (ix + 0.5) * self.resolution
+                            py = y_min + (iy + 0.5) * self.resolution
+                            pz = self.z_min + (iz + 0.5) * self.resolution
+                            if (px - bx)**2 + (py - by)**2 + (pz - bz)**2 < r_inflated**2:
+                                self.occupancy_grid[ix, iy, iz] = 1
+
+        # 3. 竖直圆柱障碍物 (沿Z轴)
+        if hasattr(env, 'cyl') and env.cyl.numel() > 0:
+            cyl = env.cyl[batch_idx].detach().cpu().numpy()
+            for c in cyl:
+                cx, cy, cr = c[:3]
+                r_inflated = cr + total_margin
+                x0 = max(0, int((cx - r_inflated - x_min) / self.resolution))
+                x1 = min(nx, int((cx + r_inflated - x_min) / self.resolution) + 1)
+                y0 = max(0, int((cy - r_inflated - y_min) / self.resolution))
+                y1 = min(ny, int((cy + r_inflated - y_min) / self.resolution) + 1)
+                for ix in range(x0, x1):
+                    for iy in range(y0, y1):
+                        px = x_min + (ix + 0.5) * self.resolution
+                        py = y_min + (iy + 0.5) * self.resolution
+                        if (px - cx)**2 + (py - cy)**2 < r_inflated**2:
+                            self.occupancy_grid[ix, iy, :] = 1
+
+        # 4. 水平圆柱障碍物 (沿Y轴)
+        if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
+            cyl_h = env.cyl_h[batch_idx].detach().cpu().numpy()
+            for c in cyl_h:
+                cx, cz, cr = c[:3]
+                r_inflated = cr + total_margin
+                x0 = max(0, int((cx - r_inflated - x_min) / self.resolution))
+                x1 = min(nx, int((cx + r_inflated - x_min) / self.resolution) + 1)
+                z0 = max(0, int((cz - r_inflated - self.z_min) / self.resolution))
+                z1 = min(nz, int((cz + r_inflated - self.z_min) / self.resolution) + 1)
+                for ix in range(x0, x1):
+                    for iz in range(z0, z1):
+                        px = x_min + (ix + 0.5) * self.resolution
+                        pz = self.z_min + (iz + 0.5) * self.resolution
+                        if (px - cx)**2 + (pz - cz)**2 < r_inflated**2:
+                            self.occupancy_grid[ix, :, iz] = 1
+
+        return self.occupancy_grid
+
+    def world_to_grid(self, pos: np.ndarray) -> Tuple[int, int, int]:
+        """世界坐标转栅格索引"""
+        idx = ((pos - self.grid_origin) / self.resolution).astype(int)
+        return tuple(np.clip(idx, 0, np.array(self.grid_shape) - 1))
+
+    def grid_to_world(self, idx: Tuple[int, int, int]) -> np.ndarray:
+        """栅格索引转世界坐标（单元格中心）"""
+        return self.grid_origin + (np.array(idx) + 0.5) * self.resolution
+
+    def is_valid(self, idx: Tuple[int, int, int]) -> bool:
+        """检查栅格索引是否有效且空闲"""
+        nx, ny, nz = self.grid_shape
+        if not (0 <= idx[0] < nx and 0 <= idx[1] < ny and 0 <= idx[2] < nz):
+            return False
+        return self.occupancy_grid[idx[0], idx[1], idx[2]] == 0
+
+    def heuristic(self, a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
+        """A* 启发式函数（欧几里得距离）"""
+        return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) * self.resolution
+
+    def plan_astar(self, start_pos: np.ndarray, goal_pos: np.ndarray,
+                   max_iterations: int = 50000) -> Optional[List[np.ndarray]]:
+        """
+        3D A* 路径规划
+
+        Args:
+            start_pos: 起点世界坐标 [3]
+            goal_pos: 终点世界坐标 [3]
+            max_iterations: 最大迭代次数
+
+        Returns:
+            path: 路径点列表 [N, 3] 或 None（规划失败）
+        """
+        if self.occupancy_grid is None:
+            return None
+
+        start_idx = self.world_to_grid(start_pos)
+        goal_idx = self.world_to_grid(goal_pos)
+
+        # 如果起点在障碍物内，尝试找到最近的空闲点
+        if not self.is_valid(start_idx):
+            start_idx = self._find_nearest_free(start_idx)
+            if start_idx is None:
+                return None
+
+        # 如果终点在障碍物内，尝试找到最近的空闲点
+        if not self.is_valid(goal_idx):
+            goal_idx = self._find_nearest_free(goal_idx)
+            if goal_idx is None:
+                return None
+
+        # A* 搜索
+        open_set = []
+        heapq.heappush(open_set, (0 + self.heuristic(start_idx, goal_idx), 0, start_idx))
+
+        came_from = {}
+        g_score = {start_idx: 0}
+
+        iterations = 0
+        while open_set and iterations < max_iterations:
+            iterations += 1
+            _, current_g, current = heapq.heappop(open_set)
+
+            # 到达目标
+            if current == goal_idx:
+                # 重建路径
+                path = [self.grid_to_world(current)]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(self.grid_to_world(current))
+                path.reverse()
+                return path
+
+            # 跳过过期节点
+            if current_g > g_score.get(current, float('inf')):
+                continue
+
+            # 扩展邻居
+            for dx, dy, dz, move_cost in self._neighbors_26:
+                neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
+
+                if not self.is_valid(neighbor):
+                    continue
+
+                tentative_g = g_score[current] + move_cost * self.resolution
+
+                if tentative_g < g_score.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + self.heuristic(neighbor, goal_idx)
+                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
+
+        # 规划失败
+        return None
+
+    def _find_nearest_free(self, idx: Tuple[int, int, int], search_radius: int = 10) -> Optional[Tuple[int, int, int]]:
+        """寻找最近的空闲栅格"""
+        for r in range(1, search_radius + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    for dz in range(-r, r + 1):
+                        if abs(dx) == r or abs(dy) == r or abs(dz) == r:
+                            neighbor = (idx[0] + dx, idx[1] + dy, idx[2] + dz)
+                            if self.is_valid(neighbor):
+                                return neighbor
+        return None
+
+    def smooth_path(self, path: List[np.ndarray], window_size: int = 5) -> np.ndarray:
+        """
+        路径平滑处理（移动平均）
+
+        Args:
+            path: 原始路径点列表
+            window_size: 平滑窗口大小
+
+        Returns:
+            smoothed_path: 平滑后的路径 [N, 3]
+        """
+        if len(path) < 3:
+            return np.array(path)
+
+        path_array = np.array(path)
+        smoothed = np.copy(path_array)
+
+        half_w = window_size // 2
+        for i in range(half_w, len(path) - half_w):
+            smoothed[i] = path_array[max(0, i-half_w):min(len(path), i+half_w+1)].mean(axis=0)
+
+        # 保持起点和终点不变
+        smoothed[0] = path_array[0]
+        smoothed[-1] = path_array[-1]
+
+        return smoothed
+
+    def extract_reference_from_path(self, current_pos: np.ndarray, path: np.ndarray,
+                                    max_speed: float = 5.0,
+                                    max_accel: float = 5.0,
+                                    max_decel: float = 6.0,
+                                    lookahead_dist: float = 1.0) -> Dict:
+        """
+        从规划路径中提取当前位置的参考方向、速度和加速度
+
+        使用梯形速度剖面和动力学约束计算参考值：
+        - 速度剖面考虑：最大速度、曲率限制、终点减速
+        - 加速度基于速度剖面的变化率计算
+        - 横向偏差为到路径的真正几何距离
+
+        Args:
+            current_pos: 当前位置 [3]
+            path: 规划路径 [N, 3]
+            max_speed: 最大速度 (m/s)
+            max_accel: 最大加速度 (m/s^2)
+            max_decel: 最大减速度 (m/s^2)，正值
+            lookahead_dist: 前瞻距离 (m)
+
+        Returns:
+            dict: 包含参考方向、速度、加速度、曲率、横向偏差等
+        """
+        if path is None or len(path) < 2:
+            return {
+                'direction': np.array([0.0, 1.0, 0.0]),
+                'speed': max_speed * 0.5,
+                'acceleration': np.array([0.0, 0.0, 0.0]),
+                'curvature': 0.0,
+                'path_progress': 0.0,
+                'dist_to_goal': 10.0,
+                'lateral_error': 0.0,  # 横向偏差
+                'valid': False
+            }
+
+        # ========== 1. 找到路径上最近点并计算横向偏差 ==========
+        distances = np.linalg.norm(path - current_pos, axis=1)
+        nearest_idx = np.argmin(distances)
+        nearest_point = path[nearest_idx]
+
+        # 横向偏差：当前位置到路径最近点的距离
+        lateral_error = distances[nearest_idx]
+
+        # 更精确的横向偏差：投影到路径线段上
+        if 0 < nearest_idx < len(path) - 1:
+            # 检查是否应该投影到前一段或后一段
+            for seg_start, seg_end in [(nearest_idx - 1, nearest_idx), (nearest_idx, nearest_idx + 1)]:
+                if seg_end >= len(path):
+                    continue
+                p0 = path[seg_start]
+                p1 = path[seg_end]
+                seg_vec = p1 - p0
+                seg_len = np.linalg.norm(seg_vec)
+                if seg_len > 1e-6:
+                    seg_dir = seg_vec / seg_len
+                    t = np.clip(np.dot(current_pos - p0, seg_dir), 0, seg_len)
+                    proj_point = p0 + t * seg_dir
+                    proj_dist = np.linalg.norm(current_pos - proj_point)
+                    if proj_dist < lateral_error:
+                        lateral_error = proj_dist
+                        nearest_point = proj_point
+
+        # ========== 2. 计算路径进度和剩余路径长度 ==========
+        path_progress = nearest_idx / max(len(path) - 1, 1)
+
+        # 计算从当前点到终点的路径长度
+        remaining_path_length = 0.0
+        for i in range(nearest_idx, len(path) - 1):
+            remaining_path_length += np.linalg.norm(path[i+1] - path[i])
+        dist_to_goal = remaining_path_length
+
+        # ========== 3. 计算前瞻点和参考方向 ==========
+        lookahead_idx = nearest_idx
+        accumulated_dist = 0.0
+        for i in range(nearest_idx, len(path) - 1):
+            segment_dist = np.linalg.norm(path[i+1] - path[i])
+            accumulated_dist += segment_dist
+            if accumulated_dist >= lookahead_dist:
+                lookahead_idx = i + 1
+                break
+        else:
+            lookahead_idx = len(path) - 1
+
+        lookahead_point = path[lookahead_idx]
+        direction_vec = lookahead_point - current_pos
+        direction_norm = np.linalg.norm(direction_vec)
+        if direction_norm > 1e-6:
+            direction = direction_vec / direction_norm
+        else:
+            if nearest_idx < len(path) - 1:
+                direction = path[nearest_idx + 1] - path[nearest_idx]
+                direction = direction / (np.linalg.norm(direction) + 1e-6)
+            else:
+                direction = np.array([0.0, 1.0, 0.0])
+
+        # ========== 4. 计算局部曲率（用于速度限制）==========
+        curvature = 0.0
+        if 1 <= nearest_idx < len(path) - 1:
+            v1 = path[nearest_idx] - path[nearest_idx - 1]
+            v2 = path[nearest_idx + 1] - path[nearest_idx]
+            v1_norm = np.linalg.norm(v1)
+            v2_norm = np.linalg.norm(v2)
+            if v1_norm > 1e-6 and v2_norm > 1e-6:
+                v1 = v1 / v1_norm
+                v2 = v2 / v2_norm
+                cos_angle = np.clip(np.dot(v1, v2), -1.0, 1.0)
+                angle_change = math.acos(cos_angle)
+                curvature = angle_change / (self.resolution + 1e-6)
+
+        # ========== 5. 计算梯形速度剖面 ==========
+        # 5.1 曲率速度限制：v_max_curve = sqrt(a_lateral_max / curvature)
+        a_lateral_max = 4.0  # 最大侧向加速度 (m/s^2)
+        if curvature > 0.1:
+            v_curve_limit = min(max_speed, math.sqrt(a_lateral_max / (curvature + 1e-6)))
+        else:
+            v_curve_limit = max_speed
+
+        # 5.2 终点减速限制：v^2 = 2 * a_decel * d
+        # 在终点速度应为 0，所以 v_max_decel = sqrt(2 * max_decel * dist_to_goal)
+        v_decel_limit = math.sqrt(2.0 * max_decel * max(dist_to_goal, 0.01))
+
+        # 5.3 前方曲率预瞰（提前减速）
+        v_lookahead_limit = max_speed
+        lookahead_curvature_dist = 2.0  # 向前看 2m
+        accumulated = 0.0
+        max_future_curvature = 0.0
+        for i in range(nearest_idx, min(nearest_idx + 20, len(path) - 1)):
+            seg_len = np.linalg.norm(path[i+1] - path[i])
+            accumulated += seg_len
+            if accumulated > lookahead_curvature_dist:
+                break
+            if 1 <= i < len(path) - 1:
+                v1 = path[i] - path[i-1]
+                v2 = path[i+1] - path[i]
+                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if n1 > 1e-6 and n2 > 1e-6:
+                    cos_a = np.clip(np.dot(v1/n1, v2/n2), -1.0, 1.0)
+                    future_curv = math.acos(cos_a) / (self.resolution + 1e-6)
+                    max_future_curvature = max(max_future_curvature, future_curv)
+
+        if max_future_curvature > 0.1:
+            v_future = math.sqrt(a_lateral_max / (max_future_curvature + 1e-6))
+            # 需要在 lookahead_curvature_dist 内减速到 v_future
+            v_lookahead_limit = math.sqrt(v_future**2 + 2.0 * max_decel * lookahead_curvature_dist)
+
+        # 5.4 综合速度限制
+        ref_speed = min(max_speed, v_curve_limit, v_decel_limit, v_lookahead_limit)
+        ref_speed = max(ref_speed, 0.1)  # 最小速度
+
+        # ========== 6. 计算参考加速度（基于速度剖面变化）==========
+        # 切向加速度：基于当前位置的速度限制变化
+        tangent_accel = 0.0
+
+        # 如果当前速度限制低于最大速度，说明需要减速
+        if ref_speed < max_speed * 0.9:
+            # 估算需要的减速度
+            if dist_to_goal > 0.1:
+                # v_final^2 - v_current^2 = 2 * a * d
+                # 假设需要在 dist_to_goal 内减到 0
+                tangent_accel = -(ref_speed ** 2) / (2 * max(dist_to_goal, 0.1))
+                tangent_accel = max(tangent_accel, -max_decel)
+            else:
+                tangent_accel = -max_decel
+
+        # 如果在弯道，额外减速
+        if curvature > 0.5:
+            curve_decel = -curvature * 1.5  # 曲率越大，减速越多
+            tangent_accel = min(tangent_accel, curve_decel)
+
+        # 限制加速度范围
+        tangent_accel = np.clip(tangent_accel, -max_decel, max_accel)
+
+        # 加速度向量 = 切向加速度 * 方向
+        acceleration = direction * tangent_accel
+
+        return {
+            'direction': direction,
+            'speed': ref_speed,
+            'acceleration': acceleration,
+            'curvature': curvature,
+            'path_progress': path_progress,
+            'dist_to_goal': dist_to_goal,
+            'lateral_error': lateral_error,  # 新增：横向偏差
+            'valid': True
+        }
+
+    def plan_and_cache(self, env, start_positions: torch.Tensor,
+                       goal_positions: torch.Tensor, batch_indices: List[int] = None):
+        """
+        为多个 batch 元素规划并缓存路径
+
+        Args:
+            env: 环境对象
+            start_positions: 起点位置 [B, 3]
+            goal_positions: 目标位置 [B, 3]
+            batch_indices: 要规划的 batch 索引列表，None 表示全部
+        """
+        B = start_positions.shape[0]
+        if batch_indices is None:
+            batch_indices = list(range(B))
+
+        success_count = 0
+
+        for b in batch_indices:
+            # 为该 batch 构建占用栅格
+            self.build_occupancy_grid(env, batch_idx=b)
+
+            start = start_positions[b].detach().cpu().numpy()
+            goal = goal_positions[b].detach().cpu().numpy()
+
+            # A* 规划
+            path = self.plan_astar(start, goal)
+
+            if path is not None:
+                # 路径平滑
+                path = self.smooth_path(path, window_size=5)
+                self.cached_paths[b] = path
+                success_count += 1
+            else:
+                # 规划失败：标记为 None，由恢复项接管，避免强制拟合不可靠参考
+                self.cached_paths[b] = None
+
+        self.plan_stats = {
+            'success': int(success_count),
+            'total': int(len(batch_indices)),
+        }
+
+    def clear_cache(self):
+        """清除缓存的路径"""
+        self.cached_paths.clear()
+        self.occupancy_grid = None
+
+
+def _compute_planner_worker_count():
+    if PLANNER_NUM_WORKERS > 0:
+        return PLANNER_NUM_WORKERS
+    cpu_total = os.cpu_count() or 8
+    # 在高核机器上预留少量核给训练主进程与系统线程
+    return max(1, min(28, cpu_total - 3))
+
+
+def _shutdown_planner_pool():
+    global _PLANNER_POOL, _PLANNER_POOL_SIZE
+    if _PLANNER_POOL is not None:
+        _PLANNER_POOL.close()
+        _PLANNER_POOL.join()
+        _PLANNER_POOL = None
+        _PLANNER_POOL_SIZE = 0
+
+
+def _get_planner_pool():
+    global _PLANNER_POOL, _PLANNER_POOL_SIZE
+    if not PLANNER_PARALLEL_ENABLE:
+        return None
+
+    target_size = _compute_planner_worker_count()
+    if _PLANNER_POOL is not None and _PLANNER_POOL_SIZE == target_size:
+        return _PLANNER_POOL
+
+    if _PLANNER_POOL is not None:
+        _shutdown_planner_pool()
+
+    # 本脚本顶层直接启动训练，spawn 会重入模块；Linux 下优先 fork。
+    start_method = 'fork' if sys.platform.startswith('linux') else 'spawn'
+    ctx = mp.get_context(start_method)
+    _PLANNER_POOL = ctx.Pool(processes=target_size, maxtasksperchild=PLANNER_POOL_MAXTASKS)
+    _PLANNER_POOL_SIZE = target_size
+    return _PLANNER_POOL
+
+
+atexit.register(_shutdown_planner_pool)
+
+
+def _plan_sample_points_worker(payload):
+    """Per-sample planning worker: build occupancy once and solve all sampled points."""
+    voxels_np = payload['voxels']
+    balls_np = payload['balls']
+    cyl_np = payload['cyl']
+    cyl_h_np = payload['cyl_h']
+    sampled_positions = payload['sampled_positions']  # [S, 3]
+    sampled_dist = payload['sampled_dist']            # [S]
+    goal_np = payload['goal']                         # [3]
+    resolution = float(payload['resolution'])
+    margin = float(payload['margin'])
+    z_min = float(payload['z_min'])
+    z_max = float(payload['z_max'])
+    max_speed = float(payload['max_speed'])
+    max_accel = float(payload['max_accel'])
+    max_decel = float(payload['max_decel'])
+    lookahead_dist = float(payload['lookahead_dist'])
+    invalid_dist_threshold = float(payload['invalid_dist_threshold'])
+
+    planner = GlobalPlanner(resolution=resolution, margin=margin, z_min=z_min, z_max=z_max, device='cpu')
+
+    class _EnvShim:
+        pass
+
+    env_shim = _EnvShim()
+    env_shim.voxels = torch.from_numpy(voxels_np).unsqueeze(0)
+    env_shim.balls = torch.from_numpy(balls_np).unsqueeze(0)
+    env_shim.cyl = torch.from_numpy(cyl_np).unsqueeze(0)
+    env_shim.cyl_h = torch.from_numpy(cyl_h_np).unsqueeze(0)
+    env_shim.p_target = torch.from_numpy(goal_np).reshape(1, 3)
+
+    planner.build_occupancy_grid(env_shim, batch_idx=0)
+
+    S = sampled_positions.shape[0]
+    ref_direction = np.zeros((S, 3), dtype=np.float32)
+    ref_speed = np.zeros((S,), dtype=np.float32)
+    ref_acceleration = np.zeros((S, 3), dtype=np.float32)
+    lateral_error = np.zeros((S,), dtype=np.float32)
+    valid_mask = np.zeros((S,), dtype=np.bool_)
+
+    plan_total = 0
+    plan_success = 0
+    curv_sum = 0.0
+    prog_sum = 0.0
+    lat_sum = 0.0
+    lat_max = 0.0
+    metric_count = 0
+
+    for s in range(S):
+        pos_np = sampled_positions[s]
+        dist = float(sampled_dist[s])
+
+        if dist < invalid_dist_threshold:
+            continue
+
+        plan_total += 1
+        path = planner.plan_astar(pos_np, goal_np)
+        if path is None:
+            continue
+        path = planner.smooth_path(path, window_size=5)
+
+        ref_info = planner.extract_reference_from_path(
+            pos_np,
+            path,
+            max_speed=max_speed,
+            max_accel=max_accel,
+            max_decel=max_decel,
+            lookahead_dist=lookahead_dist,
+        )
+
+        ref_direction[s] = np.asarray(ref_info['direction'], dtype=np.float32)
+        ref_speed[s] = float(ref_info['speed'])
+        ref_acceleration[s] = np.asarray(ref_info['acceleration'], dtype=np.float32)
+        lateral_error[s] = float(ref_info.get('lateral_error', 0.0))
+        valid_mask[s] = bool(ref_info['valid'])
+        if valid_mask[s]:
+            plan_success += 1
+
+        curv_sum += float(ref_info.get('curvature', 0.0))
+        prog_sum += float(ref_info.get('path_progress', 0.0))
+        lat = float(ref_info.get('lateral_error', 0.0))
+        lat_sum += lat
+        lat_max = max(lat_max, lat)
+        metric_count += 1
+
+    return {
+        'ref_direction': ref_direction,
+        'ref_speed': ref_speed,
+        'ref_acceleration': ref_acceleration,
+        'lateral_error': lateral_error,
+        'valid_mask': valid_mask,
+        'plan_total': int(plan_total),
+        'plan_success': int(plan_success),
+        'curv_sum': float(curv_sum),
+        'prog_sum': float(prog_sum),
+        'lat_sum': float(lat_sum),
+        'lat_max': float(lat_max),
+        'metric_count': int(metric_count),
+    }
+
+
+# 全局规划器实例（在迷宫更新时重新规划）
+global_planner = GlobalPlanner(resolution=0.3, margin=0.15)
+
+
+def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, planner: GlobalPlanner,
+                                             max_speed=5.0, max_accel=5.0, max_decel=6.0,
+                                             lookahead_dist=1.0, invalid_dist_threshold=-0.05):
+    """
+    使用全局规划器生成参考方向、速度、加速度和横向偏差
+
+    基于 A* 规划路径和梯形速度剖面计算动力学可行的参考值：
+    - 方向：指向前瞻点
+    - 速度：考虑曲率、终点减速、动力学约束
+    - 加速度：基于速度剖面变化率
+    - 横向偏差：到规划路径的真正几何距离
+
+    Args:
+        p: 位置 [S, B, 3] 或 [B, 3]
+        v: 速度 [S, B, 3] 或 [B, 3]
+        p_target: 目标位置 [B, 3]
+        dist_obj: 到障碍物的距离 [S, B] 或 [B]
+        planner: 全局规划器实例
+        max_speed: 最大速度 (m/s)
+        max_accel: 最大加速度 (m/s^2)
+        max_decel: 最大减速度 (m/s^2)
+        lookahead_dist: 前瞻距离 (m)
+
+    Returns:
+        ref_direction: 参考方向 [S, B, 3]
+        ref_speed: 参考速度 [S, B]
+        ref_acceleration: 参考加速度 [S, B, 3]
+        lateral_error: 横向偏差 [S, B]，到规划路径的距离
+        valid_mask: 有效性掩码 [S, B]
+        planner_info: 规划器信息字典
+    """
+    squeeze_output = False
+    if p.dim() == 2:
+        p = p.unsqueeze(0)
+        v = v.unsqueeze(0)
+        dist_obj = dist_obj.unsqueeze(0)
+        squeeze_output = True
+
+    S, B, _ = p.shape
+    device = p.device
+
+    ref_direction = torch.zeros(S, B, 3, device=device)
+    ref_speed = torch.zeros(S, B, device=device)
+    ref_acceleration = torch.zeros(S, B, 3, device=device)
+    lateral_error = torch.zeros(S, B, device=device)
+    valid_mask = torch.zeros(S, B, dtype=torch.bool, device=device)
+
+    curv_sum = 0.0
+    prog_sum = 0.0
+    lat_sum = 0.0
+    lat_max = 0.0
+    metric_count = 0
+    sample_plan_total = 0
+    sample_plan_success = 0
+
+    used_parallel = False
+    pool = _get_planner_pool()
+    if pool is not None and B > 1:
+        try:
+            payloads = []
+            for b in range(B):
+                vox_np = env.voxels[b].detach().cpu().numpy() if hasattr(env, 'voxels') else np.zeros((0, 6), dtype=np.float32)
+                balls_np = env.balls[b].detach().cpu().numpy() if hasattr(env, 'balls') else np.zeros((0, 4), dtype=np.float32)
+                cyl_np = env.cyl[b].detach().cpu().numpy() if hasattr(env, 'cyl') else np.zeros((0, 3), dtype=np.float32)
+                cyl_h_np = env.cyl_h[b].detach().cpu().numpy() if hasattr(env, 'cyl_h') else np.zeros((0, 3), dtype=np.float32)
+
+                payloads.append({
+                    'voxels': np.asarray(vox_np, dtype=np.float32),
+                    'balls': np.asarray(balls_np, dtype=np.float32),
+                    'cyl': np.asarray(cyl_np, dtype=np.float32),
+                    'cyl_h': np.asarray(cyl_h_np, dtype=np.float32),
+                    'sampled_positions': np.asarray(p[:, b].detach().cpu().numpy(), dtype=np.float32),
+                    'sampled_dist': np.asarray(dist_obj[:, b].detach().cpu().numpy(), dtype=np.float32),
+                    'goal': np.asarray(p_target[b].detach().cpu().numpy(), dtype=np.float32),
+                    'resolution': planner.resolution,
+                    'margin': planner.margin,
+                    'z_min': planner.z_min,
+                    'z_max': planner.z_max,
+                    'max_speed': max_speed,
+                    'max_accel': max_accel,
+                    'max_decel': max_decel,
+                    'lookahead_dist': lookahead_dist,
+                    'invalid_dist_threshold': invalid_dist_threshold,
+                })
+
+            results = pool.map(_plan_sample_points_worker, payloads)
+            used_parallel = True
+
+            for b, out in enumerate(results):
+                ref_direction[:, b] = torch.from_numpy(out['ref_direction']).to(device=device, dtype=p.dtype)
+                ref_speed[:, b] = torch.from_numpy(out['ref_speed']).to(device=device, dtype=p.dtype)
+                ref_acceleration[:, b] = torch.from_numpy(out['ref_acceleration']).to(device=device, dtype=p.dtype)
+                lateral_error[:, b] = torch.from_numpy(out['lateral_error']).to(device=device, dtype=p.dtype)
+                valid_mask[:, b] = torch.from_numpy(out['valid_mask']).to(device=device)
+
+                sample_plan_total += int(out['plan_total'])
+                sample_plan_success += int(out['plan_success'])
+                curv_sum += float(out['curv_sum'])
+                prog_sum += float(out['prog_sum'])
+                lat_sum += float(out['lat_sum'])
+                lat_max = max(lat_max, float(out['lat_max']))
+                metric_count += int(out['metric_count'])
+        except Exception:
+            used_parallel = False
+
+    if not used_parallel:
+        # 串行回退路径：每个 batch 仅构建一次占用栅格，随后复用
+        occupancy_cache = {}
+        for b in range(B):
+            planner.build_occupancy_grid(env, batch_idx=b)
+            occupancy_cache[b] = (
+                planner.occupancy_grid,
+                planner.grid_origin.copy(),
+                planner.grid_shape,
+            )
+
+        for b in range(B):
+            planner.occupancy_grid, planner.grid_origin, planner.grid_shape = occupancy_cache[b]
+            goal_np = p_target[b].detach().cpu().numpy()
+
+            for s in range(S):
+                pos_np = p[s, b].detach().cpu().numpy()
+                dist = dist_obj[s, b].item()
+
+                if dist < invalid_dist_threshold:
+                    continue
+
+                sample_plan_total += 1
+                path = planner.plan_astar(pos_np, goal_np)
+                if path is None:
+                    continue
+                path = planner.smooth_path(path, window_size=5)
+
+                ref_info = planner.extract_reference_from_path(
+                    pos_np, path,
+                    max_speed=max_speed,
+                    max_accel=max_accel,
+                    max_decel=max_decel,
+                    lookahead_dist=lookahead_dist,
+                )
+
+                ref_direction[s, b] = torch.tensor(ref_info['direction'], device=device, dtype=p.dtype)
+                ref_speed[s, b] = ref_info['speed']
+                ref_acceleration[s, b] = torch.tensor(ref_info['acceleration'], device=device, dtype=p.dtype)
+                lateral_error[s, b] = ref_info.get('lateral_error', 0.0)
+                valid_mask[s, b] = bool(ref_info['valid'])
+                if bool(ref_info['valid']):
+                    sample_plan_success += 1
+
+                curv_sum += float(ref_info.get('curvature', 0.0))
+                prog_sum += float(ref_info.get('path_progress', 0.0))
+                lat = float(ref_info.get('lateral_error', 0.0))
+                lat_sum += lat
+                lat_max = max(lat_max, lat)
+                metric_count += 1
+
+    plan_total = max(1, int(sample_plan_total))
+    plan_success = int(sample_plan_success)
+    planner_info = {
+        'avg_curvature': (curv_sum / metric_count) if metric_count > 0 else 0.0,
+        'avg_path_progress': (prog_sum / metric_count) if metric_count > 0 else 0.0,
+        'avg_lateral_error': (lat_sum / metric_count) if metric_count > 0 else 0.0,
+        'max_lateral_error': lat_max if metric_count > 0 else 0.0,
+        'planner_success_ratio': float(plan_success) / float(plan_total),
+        'reference_valid_ratio': float(valid_mask.float().mean().item()),
+        'sample_plan_total': int(sample_plan_total),
+        'sample_plan_success': int(sample_plan_success),
+    }
+
+    if squeeze_output:
+        ref_direction = ref_direction.squeeze(0)
+        ref_speed = ref_speed.squeeze(0)
+        ref_acceleration = ref_acceleration.squeeze(0)
+        lateral_error = lateral_error.squeeze(0)
+        valid_mask = valid_mask.squeeze(0)
+
+    return ref_direction, ref_speed, ref_acceleration, lateral_error, valid_mask, planner_info
+
+
+def compute_escape_penalty(v, vec_to_pt, dist_obj, collision_mask):
+    """
+    对已碰撞点，计算逃逸惩罚而非规划引导
+    鼓励速度方向与逃逸方向（远离障碍物内部）一致
+
+    Args:
+        v: 速度 [S, B, 3]
+        vec_to_pt: 指向最近障碍物表面的向量 [S, B, 3]
+        dist_obj: 到障碍物的距离 [S, B]
+        collision_mask: 碰撞掩码 [S, B]
+
+    Returns:
+        escape_loss: 逃逸方向一致性损失 [S, B]
+        depth_penalty: 碰撞深度惩罚 [S, B]
+    """
+    # 逃逸方向：vec_to_pt 指向障碍物表面最近点
+    # 当在障碍物内时，应该朝 vec_to_pt 的方向移动以逃出
+    escape_dir = safe_normalize(vec_to_pt, dim=-1)  # [S, B, 3]
+    v_dir = safe_normalize(v, dim=-1)  # [S, B, 3]
+
+    # 逃逸方向一致性损失：1 - cos(v, escape_dir)
+    # 当速度方向与逃逸方向一致时，损失为0
+    escape_alignment = 1.0 - (v_dir * escape_dir).sum(dim=-1)  # [S, B]
+
+    # 只对碰撞点计算
+    escape_loss = escape_alignment * collision_mask.float()  # [S, B]
+
+    # 额外惩罚：碰撞深度越大，惩罚越重
+    depth_penalty = F.relu(-dist_obj).pow(2) * collision_mask.float()  # [S, B]
+
+    return escape_loss, depth_penalty
+
+
+def sample_guidance_points(p_history, v_history, dist_obj, sample_count, strategy='random'):
+    """
+    智能采样轨迹上的关键点
+
+    Args:
+        p_history: 位置历史 [T, B, 3]
+        v_history: 速度历史 [T, B, 3]
+        dist_obj: 到障碍物的距离 [T, B]
+        sample_count: 采样点数
+        strategy: 采样策略 ('random', 'uniform', 'adaptive', 'critical')
+
+    Returns:
+        indices: 采样点索引 tensor [S, B]（每个 batch 独立采样）
+    """
+    T, B = p_history.shape[:2]
+    device = p_history.device
+
+    # 确保采样数不超过总时间步数
+    sample_count = min(sample_count, T)
+
+    if strategy == 'random':
+        # 随机采样时间步（不放回），每个 batch 独立采样并按时间排序
+        if sample_count >= T:
+            base = torch.arange(T, device=device, dtype=torch.long)
+            indices = base[:, None].expand(T, B).clone()
+        else:
+            cols = []
+            for b in range(B):
+                idx_b = torch.randperm(T, device=device)[:sample_count].sort().values
+                cols.append(idx_b)
+            indices = torch.stack(cols, dim=1)
+
+    elif strategy == 'uniform':
+        # 均匀采样（时间步一致，但按 batch 维度展开）
+        base = torch.linspace(0, T - 1, sample_count, device=device).long()
+        indices = base[:, None].expand(sample_count, B).clone()
+
+    elif strategy == 'adaptive':
+        # 自适应采样：优先采样危险点和变化大的点（每个 batch 独立）
+        with torch.no_grad():
+            # 危险度：dist_obj 越小越危险
+            danger_score = F.softplus(-dist_obj * 5.0)  # [T, B]
+
+            # 速度变化度（曲率指标）
+            v_diff = (v_history[1:] - v_history[:-1]).norm(dim=-1)  # [T-1, B]
+            v_diff = F.pad(v_diff, (0, 0, 0, 1), value=0.0)  # [T, B]
+
+            # 综合分数
+            importance = danger_score + v_diff  # [T, B]
+
+            # 每个 batch 选择最重要的点
+            k = min(sample_count, T)
+            cols = []
+            for b in range(B):
+                _, top_indices = importance[:, b].topk(k)
+                cols.append(top_indices.sort().values)
+            indices = torch.stack(cols, dim=1)
+
+    elif strategy == 'critical':
+        # 只采样关键时刻：轨迹的起点、终点、最危险点（每个 batch 独立）
+        with torch.no_grad():
+            danger = F.softplus(-dist_obj * 5.0)  # [T, B]
+            cols = []
+            for b in range(B):
+                critical_indices = {0, T - 1}
+                remaining_count = sample_count - len(critical_indices)
+                if remaining_count > 0 and T > 2:
+                    danger_mid = danger[1:-1, b]
+                    k = min(remaining_count, int(danger_mid.numel()))
+                    if k > 0:
+                        _, top_danger = danger_mid.topk(k)
+                        for idx in (top_danger + 1).tolist():
+                            critical_indices.add(int(idx))
+
+                idx_b = torch.tensor(sorted(critical_indices), device=device, dtype=torch.long)
+                if idx_b.numel() < sample_count:
+                    pad = idx_b[-1].repeat(sample_count - idx_b.numel())
+                    idx_b = torch.cat([idx_b, pad], dim=0)
+                elif idx_b.numel() > sample_count:
+                    idx_b = idx_b[:sample_count]
+                cols.append(idx_b)
+
+            indices = torch.stack(cols, dim=1)
+
+    else:
+        # 默认均匀采样
+        base = torch.linspace(0, T - 1, sample_count, device=device).long()
+        indices = base[:, None].expand(sample_count, B).clone()
+
+    return indices
+
+
+def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_to_pt, dist_obj,
+                                       a_history=None,
+                                       sample_count=10, strategy='random',
+                                       max_speed=5.0, max_accel=5.0, max_decel=6.0,
+                                       dir_weight=0.5, speed_weight=0.3, lateral_weight=0.3,
+                                       escape_weight=1.0, collision_threshold=-0.05,
+                                       accel_weight=0.2, speed_diff_weight=0.2,
+                                       recovery_speed_weight=0.15):
+    """
+    全局规划器引导的元损失，使用 A* 算法规划的全局路径作为参考
+
+    基于梯形速度剖面和动力学约束计算损失：
+    - 方向一致性：速度方向与规划方向的夹角
+    - 速度偏差：实际速度与规划参考速度的差异（双向惩罚）
+    - 横向偏差：到规划路径的真正几何距离
+    - 加速度偏差：实际加速度与规划参考加速度的差异
+
+    Args:
+        p_history: 位置历史 [T, B, 3]
+        v_history: 速度历史 [T, B, 3]
+        p_target: 目标位置 [B, 3]
+        vec_to_pt: 指向最近障碍物的向量 [T, B, 3]
+        dist_obj: 到障碍物的距离 [T, B]
+        a_history: 可选的环境真实加速度历史 [T, B, 3]，提供时优先用于加速度监督
+        sample_count: 采样点数
+        strategy: 采样策略
+        max_speed: 最大速度 (m/s)
+        max_accel: 最大加速度 (m/s^2)
+        max_decel: 最大减速度 (m/s^2)
+        dir_weight: 方向一致性损失权重
+        speed_weight: 速度偏差惩罚权重
+        lateral_weight: 横向偏差惩罚权重（到路径的几何距离）
+        escape_weight: 逃逸惩罚权重
+        collision_threshold: 碰撞判定阈值
+        accel_weight: 加速度偏差权重
+        speed_diff_weight: 速度差（超速/低速）惩罚权重
+
+    Returns:
+        guidance_loss: 标量损失
+        loss_components: 各分项损失的字典
+    """
+    T, B, _ = p_history.shape
+
+    # 1. 采样关键点
+    sample_indices = sample_guidance_points(
+        p_history, v_history, dist_obj, sample_count, strategy
+    )
+    S = sample_indices.shape[0]
+
+    # 2. 提取采样点的状态
+    b_idx = torch.arange(B, device=p_history.device).unsqueeze(0).expand(S, B)
+    p_sampled = p_history[sample_indices, b_idx]      # [S, B, 3]
+    v_sampled = v_history[sample_indices, b_idx]      # [S, B, 3]
+    vec_sampled = vec_to_pt[sample_indices, b_idx]    # [S, B, 3]
+    dist_sampled = dist_obj[sample_indices, b_idx]    # [S, B]
+    a_sampled = None
+    if a_history is not None:
+        a_sampled = a_history[sample_indices, b_idx]  # [S, B, 3]
+
+    # 3. 使用全局规划器计算参考（A* 规划 + 梯形速度剖面）
+    ref_dir, ref_speed, ref_accel, lateral_error, valid_mask, planner_info = compute_guidance_reference_from_planner(
+        env, p_sampled, v_sampled, p_target, dist_sampled, global_planner,
+        max_speed=max_speed, max_accel=max_accel, max_decel=max_decel,
+        lookahead_dist=1.0,
+        invalid_dist_threshold=collision_threshold,
+    )
+
+    # 4. 计算各项损失
+    v_dir = safe_normalize(v_sampled, dim=-1)  # [S, B, 3]
+    v_speed = v_sampled.norm(dim=-1)  # [S, B]
+
+    # 4.1 方向一致性损失：1 - cos(v_dir, ref_dir)
+    loss_dir_align = 1.0 - (v_dir * ref_dir).sum(dim=-1)  # [S, B]
+
+    # 4.2 速度偏差：双向惩罚（超速和低速都惩罚）
+    # 超速惩罚更重，低速惩罚较轻
+    loss_overspeed = F.relu(v_speed - ref_speed)  # [S, B]
+    loss_underspeed = F.relu(ref_speed - v_speed) * 0.3  # 低速惩罚较轻
+    loss_speed_diff = loss_overspeed + loss_underspeed  # [S, B]
+
+    # 4.3 横向偏差：到规划路径的真正几何距离
+    # 使用平滑的 L1 损失，对小偏差不过度惩罚
+    loss_lateral = F.smooth_l1_loss(lateral_error, torch.zeros_like(lateral_error), reduction='none')  # [S, B]
+
+    # 4.4 加速度偏差惩罚
+    if S > 1:
+        # 实际加速度：优先使用环境提供的 a_history，缺失时回退到速度差分估算
+        if a_sampled is not None:
+            v_diff = a_sampled
+        else:
+            v_diff = torch.zeros_like(v_sampled)
+            for i in range(S - 1):
+                dt_approx = (sample_indices[i + 1] - sample_indices[i]).to(v_sampled.dtype) / 15.0  # [B]
+                step_acc = (v_sampled[i + 1] - v_sampled[i]) / (dt_approx[:, None] + 1e-6)
+                valid_dt = dt_approx > 0
+                if valid_dt.any():
+                    v_diff[i, valid_dt] = step_acc[valid_dt]
+            v_diff[-1] = v_diff[-2] if S > 1 else torch.zeros_like(v_diff[-1])
+
+        # 加速度偏差：实际加速度与参考加速度的差异
+        # ref_accel 是基于速度剖面计算的参考加速度（通常是减速）
+        accel_error = (v_diff - ref_accel).norm(dim=-1)  # [S, B]
+
+        # 只惩罚明显的加速度偏差（阈值 0.5 m/s^2）
+        loss_accel_mismatch = F.relu(accel_error - 0.5)  # [S, B]
+
+        # 额外检查：需要减速时是否真的在减速
+        ref_accel_mag = ref_accel.norm(dim=-1)  # [S, B]
+        ref_accel_dir = safe_normalize(ref_accel, dim=-1)
+        actual_accel_along_ref = (v_diff * ref_accel_dir).sum(dim=-1)  # [S, B]
+        # 如果规划器要求减速（ref_accel 有显著幅度且为负）但实际在加速
+        need_decel = ref_accel_mag > 0.5
+        not_deceling = actual_accel_along_ref < -0.5  # 实际加速度与减速方向相反
+        loss_decel_violation = need_decel.float() * not_deceling.float() * ref_accel_mag
+        loss_accel_mismatch = loss_accel_mismatch + loss_decel_violation
+    else:
+        loss_accel_mismatch = torch.zeros_like(loss_dir_align)
+
+    # 5. 对不可规划点/碰撞点的恢复处理
+    collision_mask = dist_sampled < collision_threshold  # [S, B]
+    invalid_mask = (~valid_mask) & (~collision_mask)
+    recovery_mask = collision_mask | invalid_mask
+    valid_guidance_mask = valid_mask & (~collision_mask)
+
+    loss_escape, loss_depth = compute_escape_penalty(
+        v_sampled, vec_sampled, dist_sampled, recovery_mask
+    )
+    loss_recovery_speed = v_speed * invalid_mask.float()
+
+    # 6. 组合损失
+    # 有效点（非碰撞）用规划引导
+    loss_speed_profile = speed_weight * loss_overspeed + speed_diff_weight * loss_underspeed
+    guidance_for_valid = (
+        dir_weight * loss_dir_align +
+        loss_speed_profile +
+        lateral_weight * loss_lateral +
+        accel_weight * loss_accel_mismatch
+    )  # [S, B]
+
+    # 碰撞点和不可规划点用恢复惩罚
+    guidance_for_recovery = (
+        escape_weight * (loss_escape + loss_depth)
+        + recovery_speed_weight * loss_recovery_speed
+    )  # [S, B]
+
+    # 根据点状态选择损失
+    guidance_loss_per_point = torch.where(
+        valid_guidance_mask,
+        guidance_for_valid,
+        guidance_for_recovery,
+    )  # [S, B]
+
+    # 总损失
+    guidance_loss = guidance_loss_per_point.mean()
+
+    # 返回各分项用于日志
+    loss_components = {
+        'dir_align': loss_dir_align.mean(),
+        'speed_diff': loss_speed_diff.mean(),
+        'overspeed': loss_overspeed.mean(),
+        'underspeed': loss_underspeed.mean(),
+        'lateral_error': loss_lateral.mean(),
+        'accel_mismatch': loss_accel_mismatch.mean(),
+        'escape': loss_escape.mean(),
+        'depth': loss_depth.mean(),
+        'recovery_speed': loss_recovery_speed.mean(),
+        'valid_ratio': valid_mask.float().mean(),
+        'invalid_ratio': invalid_mask.float().mean(),
+        'collision_ratio': collision_mask.float().mean(),
+        'sample_count': S,
+        'avg_curvature': planner_info.get('avg_curvature', 0.0),
+        'avg_path_progress': planner_info.get('avg_path_progress', 0.0),
+        'avg_lateral_error': planner_info.get('avg_lateral_error', 0.0),
+        'max_lateral_error': planner_info.get('max_lateral_error', 0.0),
+        'planner_success_ratio': planner_info.get('planner_success_ratio', 0.0),
+        'avg_ref_speed': ref_speed.mean().item(),
+    }
+
+    return guidance_loss, loss_components
 
 
 @torch.no_grad()
@@ -739,17 +1944,18 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
     env.reset_drone_only()
 
-    p_list, v_list, vec_list = [], [], []
+    p_list, v_list, a_list, vec_list = [], [], [], []
     act_buf = [env.act.detach()] * 2
     h_val = None
 
     for t in range(args.lgn_timesteps):
-        ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+        ctl_dt = 1.0 / 15.0
         depth, flow = env.render(ctl_dt)
         depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
 
         p_list.append(env.p)
         v_list.append(env.v)
+        a_list.append(env.a)
         vec_list.append(env.find_vec_to_nearest_pt())
 
         target_v_raw = env.p_target - env.p.detach()
@@ -795,6 +2001,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     # --- 计算 Meta Loss ---
     p_val = torch.stack(p_list)
+    a_val = torch.stack(a_list)
     act_val = torch.stack(act_buf)
     vec_val = torch.stack(vec_list)
     if vec_val.dim() == 4:
@@ -817,11 +2024,42 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
                + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
-    meta_val = sanitize_tensor(m_pos + m_coll + m_height * 2.0,
-                               nan=1e3, posinf=1e3, neginf=1e3)
+    # 全局规划引导损失（与主訓練分支保持一致）
+    v_val = torch.stack(v_list)  # [T, B, 3]
+    m_guidance, _ = compute_global_guidance_meta_loss(
+        env, p_val, v_val, env.p_target, vec_val, dist_val,
+        a_history=a_val,
+        sample_count=args.guide_sample_count,
+        strategy=args.guide_sample_strategy,
+        max_speed=float(env.max_speed),
+        max_accel=args.guide_max_accel,
+        max_decel=args.guide_max_decel,
+        dir_weight=args.guide_dir_weight,
+        speed_weight=args.guide_speed_weight,
+        lateral_weight=args.guide_lateral_weight,
+        escape_weight=args.guide_escape_weight,
+        collision_threshold=args.guide_collision_threshold,
+        accel_weight=args.guide_accel_weight,
+        speed_diff_weight=args.guide_speed_diff_weight,
+        recovery_speed_weight=args.guide_recovery_speed_weight,
+    )
+
+    meta_val = sanitize_tensor(
+        m_pos + m_coll + m_height * 2.0 + args.meta_guidance_weight * m_guidance,
+        nan=1e3, posinf=1e3, neginf=1e3
+    )
     return meta_val, m_pos, m_coll, m_ctrl
 
 ########## 7. 训练主循环 ##########
+
+# 使用命令行参数重新初始化全局规划器
+global_planner = GlobalPlanner(
+    resolution=args.planner_resolution,
+    margin=args.planner_margin,
+    device=device
+)
+print(f"[GlobalPlanner] Initialized with resolution={args.planner_resolution}m, margin={args.planner_margin}m")
+
 pbar = tqdm(range(args.num_iters), ncols=120)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
@@ -841,7 +2079,7 @@ for i in pbar:
     maze_update_counter += 1
     worknet.reset()
 
-    p_history, v_history, target_v_history, vec_to_pt_history = [], [], [], []
+    p_history, v_history, a_history, target_v_history, vec_to_pt_history = [], [], [], [], []
     rpy_history = []
     R_history = []  # 记录姿态矩阵用于可视化
     real_act_history = []
@@ -856,7 +2094,7 @@ for i in pbar:
 
     ###### A. Rollout ######
     for t in range(rollout_steps):
-        ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+        ctl_dt = 1.0 / 15.0
         depth, flow = env.render(ctl_dt)
         depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
 
@@ -865,6 +2103,7 @@ for i in pbar:
 
         p_history.append(env.p)
         v_history.append(env.v)
+        a_history.append(env.a)
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())
         rpy_history.append(rotation_matrix_to_rpy_deg(env.R))
         R_history.append(env.R.detach().clone())  # 保存姿态矩阵
@@ -919,6 +2158,7 @@ for i in pbar:
     ###### B. Loss Calculation (Step-wise) ######
     p_history = torch.stack(p_history)     # [T, B, 3]
     v_history = torch.stack(v_history)     # [T, B, 3]
+    a_history = torch.stack(a_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
     weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
     rpy_history = torch.stack(rpy_history) # [T, B, 3]
@@ -1012,8 +2252,58 @@ for i in pbar:
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     loss_meta_height = loss_height_seq.mean()
 
-    # 训练目标仅使用位置/碰撞/高度; 控制项仅用于日志监控
-    meta_loss = loss_meta_pos + loss_meta_coll + loss_meta_height * 2.0
+    # --- 全局规划引导损失 ---
+    # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
+    if train_lgn_phase:
+        loss_meta_guidance, guidance_components = compute_global_guidance_meta_loss(
+            env, p_history, v_history, env.p_target, vec_to_pt, dist_obj,
+            a_history=a_history,
+            sample_count=args.guide_sample_count,
+            strategy=args.guide_sample_strategy,
+            max_speed=float(env.max_speed),
+            max_accel=args.guide_max_accel,
+            max_decel=args.guide_max_decel,
+            dir_weight=args.guide_dir_weight,
+            speed_weight=args.guide_speed_weight,
+            lateral_weight=args.guide_lateral_weight,
+            escape_weight=args.guide_escape_weight,
+            collision_threshold=args.guide_collision_threshold,
+            accel_weight=args.guide_accel_weight,
+            speed_diff_weight=args.guide_speed_diff_weight,
+            recovery_speed_weight=args.guide_recovery_speed_weight,
+        )
+    else:
+        zero = torch.tensor(0.0, device=p_history.device)
+        loss_meta_guidance = zero
+        guidance_components = {
+            'dir_align': zero,
+            'speed_diff': zero,
+            'overspeed': zero,
+            'underspeed': zero,
+            'lateral_error': zero,
+            'accel_mismatch': zero,
+            'escape': zero,
+            'depth': zero,
+            'recovery_speed': zero,
+            'valid_ratio': zero,
+            'invalid_ratio': zero,
+            'collision_ratio': zero,
+            'sample_count': 0.0,
+            'avg_curvature': 0.0,
+            'avg_path_progress': 0.0,
+            'avg_lateral_error': 0.0,
+            'max_lateral_error': 0.0,
+            'planner_success_ratio': 0.0,
+            'avg_ref_speed': 0.0,
+        }
+
+    # 训练目标仅使用位置/碰撞/高度/引导; 控制项仅用于日志监控
+    meta_loss = (
+        loss_meta_pos +
+        loss_meta_coll +
+        loss_meta_height * 2.0 +
+        args.meta_guidance_weight * loss_meta_guidance
+    )
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
@@ -1171,6 +2461,28 @@ for i in pbar:
             'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
+
+            # === 全局规划引导损失分项 ===
+            'Meta_Comp/5_Guidance': loss_meta_guidance,
+            'Guidance/Dir_Align': guidance_components['dir_align'],
+            'Guidance/Overspeed': guidance_components['overspeed'],
+            'Guidance/Underspeed': guidance_components.get('underspeed', 0.0),
+            'Guidance/Speed_Diff': guidance_components.get('speed_diff', 0.0),
+            'Guidance/Lateral_Error': guidance_components['lateral_error'],
+            'Guidance/Accel_Mismatch': guidance_components.get('accel_mismatch', 0.0),
+            'Guidance/Escape': guidance_components['escape'],
+            'Guidance/Depth': guidance_components['depth'],
+            'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
+            'Guidance/Valid_Ratio': guidance_components['valid_ratio'],
+            'Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
+            'Guidance/Collision_Ratio': guidance_components['collision_ratio'],
+            'Guidance/Sample_Count': guidance_components['sample_count'],
+            'Guidance/Avg_Curvature': guidance_components.get('avg_curvature', 0.0),
+            'Guidance/Avg_Path_Progress': guidance_components.get('avg_path_progress', 0.0),
+            'Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
+            'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
+            'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
+            'Guidance/Planner_Success_Ratio': guidance_components.get('planner_success_ratio', 0.0),
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -1349,7 +2661,6 @@ for i in pbar:
             ax.view_init(elev=28, azim=38)
             ax.legend(loc='upper left')
             ax.set_title(f"Iter {i} 3D Trajectory & Obstacles")
-            writer.add_figure('Trajectory/Map_View', fig_map, i + 1)
             plt.close(fig_map)
 
             interactive_html = os.path.join(video_dir, f'trajectory3d_iter_{i+1:06d}.html')

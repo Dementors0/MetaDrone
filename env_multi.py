@@ -233,12 +233,24 @@ class Env(BaseEnv):
         lo, hi = random.choice(valid)
         return random.uniform(lo, hi)
 
+    def _sample_y_uniform_in_usable(self, y0, y1, half_y):
+        """在中间6米可用区域内均匀采样 y 坐标，确保障碍物不侵入留白区。"""
+        usable_y0 = y0 + self.blank_length
+        usable_y1 = y1 - self.blank_length
+        margin = 0.20  # 额外安全边距
+        lo = usable_y0 + half_y + margin
+        hi = usable_y1 - half_y - margin
+        if hi <= lo:
+            return 0.5 * (usable_y0 + usable_y1)
+        return random.uniform(lo, hi)
+
     def _generate_random_region(self, difficulty, y0, y1):
         if difficulty == "easy":
             segments = self._easy_corridor_segments(y0, y1)
-            ball_count = self._scaled_region_count(4, min_count=2)
-            cyl_count = self._scaled_region_count(4, min_count=2)
-            box_count = self._scaled_region_count(6, min_count=3)
+            # 增加 easy 区域的障碍物数量
+            ball_count = self._scaled_region_count(8, min_count=4)
+            cyl_count = self._scaled_region_count(8, min_count=4)
+            box_count = self._scaled_region_count(12, min_count=6)
             cfg = {
                 "ball_r": (0.35, 0.60),
                 "cyl_r": (0.24, 0.45),
@@ -274,7 +286,8 @@ class Env(BaseEnv):
         for _ in range(ball_count):
             radius = random.uniform(*cfg["ball_r"])
             half_y = radius
-            y_center = self._sample_y_inside_segments(segments, half_y)
+            # 使用新的均匀采样方法，确保在中间6米区域内且不侵入留白区
+            y_center = self._sample_y_uniform_in_usable(y0, y1, half_y)
             x_center = self._sample_x_outside_corridor(
                 radius, y_center, half_y, segments, cfg["clearance"], cfg["hug_boundary"]
             )
@@ -284,7 +297,7 @@ class Env(BaseEnv):
         for _ in range(cyl_count):
             radius = random.uniform(*cfg["cyl_r"])
             half_y = max(radius, random.uniform(0.20, 0.55))
-            y_center = self._sample_y_inside_segments(segments, half_y)
+            y_center = self._sample_y_uniform_in_usable(y0, y1, half_y)
             x_center = self._sample_x_outside_corridor(
                 radius, y_center, half_y, segments, cfg["clearance"], cfg["hug_boundary"]
             )
@@ -299,7 +312,7 @@ class Env(BaseEnv):
             else:
                 hz = random.uniform(*cfg["box_hz"])
                 cz = self._sample_vertical_center(hz, cfg["prefer_extremes"])
-            y_center = self._sample_y_inside_segments(segments, hy)
+            y_center = self._sample_y_uniform_in_usable(y0, y1, hy)
             x_center = self._sample_x_outside_corridor(
                 hx, y_center, hy, segments, cfg["clearance"], cfg["hug_boundary"]
             )
@@ -330,58 +343,81 @@ class Env(BaseEnv):
         self._append_wall_box(walls, x_center, 0.5 * (y_lo + y_hi), half_thickness, 0.5 * (y_hi - y_lo))
 
     def _append_stepped_wall(self, walls, x0, y0, x1, y1, half_thickness, steps=8):
+        """构造斜墙离散段，沿 x/y 双向加密封重叠，避免穿缝。"""
         total_steps = max(2, int(steps))
+        seg_dx = (x1 - x0) / total_steps
         seg_dy = (y1 - y0) / total_steps
+
+        # y 向重叠用于封住段间上下缝，x 向重叠用于封住斜率造成的横向锯齿缝。
+        overlap_y = 0.08
+        overlap_x = 0.04
+        hx = half_thickness + 0.5 * abs(seg_dx) + overlap_x
+        hy = 0.5 * abs(seg_dy) + overlap_y
+
         for idx in range(total_steps):
             seg_y0 = y0 + seg_dy * idx
             seg_y1 = y0 + seg_dy * (idx + 1)
             y_center = 0.5 * (seg_y0 + seg_y1)
             t = (idx + 0.5) / total_steps
             x_center = x0 + (x1 - x0) * t
-            hy = 0.5 * abs(seg_y1 - seg_y0) + 0.02
-            self._append_wall_box(walls, x_center, y_center, half_thickness, hy)
+            self._append_wall_box(walls, x_center, y_center, hx, hy)
+
+        # 端点封口，防止与相邻竖墙/边界拼接处出现小孔。
+        cap_hx = half_thickness + 0.5 * abs(seg_dx) + overlap_x
+        cap_hy = half_thickness + 0.04
+        self._append_wall_box(walls, x0, y0, cap_hx, cap_hy)
+        self._append_wall_box(walls, x1, y1, cap_hx, cap_hy)
 
     def _generate_u_region(self, y0, y1):
+        """生成 U 型局部最优陷阱区域。"""
         walls = []
         wall_half = 0.14
-        corridor_half_width = 1.0
-        corridor_x_left = self.spawn_x_center - corridor_half_width
-        corridor_x_right = self.spawn_x_center + corridor_half_width
+        corridor_half_width = 1.0  # 通道半宽，总宽 2 米
+        corridor_x_left = self.spawn_x_center - corridor_half_width   # 4.0
+        corridor_x_right = self.spawn_x_center + corridor_half_width  # 6.0
         outer_left_x = wall_half
         outer_right_x = self.map_x_max - wall_half
 
+        # 漏斗区域 y 范围
         funnel_y0 = y0 + 0.04
         funnel_y1 = y0 + 2.35
         corridor_y0 = funnel_y1
         corridor_y1 = y0 + 6.45
         deadend_y = corridor_y1 + wall_half
 
-        exit_gap = 0.90
-        exit_center_y = corridor_y0 + 1.00
+        # 出口参数：2 米宽出口
+        exit_gap = 2.0
+        exit_center_y = corridor_y0 + 2.0
         exit_y0 = exit_center_y - 0.5 * exit_gap
         exit_y1 = exit_center_y + 0.5 * exit_gap
 
-        self._append_stepped_wall(walls, outer_left_x, funnel_y0, corridor_x_left, funnel_y1, wall_half, steps=8)
-        self._append_stepped_wall(walls, outer_right_x, funnel_y0, corridor_x_right, funnel_y1, wall_half, steps=8)
+        # 漏斗入口斜墙（无间隙）
+        self._append_stepped_wall(walls, outer_left_x, funnel_y0, corridor_x_left, funnel_y1, wall_half, steps=12)
+        self._append_stepped_wall(walls, outer_right_x, funnel_y0, corridor_x_right, funnel_y1, wall_half, steps=12)
 
         open_left = random.random() < 0.5
         if open_left:
+            # 左墙有出口：分成两段
             self._append_vertical_wall(walls, corridor_x_left, corridor_y0, exit_y0, wall_half)
             self._append_vertical_wall(walls, corridor_x_left, exit_y1, corridor_y1, wall_half)
+            # 右墙完整
             self._append_vertical_wall(walls, corridor_x_right, corridor_y0, corridor_y1, wall_half)
 
-            self._append_horizontal_wall(walls, 0.12, 2.85, exit_y1 + 0.42, wall_half)
-            self._append_vertical_wall(walls, 2.85, exit_y1 + 0.42, exit_y1 + 1.18, wall_half)
-            self._append_horizontal_wall(walls, 1.20, 3.78, exit_y1 + 1.50, wall_half)
+            # 出口外侧引导墙：保留 2 米间距
+            guide_x = corridor_x_left - 2.0 - wall_half  # 距离出口 2 米
+            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half)
         else:
+            # 左墙完整
             self._append_vertical_wall(walls, corridor_x_left, corridor_y0, corridor_y1, wall_half)
+            # 右墙有出口：分成两段
             self._append_vertical_wall(walls, corridor_x_right, corridor_y0, exit_y0, wall_half)
             self._append_vertical_wall(walls, corridor_x_right, exit_y1, corridor_y1, wall_half)
 
-            self._append_horizontal_wall(walls, 7.15, 9.88, exit_y1 + 0.42, wall_half)
-            self._append_vertical_wall(walls, 7.15, exit_y1 + 0.42, exit_y1 + 1.18, wall_half)
-            self._append_horizontal_wall(walls, 6.22, 8.80, exit_y1 + 1.50, wall_half)
+            # 出口外侧引导墙：保留 2 米间距
+            guide_x = corridor_x_right + 2.0 + wall_half  # 距离出口 2 米
+            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half)
 
+        # 死胡同尽头的墙
         self._append_horizontal_wall(walls, corridor_x_left - 0.12, corridor_x_right + 0.12, deadend_y, wall_half)
 
         return walls, {
@@ -525,8 +561,8 @@ class Env(BaseEnv):
         x_goal = self.spawn_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
         z_goal = self.spawn_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
 
-        y = torch.full((B,), -11.0, device=device)
-        y_goal = torch.full((B,), 11.0, device=device)
+        y = torch.full((B,), -11.5, device=device)
+        y_goal = torch.full((B,), 11.5, device=device)
 
         self.p = torch.stack([x, y, z], dim=-1)
         self.p_target = torch.stack([x_goal, y_goal, z_goal], dim=-1)

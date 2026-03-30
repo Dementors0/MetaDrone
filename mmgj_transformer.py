@@ -45,12 +45,12 @@ if torch.cuda.is_available():
     print("[SDP] flash=False, mem_efficient=False, math=True (for higher-order gradients)")
 
 try:
-    from env import Env
+    from env_multi import Env
 except ModuleNotFoundError:
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
-    from env import Env
+    from env_multi import Env
 try:
     from WorkNet_transformer import WorkNet
     from LossGenNet_transformer import LossGenNet
@@ -128,7 +128,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=64)
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--num_iters', type=int, default=5000000)
 
 # [优化策略参数]
@@ -153,8 +153,8 @@ parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v
 parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
-parser.add_argument('--timesteps', type=int, default=180)
-parser.add_argument('--lgn_timesteps', type=int, default=48,
+parser.add_argument('--timesteps', type=int, default=300)
+parser.add_argument('--lgn_timesteps', type=int, default=300,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
@@ -1688,6 +1688,40 @@ def _plotly_add_cylinder_y(fig, cx, zc, r, y0, y1, color='darkorange', opacity=0
                              opacity=opacity, hoverinfo='skip'))
 
 
+def _is_ceiling_or_side_boundary_voxel(box_xyz_half, env):
+    """Hide enclosure voxels (ceiling + 4 side walls) while keeping floor visible."""
+    cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
+    if not all(hasattr(env, key) for key in ('map_x_max', 'map_y_min', 'map_y_max', 'map_z_max', 'boundary_half')):
+        return False
+
+    map_x_max = float(env.map_x_max)
+    map_y_min = float(env.map_y_min)
+    map_y_max = float(env.map_y_max)
+    map_z_max = float(env.map_z_max)
+    boundary_half = float(env.boundary_half)
+    map_y_span = max(1e-6, map_y_max - map_y_min)
+
+    tol = max(0.08, boundary_half * 1.6)
+
+    side_x = (
+        (abs(cx - 0.0) <= tol or abs(cx - map_x_max) <= tol)
+        and abs(hx - boundary_half) <= tol
+        and hy >= 0.45 * map_y_span
+    )
+    side_y = (
+        (abs(cy - map_y_min) <= tol or abs(cy - map_y_max) <= tol)
+        and abs(hy - boundary_half) <= tol
+        and hx >= 0.45 * map_x_max
+    )
+    ceiling = (
+        abs(cz - map_z_max) <= tol
+        and abs(hz - boundary_half) <= tol
+        and hx >= 0.45 * map_x_max
+        and hy >= 0.45 * map_y_span
+    )
+    return bool(side_x or side_y or ceiling)
+
+
 def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5):
     """保存交互式3D轨迹HTML，带有无人机姿态坐标系
 
@@ -1771,6 +1805,8 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         vox = env.voxels[idx].detach().cpu().numpy()
         vox = vox[(vox[:, 3:6] < 20).all(axis=1)]
         for box in vox[:180]:
+            if _is_ceiling_or_side_boundary_voxel(box, env):
+                continue
             cx, cy, cz, hx, hy, hz = box.tolist()
             _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.7)
             x_vals.extend([[cx - hx], [cx + hx]])

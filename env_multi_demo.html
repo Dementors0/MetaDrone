@@ -948,8 +948,17 @@
       );
     }
 
-    function updateSidebar(env) {
-      document.getElementById('voxelCount').textContent = String(env.voxels.length);
+    function isHiddenBoundaryVoxel(box) {
+      if (box.region !== 'boundary') return false;
+      const tol = Math.max(0.08, CONFIG.boundaryHalf * 1.6);
+      const isCeiling = Math.abs(box.z - CONFIG.mapZMax) <= tol;
+      const isSideX = Math.abs(box.x - 0.0) <= tol || Math.abs(box.x - CONFIG.mapXMax) <= tol;
+      const isSideY = Math.abs(box.y - CONFIG.mapYMin) <= tol || Math.abs(box.y - CONFIG.mapYMax) <= tol;
+      return isCeiling || isSideX || isSideY;
+    }
+
+    function updateSidebar(env, visibleVoxels) {
+      document.getElementById('voxelCount').textContent = String(visibleVoxels.length);
       document.getElementById('sphereCount').textContent = String(env.balls.length);
       document.getElementById('cylCount').textContent = String(env.cylinders.length);
       document.getElementById('routeSpan').textContent = `${env.ySpan.toFixed(1)}m`;
@@ -997,6 +1006,7 @@
       if (requestToken !== activeRequestToken) return;
       Object.assign(CONFIG, env.config || {});
       const traces = [];
+      const visibleVoxels = env.voxels.filter((box) => !isHiddenBoundaryVoxel(box));
 
       env.regionZones.forEach((zone) => {
         traces.push(regionFloorTrace(zone));
@@ -1004,7 +1014,7 @@
         traces.push(regionLabelTrace(zone));
       });
 
-      env.voxels.forEach((box, idx) => {
+      visibleVoxels.forEach((box, idx) => {
         let color = CONFIG.colors.wall;
         let opacity = 0.56;
         let name = 'voxel wall';
@@ -1093,7 +1103,7 @@
       };
 
       Plotly.react('plot', traces, layout, { responsive: true, displaylogo: false });
-      updateSidebar(env);
+      updateSidebar(env, visibleVoxels);
       setStatus(`已连接本地 Python 服务。当前显示的是 env_multi.py 的真实输出。seed=${env.seed} · scale=${Number(env.obstacleScale).toFixed(2)}${env.device ? ` · device=${env.device}` : ''}`);
     }
 

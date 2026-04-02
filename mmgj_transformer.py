@@ -1,4 +1,4 @@
-#7.1
+#7.3
 #修改地圖起始位置和終點
 #可調整地圖大小和障礙物密度
 
@@ -197,6 +197,14 @@ parser.add_argument('--goal_radius', type=float, default=0.5,
                     help='所有无人机进入此半径内判定为到达终点，提前结束 episode (m)')
 parser.add_argument('--maze_update_interval', type=int, default=50,
                     help='每 N 次迭代重新生成迷宫，中间仅重置无人机位置')
+parser.add_argument('--height_floor', type=float, default=0.0,
+                    help='高度下界(地面)，低于该值会受惩罚')
+parser.add_argument('--height_ceiling', type=float, default=None,
+                    help='高度上界(天花板)；默认使用环境 map_z_max')
+parser.add_argument('--height_bound_sharpness', type=float, default=20.0,
+                    help='地面/天花板约束软惩罚斜率，越大越接近硬约束')
+parser.add_argument('--height_smooth_weight', type=float, default=0.2,
+                    help='高度变化平滑惩罚权重，抑制相邻时刻 z 的剧烈变化')
 
 # ============================================================================
 # Transformer 序列长度
@@ -228,7 +236,7 @@ parser.add_argument('--no_odom', default=False, action='store_true',
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
                     help='LGN softmax 输出温度，越低权重分布越尖锐')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
-                    help='LGN 每通道权重下限，防止权重为 0')
+                    help='兼容参数(当前未启用下限约束)')
 
 # ============================================================================
 # Proxy Loss (Worker 训练目标) 参数
@@ -335,6 +343,12 @@ parser.add_argument('--stuck_displacement_threshold', type=float, default=0.3,
                     help='窗口内最小期望位移 (m)，低于此值触发惩罚')
 parser.add_argument('--collision_duration_weight', type=float, default=10.0,
                     help='碰撞持续时间惩罚权重，连续碰撞越久惩罚越重')
+parser.add_argument('--meta_smooth_jerk_weight', type=float, default=0.001,
+                    help='元损失中动作一阶差分(jerk)平滑惩罚权重，抑制姿态抖动')
+parser.add_argument('--meta_smooth_snap_weight', type=float, default=0.0002,
+                    help='元损失中归一化动作二阶差分(snap)平滑惩罚权重，抑制高频震荡')
+parser.add_argument('--meta_smooth_v_pred_weight', type=float, default=0.1,
+                    help='元损失中速度预测误差权重，促进网络学习准确的速度预测')
 
 args = parser.parse_args()
 
@@ -2055,6 +2069,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     p_list, v_list, a_list, vec_list = [], [], [], []
     act_buf = [env.act.detach()] * 2
+    v_preds_val = []  # [新增] 收集速度预测值用于计算预测误差
     h_val = None
 
     for t in range(args.lgn_timesteps):
@@ -2091,6 +2106,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
+        v_preds_val.append(v_pred)  # [新增] 收集速度预测值
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
@@ -2118,6 +2134,14 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
+    # [新增] 计算卡住损失和碰撞持续时间
+    collision_depth_val = F.relu(-dist_val)
+    loss_stuck_val, loss_collision_duration_val, stuck_ratio = compute_stuck_loss(
+        p_val, collision_depth_val,
+        stuck_window=args.stuck_window,
+        displacement_threshold=args.stuck_displacement_threshold
+    )
+
     m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
     collision_depth_val = F.relu(-dist_val)
     m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
@@ -2128,13 +2152,32 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
               + args.meta_coll_hard_weight * m_coll_hard
               + args.meta_coll_event_weight * m_coll_event)
     m_ctrl = act_val.norm(2, -1).sum()
-    # Meta rollout 的高度惩罚，与主训练分支保持一致
-    m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
-               + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
-               + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
-
-    # 全局规划引导损失（与主訓練分支保持一致）
+    # 与 main_cuda.py 一致的平滑损失构造：jerk + snap
+    m_jerk = act_val.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
+    m_snap = (F.normalize(act_val - env.g_std, dim=-1)
+              .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
+    # Meta rollout 的高度惩罚：仅约束不越界 + 抑制高度剧烈变化
+    z_val = p_val[:, :, 2]
+    z_floor = float(args.height_floor)
+    z_ceiling = float(args.height_ceiling) if args.height_ceiling is not None else float(getattr(env, 'map_z_max', 5.0))
+    z_sharpness = float(args.height_bound_sharpness)
+    m_height_bound = (
+        F.softplus((z_val - z_ceiling) * z_sharpness)
+        + F.softplus((z_floor - z_val) * z_sharpness)
+    )
+    z_delta_val = z_val[1:] - z_val[:-1]
+    m_height_smooth = F.smooth_l1_loss(z_delta_val, torch.zeros_like(z_delta_val), reduction='none')
+    m_height_smooth = torch.cat([torch.zeros_like(z_val[:1]), m_height_smooth], dim=0)
+    m_height = (m_height_bound + float(args.height_smooth_weight) * m_height_smooth).mean()
+    
+    # [新增] 速度预测误差损失
+    v_preds_val_tensor = torch.stack(v_preds_val)  # [T, B, 3]
     v_val = torch.stack(v_list)  # [T, B, 3]
+    m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
+    
+    # [新增] 卡住惩罚和碰撞持续时间
+    m_stuck = loss_stuck_val.mean()
+    m_collision_duration = loss_collision_duration_val.mean()
     m_guidance, _ = compute_global_guidance_meta_loss(
         env, p_val, v_val, env.p_target, vec_val, dist_val,
         a_history=a_val,
@@ -2154,7 +2197,15 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     )
 
     meta_val = sanitize_tensor(
-        m_pos + m_coll + m_height * 2.0 + args.meta_guidance_weight * m_guidance,
+        m_pos
+        + m_coll
+        + m_height * 2.0
+        + args.meta_guidance_weight * m_guidance
+        + args.meta_smooth_jerk_weight * m_jerk
+        + args.meta_smooth_snap_weight * m_snap
+        + args.meta_smooth_v_pred_weight * m_v_pred
+        + args.stuck_loss_weight * m_stuck
+        + args.collision_duration_weight * m_collision_duration,
         nan=1e3, posinf=1e3, neginf=1e3
     )
     return meta_val, m_pos, m_coll, m_ctrl
@@ -2200,6 +2251,7 @@ for i in pbar:
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
+    v_preds = []  # [新增] 收集每个时间步的速度预测值用于计算预测误差
 
     h = None
     lgn_hx = None
@@ -2240,9 +2292,9 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        # LGN Forward (输出非负权重，不限于0-1)
+        # LGN Forward (直接使用可正可负权重，不做下限约束)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
-        current_weights = sanitize_tensor(current_weights, nan=1.0, posinf=100.0, neginf=0.0).clamp(0.01, 100.0)
+        current_weights = sanitize_tensor(current_weights, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
 
         # [诊断] 在第一个时间步检查 current_weights 的梯度链
         if t == 0 and i % 100 == 0:
@@ -2257,6 +2309,7 @@ for i in pbar:
         act, _, h = worknet(x_pooled, state_tensor, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+        v_preds.append(v_pred)  # [新增] 收集速度预测值
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         real_act_history.append(real_act)
@@ -2343,13 +2396,19 @@ for i in pbar:
 
     actual_T = p_history.shape[0]
 
-    # 高度约束损失 (固定权重, 不经LGN控制)
+    # 高度约束损失 (固定权重, 不经LGN控制): 不越界 + 平滑高度变化
     z_pos = p_history[:, :, 2]  # [T, B]
-    z_target = 1.0  # 迷宫中层高度
-    z_min, z_max = 0.0, 5.0
-    loss_height_seq = (F.smooth_l1_loss(z_pos, torch.full_like(z_pos, z_target), reduction='none')
-                       + F.softplus((z_pos - z_max) * 20.0)
-                       + F.softplus((z_min - z_pos) * 20.0))
+    z_floor = float(args.height_floor)
+    z_ceiling = float(args.height_ceiling) if args.height_ceiling is not None else float(getattr(env, 'map_z_max', 5.0))
+    z_sharpness = float(args.height_bound_sharpness)
+    loss_height_bound_seq = (
+        F.softplus((z_pos - z_ceiling) * z_sharpness)
+        + F.softplus((z_floor - z_pos) * z_sharpness)
+    )
+    z_delta = z_pos[1:] - z_pos[:-1]
+    loss_height_smooth_seq = F.smooth_l1_loss(z_delta, torch.zeros_like(z_delta), reduction='none')
+    loss_height_smooth_seq = torch.cat([torch.zeros_like(z_pos[:1]), loss_height_smooth_seq], dim=0)
+    loss_height_seq = loss_height_bound_seq + float(args.height_smooth_weight) * loss_height_smooth_seq
 
     # 归一化各损失项到相同尺度 (可微除法, 统计量不反传)
     loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n = \
@@ -2358,18 +2417,18 @@ for i in pbar:
         )
 
     # 纯学习模式: 仅使用 LGN 动态权重，不叠加先验或规则门控
-    weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-    effective_weights_seq = weights_seq_norm
+    # 这里直接使用原始权重，不做和为1归一化。
+    effective_weights_seq = weights_seq
 
-    # [诊断] 检查loss项和weights_seq_norm的梯度属性
+    # [诊断] 检查loss项和effective_weights_seq的梯度属性
     if i % 100 == 0:
-        _wsn_req = weights_seq_norm.requires_grad
-        _wsn_gfn = type(weights_seq_norm.grad_fn).__name__ if weights_seq_norm.grad_fn else "None"
+        _wsn_req = effective_weights_seq.requires_grad
+        _wsn_gfn = type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else "None"
         _ls_req = loss_speed_n.requires_grad
         _ld_req = loss_dir_n.requires_grad
         _la_req = loss_avoid_n.requires_grad
         _le_req = loss_expl_n.requires_grad
-        print(f"[DIAG iter={i}] weights_seq_norm: requires_grad={_wsn_req}, grad_fn={_wsn_gfn}")
+        print(f"[DIAG iter={i}] effective_weights_seq: requires_grad={_wsn_req}, grad_fn={_wsn_gfn}")
         print(f"[DIAG iter={i}] loss_n requires_grad: speed={_ls_req}, dir={_ld_req}, avoid={_la_req}, expl={_le_req}")
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
@@ -2419,7 +2478,16 @@ for i in pbar:
         + args.meta_coll_event_weight * loss_meta_coll_event
     )
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
+    # 与 main_cuda.py 一致的平滑损失构造：jerk + snap
+    loss_meta_jerk = act_buffer.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
+    loss_meta_snap = (F.normalize(act_buffer - env.g_std, dim=-1)
+                      .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
     loss_meta_height = loss_height_seq.mean()
+    
+    # [新增] 速度预测误差损失：仿照 main_cuda.py 的构造逻辑
+    # v_preds: [T, B, 3], v_history: [T, B, 3]
+    v_preds_tensor = torch.stack(v_preds)  # [T, B, 3]
+    loss_meta_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
 
     # --- 全局规划引导损失 ---
     # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
@@ -2476,6 +2544,9 @@ for i in pbar:
         loss_meta_coll +
         loss_meta_height * 2.0 +
         args.meta_guidance_weight * loss_meta_guidance +
+        args.meta_smooth_jerk_weight * loss_meta_jerk +
+        args.meta_smooth_snap_weight * loss_meta_snap +
+        args.meta_smooth_v_pred_weight * loss_meta_v_pred +
         args.stuck_loss_weight * loss_meta_stuck +
         args.collision_duration_weight * loss_meta_collision_duration
     )
@@ -2538,9 +2609,9 @@ for i in pbar:
 
         fast_params = dict(worknet.named_parameters())
 
-        # 获取 LGN 输出的归一化权重（用最后一步的平均，或者用全序列平均）
-        # weights_seq_norm: [T, B, 4]，取平均得到 [4]
-        lgn_weights_for_grad = weights_seq_norm.mean(dim=[0, 1])  # [4]
+        # 获取用于代理损失加权的实际权重（按全序列平均）
+        # effective_weights_seq: [T, B, 4]，取平均得到 [4]
+        lgn_weights_for_grad = effective_weights_seq.mean(dim=[0, 1])  # [4]
 
         # [诊断] 检查 lgn_weights_for_grad 的梯度属性
         if i % 100 == 0:
@@ -2788,10 +2859,10 @@ for i in pbar:
     with torch.no_grad():
         success = torch.all(dist_obj > 0, 0)
         # 计算平均权重 (用于 Scalar 显示)
-        avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始非归一化权重
-        avg_weights = weights_seq_norm.mean(dim=[0, 1]).cpu()  # 归一化后的权重
-        avg_effective_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()
-        weight_entropy = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(dim=-1).mean()
+        avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际用于加权损失的权重
+        # 仅用于监控分布形态；不参与训练加权
+        _w_prob = torch.softmax(effective_weights_seq.detach(), dim=-1)
+        weight_entropy = (-_w_prob * torch.log(_w_prob.clamp_min(1e-8))).sum(dim=-1).mean()
         v_norm = v_history.norm(dim=-1)
         avg_speed = v_norm.mean()
         min_speed_threshold = float(env.max_speed) * 0.7
@@ -2809,49 +2880,23 @@ for i in pbar:
             'Loss/2_Meta_Total': meta_loss,
 
             # ============================== 权重监控（LGN输出） ==============================
-            # [权重/0_速度] LGN学到的速度目标权重(经过softmax+温度变换后的归一化权重)
-            # 现象：应在0-1之间摇摆。快速任务中应该>0，追求高速通过
-            # [权重/0_速度] LGN学到的速度目标权重(经过softmax+温度变换后的归一化权重)
-            # 现象：应在0-1之间摇摆。快速任务中应该>0，追求高速通过
+            # [权重/0_速度] 实际用于损失加权的速度项权重（非归一化）
             'Weights/0_Speed': avg_weights[0],
-            # [权重/1_方向] LGN学到的方向一致性权重(经过softmax+温度变换后的归一化权重)
-            # 现象：应在0-1之间。狭窄环境中应该较大，求助路径一致性
+            # [权重/1_方向] 实际用于损失加权的方向项权重（非归一化）
             'Weights/1_Direction': avg_weights[1],
-            # [权重/2_避障] LGN学到的碰撞避免权重(经过softmax+温度变换后的归一化权重)
-            # 现象：应在0-1之间。复杂障碍环境中应该较大，保证安全
+            # [权重/2_避障] 实际用于损失加权的避障项权重（非归一化）
             'Weights/2_Avoidance': avg_weights[2],
-            # [权重/3_探索] LGN学到的鼓励探索权重(经过softmax+温度变换后的归一化权重)
-            # 现象：应在0-1之间。初期可能较小，训练后期若陷入局部最优会增大
+            # [权重/3_探索] 实际用于损失加权的探索项权重（非归一化）
             'Weights/3_Exploration': avg_weights[3],
 
-            # ====== 原始非归一化权重（Softmax前的logits，用于诊断） ======
-            # 四个未经过softmax的原始logits值。用于判断权重生成的饱和度
-            # 现象：logits的max-min差距大表示分布尖锐，接近0表示权重分布平均
-            'Weights_Raw/0_Speed': avg_weights_raw[0],
-            'Weights_Raw/1_Direction': avg_weights_raw[1],
-            'Weights_Raw/2_Avoidance': avg_weights_raw[2],
-            'Weights_Raw/3_Exploration': avg_weights_raw[3],
-
-            # ====== 有效权重（应用了下限保护后） ======
-            # 应用了lgn_weight_floor下限保护后的权重。用于监控下限保护是否生效
-            # 现象：应该 >= lgn_weight_floor(通常0.01)。若等于下限值过多说明需要调整温度
-            'Weights_Effective/0_Speed': avg_effective_weights[0],
-            'Weights_Effective/1_Direction': avg_effective_weights[1],
-            'Weights_Effective/2_Avoidance': avg_effective_weights[2],
-            'Weights_Effective/3_Exploration': avg_effective_weights[3],
-
             # ============================== 权重分布统计 ==============================
-            # 整个Episode中的权重序列的最小值。用于检测权重下界
-            # 现象：应该 >= lgn_weight_floor，否则说明下限保护未正确应用
-            'Weight_Stats/Raw_Min': weights_seq.min(),
+            # 整个Episode中的有效权重最小值（权重可正可负）
+            'Weight_Stats/Raw_Min': effective_weights_seq.min(),
             # 整个Episode中的权重序列的最大值。用于检测权重上界
-            # 现象：应该接近1.0，如果远小于1.0说明权重分布过于分散
-            'Weight_Stats/Raw_Max': weights_seq.max(),
+            'Weight_Stats/Raw_Max': effective_weights_seq.max(),
             # 整个Episode中的权重序列的平均值。用于监控总体权重水平
-            # 现象：应该在0.2-0.8之间，过小表示权重设置不当，过大表示某权重独占
-            'Weight_Stats/Raw_Mean': weights_seq.mean(),
-            # 权重分布的熵值(Shannon entropy)。衡量权重分布的多样性
-            # 现象：高熵(>0.8)表示权重分布均匀，低熵(<0.5)表示某权重主要影响。好的学习应该熵值适中
+            'Weight_Stats/Raw_Mean': effective_weights_seq.mean(),
+            # 监控用熵：对有效权重做softmax后计算，不参与训练
             'Weight_Stats/Entropy': weight_entropy,
 
             # ============================== Proxy Loss 分项 ==============================
@@ -2908,6 +2953,9 @@ for i in pbar:
             'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
+            'Meta_Comp/8_Smooth_Jerk': loss_meta_jerk,
+            'Meta_Comp/9_Smooth_Snap': loss_meta_snap,
+            'Meta_Comp/10_Smooth_V_Pred': loss_meta_v_pred,  # [新增] 速度预测误差
             # === [新增] Meta Loss 中的卡住损失 ===
             'Meta_Comp/6_Stuck': loss_meta_stuck,
             'Meta_Comp/7_Collision_Duration': loss_meta_collision_duration,
@@ -3337,11 +3385,11 @@ for i in pbar:
 
             # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
             fig_w, ax = plt.subplots()
-            w_cpu = weights_seq_norm[:, idx, :].cpu() # [T, 4] 归一化后的权重
+            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际用于加权损失的权重
             labels = ['Speed', 'Dir', 'Avoid', 'Expl']
             for wi in range(4):
                 ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Normalized)")
+            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Effective)")
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 

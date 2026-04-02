@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 class LossGenNet(nn.Module):
     """
@@ -22,7 +21,8 @@ class LossGenNet(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
         self.output_temperature = float(max(output_temperature, 1e-3))
-        self.weight_floor = float(min(max(weight_floor, 0.0), 0.249))
+        # 保留该字段仅为兼容旧调用；当前前向不再使用下限约束。
+        self.weight_floor = float(weight_floor)
         
         # 1. 增强视觉特征提取 (3层卷积)
         # Input: [B, 1, 12, 16]
@@ -105,10 +105,9 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成权重 (非负输出，不做归一化，允许自由动态范围)
+        # 5. 生成权重（不做非负/下限约束，不做归一化）
         raw = self.head(last_token)
-        # 使用 softplus 保证非负，输出范围 [weight_floor, +inf)
-        weights = F.softplus(raw / self.output_temperature) + self.weight_floor
+        weights = raw / self.output_temperature
 
         # 返回 weights 和 新的记忆序列
         return weights, seq

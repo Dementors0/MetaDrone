@@ -125,129 +125,216 @@ def sanitize_module_(module, clamp_value=10.0):
 
 ########### 1. 参数配置 ##########
 parser = argparse.ArgumentParser()
-parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
-parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
-parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--num_iters', type=int, default=5000000)
 
-# [优化策略参数]
-parser.add_argument('--lgn_steps', type=int, default=1)
-parser.add_argument('--worker_steps', type=int, default=5)
+# ============================================================================
+# 基础训练参数
+# ============================================================================
+parser.add_argument('--batch_size', type=int, default=8,
+                    help='每次迭代的样本数')
+parser.add_argument('--num_iters', type=int, default=5000000,
+                    help='总训练迭代次数')
+parser.add_argument('--exp_name', type=str, default="default",
+                    help='实验名称标签，用于区分不同实验的保存目录')
 
-# 基础物理参数
-parser.add_argument('--grad_decay', type=float, default=0.4)
-parser.add_argument('--speed_mtp', type=float, default=1.0)
-parser.add_argument('--scene_scale', type=float, default=0.5,#調節環境大小
-                    help='Global scene size scale for obstacle field extent and spawn area')
-parser.add_argument('--obstacle_count_scale', type=float, default=0.5,#調節障礙物數量
-                    help='Global multiplier for obstacle counts (balls/voxels/cylinders)')
-parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,#物理軟限速的平滑度（越小越接近硬截斷，越大越平滑）。
-                    help='Softness for physical speed cap in env._apply_speed_limit (smaller = harder cap)')
-parser.add_argument('--max_speed_ceiling', type=float, default=10.0,#env.max_speed 的上限值（軟限速的速度天花板）。
-                    help='Upper bound of env max_speed used by soft speed limiter')
-parser.add_argument('--hard_vpred_clip', type=float, default=20.0,#env.run 中 v_pred 的硬截斷閾值（原本固定 20）。
-                    help='Hard clip magnitude for v_pred in env.run')
-parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v_free/self.v 的硬截斷閾值（原本固定 30）。
-                    help='Hard clip magnitude for velocity tensors (v_free/self.v) in env.run')
-parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
-                    help='Start/goal planes are set to +Y and -Y using this absolute value')
-parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
-parser.add_argument('--timesteps', type=int, default=300)
-parser.add_argument('--lgn_timesteps', type=int, default=300,
-                    help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
-parser.add_argument('--detach_interval', type=int, default=12,
-                    help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
-parser.add_argument('--cam_angle', type=int, default=10)
-parser.add_argument('--goal_radius', type=float, default=0.5,
-                    help='Episode terminates when all drones are within this radius of their goal')
-parser.add_argument('--maze_update_interval', type=int, default=50,
-                    help='Regenerate maze every N iterations; drone-only reset in between for stable LGN signal')
-
-# Transformer memory参数
-parser.add_argument('--worker_max_seq_len', type=int, default=32)
-parser.add_argument('--lgn_max_seq_len', type=int, default=32)
-
-# 环境Flag
-parser.add_argument('--single', default=False, action='store_true')
-parser.add_argument('--gate', default=False, action='store_true')
-parser.add_argument('--ground_voxels', default=False, action='store_true')
-parser.add_argument('--scaffold', default=False, action='store_true')
-parser.add_argument('--random_rotation', default=False, action='store_true')
-parser.add_argument('--no_odom', default=False, action='store_true')
-
-# 学习率
-parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--lgn_lr', type=float, default=2e-4)
+# ============================================================================
+# 双层优化策略参数 (Bilevel Optimization)
+# ============================================================================
+# 训练循环: 每 cycle_len = lgn_steps + worker_steps 步为一周期
+# 前 lgn_steps 步训练 LGN (元学习器)，后 worker_steps 步训练 Worker (策略网络)
+parser.add_argument('--lgn_steps', type=int, default=1,
+                    help='每周期内 LGN 训练步数')
+parser.add_argument('--worker_steps', type=int, default=5,
+                    help='每周期内 Worker 训练步数')
 parser.add_argument('--inner_lr', type=float, default=3e-3,
-                    help='Inner loop LR for differentiable worker update in LGN phase')
+                    help='LGN phase 内循环可微梯度下降的学习率 (用于 unrolled bilevel)')
 parser.add_argument('--inner_steps', type=int, default=1,
-                    help='Number of differentiable inner SGD steps (unrolled bilevel)')
-parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
+                    help='LGN phase 内循环可微 SGD 步数')
 
-# 避障/碰撞超参
-parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
-                    help='Proxy avoidance rises smoothly inside this clearance to walls')
+# ============================================================================
+# 学习率
+# ============================================================================
+parser.add_argument('--lr', type=float, default=1e-4,
+                    help='Worker 网络学习率 (AdamW)')
+parser.add_argument('--lgn_lr', type=float, default=2e-4,
+                    help='LGN 网络学习率 (AdamW)')
+
+# ============================================================================
+# 环境物理参数
+# ============================================================================
+parser.add_argument('--grad_decay', type=float, default=0.4,
+                    help='环境梯度衰减系数，传入 Env 构造函数')
+parser.add_argument('--speed_mtp', type=float, default=1.0,
+                    help='速度乘数，调节无人机最大速度')
+parser.add_argument('--scene_scale', type=float, default=0.5,
+                    help='场景缩放比例，调节障碍物区域大小和生成范围')
+parser.add_argument('--obstacle_count_scale', type=float, default=0.5,
+                    help='障碍物数量缩放比例 (球体/体素/圆柱)')
+parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,
+                    help='物理软限速平滑度，越小越接近硬截断')
+parser.add_argument('--max_speed_ceiling', type=float, default=10.0,
+                    help='env.max_speed 上限值 (m/s)')
+parser.add_argument('--hard_vpred_clip', type=float, default=20.0,
+                    help='env.run 中 v_pred 硬截断阈值')
+parser.add_argument('--hard_speed_clip', type=float, default=30.0,
+                    help='env.run 中速度张量硬截断阈值')
+parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,
+                    help='起点/终点 Y 坐标绝对值，起点在 +Y，终点在 -Y')
+parser.add_argument('--fov_x_half_tan', type=float, default=0.53,
+                    help='深度相机水平视场角的 tan(fov_x/2)')
+parser.add_argument('--cam_angle', type=int, default=10,
+                    help='相机俯仰角度 (度)')
+
+# ============================================================================
+# Rollout 参数
+# ============================================================================
+parser.add_argument('--timesteps', type=int, default=300,
+                    help='Worker phase 每 episode 最大步数')
+parser.add_argument('--lgn_timesteps', type=int, default=300,
+                    help='LGN phase 每 episode 步数，较小值可减少二阶梯度显存占用')
+parser.add_argument('--detach_interval', type=int, default=12,
+                    help='每隔 N 步截断时序记忆梯度以限制计算图深度 (<=0 禁用)')
+parser.add_argument('--goal_radius', type=float, default=0.5,
+                    help='所有无人机进入此半径内判定为到达终点，提前结束 episode (m)')
+parser.add_argument('--maze_update_interval', type=int, default=50,
+                    help='每 N 次迭代重新生成迷宫，中间仅重置无人机位置')
+
+# ============================================================================
+# Transformer 序列长度
+# ============================================================================
+parser.add_argument('--worker_max_seq_len', type=int, default=32,
+                    help='Worker Transformer 最大序列长度')
+parser.add_argument('--lgn_max_seq_len', type=int, default=32,
+                    help='LGN Transformer 最大序列长度')
+
+# ============================================================================
+# 环境模式 Flag
+# ============================================================================
+parser.add_argument('--single', default=False, action='store_true',
+                    help='单无人机模式')
+parser.add_argument('--gate', default=False, action='store_true',
+                    help='启用门型障碍物')
+parser.add_argument('--ground_voxels', default=False, action='store_true',
+                    help='启用地面体素障碍物')
+parser.add_argument('--scaffold', default=False, action='store_true',
+                    help='启用脚手架障碍物')
+parser.add_argument('--random_rotation', default=False, action='store_true',
+                    help='启用随机旋转')
+parser.add_argument('--no_odom', default=False, action='store_true',
+                    help='不使用里程计速度作为状态输入 (state_dim 从 10 变为 7)')
+
+# ============================================================================
+# LGN 网络参数
+# ============================================================================
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
-                    help='Temperature for LGN softmax output (lower = sharper)')
+                    help='LGN softmax 输出温度，越低权重分布越尖锐')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
-                    help='Minimum per-channel LGN weight after simplex projection')
-parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
-                    help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
-parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
-                    help='Soft collision term weight in meta loss')
-parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
-                    help='Hard penetration-depth penalty weight in meta loss')
-parser.add_argument('--meta_coll_event_weight', type=float, default=80.0,
-                    help='Episode-level collision event penalty weight in meta loss')
-parser.add_argument('--meta_coll_event_temp', type=float, default=80.0,
-                    help='Sharpness for differentiable episode collision event penalty (sigmoid temperature)')
-parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
-                    help='Penetration-depth threshold (m) where differentiable collision-event penalty turns on')
-parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
-                    help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
+                    help='LGN 每通道权重下限，防止权重为 0')
 
-# 全局规划引导元损失参数
+# ============================================================================
+# Proxy Loss (Worker 训练目标) 参数
+# ============================================================================
+# 避障损失: loss = softplus((safe_margin - dist_obj) * 12) + ...
+parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
+                    help='避障损失开始生效的距离阈值 (m)，进入此范围开始惩罚')
+
+# 自适应速度目标: v_target = v_max * speed_factor_obs * speed_factor_goal
+# speed_factor_obs: 近障碍物时减速 (sigmoid)
+# speed_factor_goal: 近终点时减速 (线性)
+parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
+                    help='距终点小于此距离时开始线性减速 (m)')
+parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
+                    help='近障碍物时速度因子下限，越小制动越强')
+
+# ============================================================================
+# Meta Loss (LGN 训练目标) 碰撞惩罚参数
+# ============================================================================
+# meta_coll = soft_weight * softplus(-dist) + hard_weight * depth^2 + event_weight * sigmoid(...)
+parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
+                    help='软碰撞项权重，靠近墙壁即升高，提供连续梯度')
+parser.add_argument('--meta_coll_hard_weight', type=float, default=40.0,
+                    help='硬碰撞项权重，穿墙深度平方惩罚')
+parser.add_argument('--meta_coll_event_weight', type=float, default=80.0,
+                    help='碰撞事件项权重，episode 级碰撞惩罚')
+parser.add_argument('--meta_coll_event_temp', type=float, default=80.0,
+                    help='碰撞事件 sigmoid 温度，越大越接近阶跃')
+parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
+                    help='碰撞事件触发阈值，穿入深度超过此值判定为碰撞 (m)')
+
+# ============================================================================
+# 全局规划引导 (Guidance) Meta Loss 参数
+# ============================================================================
+# A* 规划器生成参考路径，计算方向/速度/横向偏差等损失
 parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
-                    help='Weight for global guidance meta loss (path-guiding dense supervision)')
+                    help='全局引导损失总权重')
 parser.add_argument('--guide_sample_count', type=int, default=10,
-                    help='Number of keypoints to sample for guidance loss computation')
+                    help='每 episode 采样计算引导损失的关键点数量')
 parser.add_argument('--guide_sample_strategy', type=str, default='random',
                     choices=['random', 'uniform', 'adaptive', 'critical'],
-                    help='Sampling strategy: random/uniform/adaptive(danger+curvature)/critical(start+end+danger)')
+                    help='采样策略: random/uniform/adaptive(危险+曲率)/critical(起终点+危险)')
 parser.add_argument('--guide_max_accel', type=float, default=5.0,
-                    help='Max acceleration for trapezoidal velocity profile (m/s^2)')
+                    help='梯形速度剖面最大加速度 (m/s^2)')
 parser.add_argument('--guide_max_decel', type=float, default=6.0,
-                    help='Max deceleration for trapezoidal velocity profile (m/s^2)')
+                    help='梯形速度剖面最大减速度 (m/s^2)')
 parser.add_argument('--guide_dir_weight', type=float, default=0.5,
-                    help='Weight for direction alignment loss within guidance loss')
+                    help='方向对齐损失权重')
 parser.add_argument('--guide_speed_weight', type=float, default=0.3,
-                    help='Weight for overspeed penalty within guidance loss')
+                    help='超速惩罚权重')
 parser.add_argument('--guide_lateral_weight', type=float, default=0.3,
-                    help='Weight for lateral error penalty (geometric distance to planned path)')
+                    help='横向偏差惩罚权重 (到规划路径的几何距离)')
 parser.add_argument('--guide_speed_diff_weight', type=float, default=0.2,
-                    help='Weight for speed difference penalty (overspeed + underspeed)')
+                    help='速度偏差惩罚权重 (超速+欠速)')
 parser.add_argument('--guide_escape_weight', type=float, default=1.0,
-                    help='Weight for escape penalty on collided points')
+                    help='已碰撞点的逃脱惩罚权重')
 parser.add_argument('--guide_recovery_speed_weight', type=float, default=0.15,
-                    help='Extra speed damping weight on planner-invalid sampled points')
+                    help='规划无效点的速度抑制惩罚权重')
 parser.add_argument('--guide_collision_threshold', type=float, default=-0.05,
-                    help='Penetration threshold below which point is considered collided')
+                    help='判定为碰撞的穿入深度阈值 (m)')
 parser.add_argument('--guide_accel_weight', type=float, default=0.1,
-                    help='Weight for acceleration mismatch penalty (deceleration requirement)')
+                    help='加速度不匹配惩罚权重 (减速需求)')
+
+# ============================================================================
+# A* 规划器参数
+# ============================================================================
 parser.add_argument('--planner_resolution', type=float, default=0.3,
-                    help='Resolution of the occupancy grid for A* planning (meters)')
+                    help='占用栅格地图分辨率 (m)')
 parser.add_argument('--planner_margin', type=float, default=0.15,
-                    help='Safety margin for obstacle inflation in planner (meters)')
+                    help='A* 规划器障碍物膨胀边距 (m)')
 parser.add_argument('--planner_parallel', dest='planner_parallel', action='store_true',
-                    help='Enable sample-level parallel global planning with multiprocessing pool')
+                    help='启用多进程并行规划')
 parser.add_argument('--no_planner_parallel', dest='planner_parallel', action='store_false',
-                    help='Disable sample-level parallel global planning')
+                    help='禁用多进程并行规划')
 parser.set_defaults(planner_parallel=True)
 parser.add_argument('--planner_workers', type=int, default=0,
-                    help='Number of planner worker processes (<=0 means auto)')
+                    help='规划器进程数 (<=0 自动)')
 parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
-                    help='maxtasksperchild for planner process pool to avoid long-run memory growth')
+                    help='进程池 maxtasksperchild，防止长时间运行内存泄漏')
+
+# ============================================================================
+# 梯度爆炸保护参数
+# ============================================================================
+# 检测到梯度范数超阈值或非有限时跳过 optimizer.step()
+# 连续爆炸超过 skip_window 次后重置优化器状态
+parser.add_argument('--grad_explosion_threshold', type=float, default=100.0,
+                    help='梯度范数阈值，超过则跳过本次更新')
+parser.add_argument('--grad_explosion_skip_window', type=int, default=5,
+                    help='连续爆炸次数阈值，超过后重置优化器状态')
+parser.add_argument('--enable_grad_protection', action='store_true', default=True,
+                    help='启用梯度爆炸保护')
+
+# ============================================================================
+# Stuck Loss (卡住惩罚) 参数
+# ============================================================================
+# 检测并惩罚两种卡住状态:
+# 1. loss_stuck: 局部窗口内位移过小 → softplus((threshold - displacement) * 10)
+# 2. loss_collision_duration: 连续碰撞累计步数 → streak * in_collision
+parser.add_argument('--stuck_loss_weight', type=float, default=2.0,
+                    help='局部位移惩罚权重')
+parser.add_argument('--stuck_window', type=int, default=15,
+                    help='卡住检测时间窗口 (步数)')
+parser.add_argument('--stuck_displacement_threshold', type=float, default=0.3,
+                    help='窗口内最小期望位移 (m)，低于此值触发惩罚')
+parser.add_argument('--collision_duration_weight', type=float, default=10.0,
+                    help='碰撞持续时间惩罚权重，连续碰撞越久惩罚越重')
 
 args = parser.parse_args()
 
@@ -315,23 +402,7 @@ except TypeError:
     lgn = LossGenNet(state_dim=state_dim).to(device)
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
 
-########## 4. 加载预训练模型 ##########
-# def load_checkpoint(model, path, name):
-#     if path and os.path.isfile(path):
-#         print(f"Loading {name} from {path}")
-#         model.load_state_dict(torch.load(path, map_location=device), strict=False)
-#     elif path:
-#         print(f"Warning: {name} path provided but file not found: {path}")
-
-# load_checkpoint(worknet, args.resume_worker, "Worker")
-# load_checkpoint(lgn, args.resume_lgn, "LGN")
-# if args.resume_norm:
-#     load_checkpoint(state_normalizer, args.resume_norm, "Norm Stats")
-# elif args.resume_worker:
-#     norm_path = args.resume_worker.replace('worker_', 'norm_')
-#     load_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats")
-
-########## 5. 优化器配置 ##########
+########## 4. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
 optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
@@ -1576,39 +1647,6 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
     return guidance_loss, loss_components
 
 
-@torch.no_grad()
-def get_map_view_bounds(env, traj_xy, target_xy=None, pad=0.5):
-    """Auto-fit map bounds for both maze-like and random obstacle layouts."""
-    x_vals = [traj_xy[:, 0]]
-    y_vals = [traj_xy[:, 1]]
-
-    if target_xy is not None:
-        x_vals.append(target_xy[0:1])
-        y_vals.append(target_xy[1:2])
-
-    if hasattr(env, 'voxels') and env.voxels.numel() > 0:
-        walls = env.voxels[0].detach().cpu()
-        c = walls[:, :2]
-        h = walls[:, 3:5]
-        x_vals.extend([c[:, 0] - h[:, 0], c[:, 0] + h[:, 0]])
-        y_vals.extend([c[:, 1] - h[:, 1], c[:, 1] + h[:, 1]])
-
-    x_all = torch.cat(x_vals)
-    y_all = torch.cat(y_vals)
-
-    x_min = float(x_all.min().item()) - pad
-    x_max = float(x_all.max().item()) + pad
-    y_min = float(y_all.min().item()) - pad
-    y_max = float(y_all.max().item()) + pad
-
-    if (x_max - x_min) < 1e-3:
-        x_min -= 0.5
-        x_max += 0.5
-    if (y_max - y_min) < 1e-3:
-        y_min -= 0.5
-        y_max += 0.5
-    return x_min, x_max, y_min, y_max
-
 
 def draw_sphere(ax, cx, cy, cz, r, color='royalblue', alpha=0.18, res=12):
     u = np.linspace(0.0, 2.0 * np.pi, res)
@@ -1722,13 +1760,15 @@ def _is_ceiling_or_side_boundary_voxel(box_xyz_half, env):
     return bool(side_x or side_y or ceiling)
 
 
-def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5):
-    """保存交互式3D轨迹HTML，带有无人机姿态坐标系
+def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5, astar_path=None, astar_paths_sampled=None):
+    """保存交互式3D轨迹HTML，带有无人机姿态坐标系和A*规划路径
 
     Args:
         R_cpu: 姿态矩阵 [T, 3, 3]，如果提供则绘制坐标系
         axis_len: 坐标轴长度(米)
         axis_step: 每隔多少个时间步绘制一次坐标系
+        astar_path: A*规划路径 [N, 3] numpy数组，从起点到终点的路径
+        astar_paths_sampled: 采样点的A*路径列表 [(sample_idx, path), ...]，每个path是[N, 3] numpy数组
     """
     if go is None:
         return False
@@ -1751,6 +1791,41 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         line=dict(color='limegreen', width=5),
         name='Trajectory'
     ))
+
+    # 绘制从起点到终点的 A* 规划路径 (橙色虚线)
+    if astar_path is not None and len(astar_path) > 1:
+        fig.add_trace(go.Scatter3d(
+            x=astar_path[:, 0], y=astar_path[:, 1], z=astar_path[:, 2],
+            mode='lines+markers',
+            marker=dict(size=2, color='gold', symbol='diamond'),
+            line=dict(color='orange', width=4, dash='dash'),
+            name='A* Path (Start→Goal)'
+        ))
+
+    # 绘制所有采样点的 A* 路径 (淡紫色细线，按时间步渐变)
+    if astar_paths_sampled is not None and len(astar_paths_sampled) > 0:
+        # 使用颜色渐变表示时间顺序
+        num_paths = len(astar_paths_sampled)
+        for path_idx, (sample_t, path) in enumerate(astar_paths_sampled):
+            if path is None or len(path) < 2:
+                continue
+            # 颜色从浅蓝到深紫渐变
+            color_ratio = path_idx / max(num_paths - 1, 1)
+            r = int(100 + 100 * color_ratio)
+            g = int(150 * (1 - color_ratio))
+            b = int(200 + 55 * color_ratio)
+            color = f'rgb({r},{g},{b})'
+
+            fig.add_trace(go.Scatter3d(
+                x=path[:, 0], y=path[:, 1], z=path[:, 2],
+                mode='lines',
+                line=dict(color=color, width=2),
+                opacity=0.6,
+                showlegend=(path_idx == 0),
+                name='A* Sampled Paths' if path_idx == 0 else None,
+                legendgroup='astar_sampled',
+                hovertemplate=f't={sample_t}<br>x=%{{x:.2f}}<br>y=%{{y:.2f}}<br>z=%{{z:.2f}}<extra></extra>'
+            ))
 
     # 绘制无人机姿态坐标系 (X-红, Y-绿, Z-蓝)
     if R_cpu is not None:
@@ -1849,6 +1924,20 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         y_vals.append([tgt[1]])
         z_vals.append([tgt[2]])
 
+    # 将 A* 路径坐标也纳入范围计算
+    if astar_path is not None and len(astar_path) > 0:
+        x_vals.append(astar_path[:, 0])
+        y_vals.append(astar_path[:, 1])
+        z_vals.append(astar_path[:, 2])
+
+    # 将采样点 A* 路径坐标也纳入范围计算
+    if astar_paths_sampled is not None:
+        for _, path in astar_paths_sampled:
+            if path is not None and len(path) > 0:
+                x_vals.append(path[:, 0])
+                y_vals.append(path[:, 1])
+                z_vals.append(path[:, 2])
+
     x_all = np.concatenate([np.asarray(v) for v in x_vals])
     y_all = np.concatenate([np.asarray(v) for v in y_vals])
     z_all = np.concatenate([np.asarray(v) for v in z_vals])
@@ -1871,75 +1960,6 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
     return True
 
 
-@torch.no_grad()
-def get_collision_wall_patches(points_xyz, walls, drone_radius, segment_len=0.45, contact_eps=0.02):
-    if points_xyz.numel() == 0 or walls.numel() == 0:
-        return []
-
-    wall_mask = (
-        (walls[:, 2] >= 0.1)
-        & (walls[:, 2] <= 1.9)
-        & (walls[:, 5] > 0.5)
-    )
-    walls = walls[wall_mask]
-    if walls.numel() == 0:
-        return []
-
-    centers = walls[:, :3]
-    half = walls[:, 3:]
-    wall_min = centers - half
-    wall_max = centers + half
-    axis_is_x = half[:, 0] <= half[:, 1]
-
-    points_expanded = points_xyz.unsqueeze(1)
-    nearest = torch.minimum(torch.maximum(points_expanded, wall_min.unsqueeze(0)), wall_max.unsqueeze(0))
-    clearance = (nearest - points_expanded).norm(dim=-1) - float(drone_radius)
-    contact_steps = torch.nonzero(clearance.min(dim=1).values <= contact_eps, as_tuple=False).flatten().tolist()
-
-    wall_intervals = defaultdict(list)
-    for step_idx in contact_steps:
-        wall_idx = int(clearance[step_idx].argmin().item())
-        if float(clearance[step_idx, wall_idx].item()) > contact_eps:
-            continue
-
-        point = points_xyz[step_idx]
-        center = centers[wall_idx]
-        wall_half = half[wall_idx]
-
-        if bool(axis_is_x[wall_idx]):
-            tangent_min = float(center[1] - wall_half[1])
-            tangent_max = float(center[1] + wall_half[1])
-            tangent_center = min(max(float(point[1]), tangent_min), tangent_max)
-        else:
-            tangent_min = float(center[0] - wall_half[0])
-            tangent_max = float(center[0] + wall_half[0])
-            tangent_center = min(max(float(point[0]), tangent_min), tangent_max)
-
-        seg_half = min(0.5 * float(segment_len), 0.5 * (tangent_max - tangent_min))
-        seg_start = max(tangent_min, tangent_center - seg_half)
-        seg_end = min(tangent_max, tangent_center + seg_half)
-        if seg_end - seg_start <= 1e-4:
-            continue
-        wall_intervals[wall_idx].append((seg_start, seg_end))
-
-    patches = []
-    for wall_idx, intervals in wall_intervals.items():
-        center = centers[wall_idx]
-        wall_half = half[wall_idx]
-        for seg_start, seg_end in merge_intervals(intervals, min_gap=0.02):
-            if bool(axis_is_x[wall_idx]):
-                patches.append({
-                    'xy': (float(center[0] - wall_half[0]), seg_start),
-                    'width': float(2.0 * wall_half[0]),
-                    'height': float(seg_end - seg_start),
-                })
-            else:
-                patches.append({
-                    'xy': (seg_start, float(center[1] - wall_half[1])),
-                    'width': float(seg_end - seg_start),
-                    'height': float(2.0 * wall_half[1]),
-                })
-    return patches
 
 def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     """
@@ -1948,7 +1968,7 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     """
     p_history = p_history.permute(1, 0, 2) # [B, T, 3]
     n_batch, n_points, n_dims = p_history.shape
-    
+
     if n_points < time_window + 1:
         return torch.zeros((n_batch, n_points), device=p_history.device)
 
@@ -1961,12 +1981,65 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     mask = (time_diff > time_window).float()
 
     # 计算每个时间步的能量总和
-    energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2) 
+    energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2)
     mask_sum = mask.sum(dim=1).unsqueeze(0) + 1e-6
 
     # 返回 [Batch, Time]
     loss_per_step = energy_sum / mask_sum
     return loss_per_step
+
+
+def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement_threshold=0.3):
+    """
+    计算卡住惩罚损失
+
+    检测两种卡住状态：
+    1. 局部窗口内位移过小 (stuck due to obstacles or getting lost)
+    2. 持续碰撞状态 (sustained contact with obstacles)
+
+    Args:
+        p_history: [T, B, 3] 位置历史
+        collision_depth: [T, B] 碰撞深度 (正值表示穿入)
+        stuck_window: 检测窗口大小 (步数)
+        displacement_threshold: 最小期望位移 (m)
+
+    Returns:
+        loss_stuck: [T, B] 卡住惩罚
+        loss_collision_duration: [T, B] 碰撞持续时间惩罚
+        stuck_ratio: 标量，卡住比例（用于监控）
+    """
+    T, B, _ = p_history.shape
+    device = p_history.device
+
+    # 1. 局部位移惩罚：检测低速移动/原地踏步
+    loss_stuck = torch.zeros((T, B), device=device)
+    if T > stuck_window:
+        for t in range(stuck_window, T):
+            # 计算过去 stuck_window 步的累计位移
+            window_start = t - stuck_window
+            displacement = (p_history[t] - p_history[window_start]).norm(dim=-1)  # [B]
+            # 惩罚位移小于阈值的情况
+            # 使用平滑惩罚：softplus((threshold - displacement) * scale)
+            loss_stuck[t] = F.softplus((displacement_threshold - displacement) * 10.0)
+
+    # 2. 碰撞持续时间惩罚：检测持续接触
+    # 使用滑动窗口累计碰撞事件
+    in_collision = (collision_depth > 0).float()  # [T, B]
+    loss_collision_duration = torch.zeros_like(in_collision)
+
+    # 累计连续碰撞步数
+    collision_streak = torch.zeros((B,), device=device)
+    for t in range(T):
+        collision_streak = collision_streak * in_collision[t] + in_collision[t]
+        # 随着连续碰撞步数增加，惩罚递增
+        loss_collision_duration[t] = collision_streak * in_collision[t]
+
+    # 计算卡住比例（监控用）
+    with torch.no_grad():
+        stuck_mask = loss_stuck > 0.5
+        stuck_ratio = stuck_mask.float().mean()
+
+    return loss_stuck, loss_collision_duration, stuck_ratio
 
 
 def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
@@ -2101,6 +2174,11 @@ B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
 
+# [新增] 梯度爆炸保护状态
+grad_explosion_count = 0
+worker_explosion_consecutive = 0
+lgn_explosion_consecutive = 0
+
 state_normalizer.train()
 
 for i in pbar:
@@ -2165,6 +2243,14 @@ for i in pbar:
         # LGN Forward (输出非负权重，不限于0-1)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
         current_weights = sanitize_tensor(current_weights, nan=1.0, posinf=100.0, neginf=0.0).clamp(0.01, 100.0)
+
+        # [诊断] 在第一个时间步检查 current_weights 的梯度链
+        if t == 0 and i % 100 == 0:
+            _cw_req = current_weights.requires_grad
+            _cw_gfn = type(current_weights.grad_fn).__name__ if current_weights.grad_fn else "None"
+            _lgn_hx_req = lgn_hx.requires_grad if lgn_hx is not None else "N/A"
+            print(f"[DIAG iter={i} t=0] current_weights.requires_grad={_cw_req}, grad_fn={_cw_gfn}, lgn_hx.requires_grad={_lgn_hx_req}")
+
         trajectory_lgn_weights.append(current_weights)
 
         # Worker Forward
@@ -2197,6 +2283,14 @@ for i in pbar:
     a_history = torch.stack(a_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
     weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
+
+    # [诊断] 检查 weights_seq 的梯度属性
+    if i % 100 == 0:
+        _ws_req = weights_seq.requires_grad
+        _ws_gfn = type(weights_seq.grad_fn).__name__ if weights_seq.grad_fn else "None"
+        _ws_leaf = weights_seq.is_leaf
+        print(f"[DIAG iter={i}] weights_seq: requires_grad={_ws_req}, is_leaf={_ws_leaf}, grad_fn={_ws_gfn}")
+
     rpy_history = torch.stack(rpy_history) # [T, B, 3]
     R_history = torch.stack(R_history)     # [T, B, 3, 3]
     real_act_history = torch.stack(real_act_history) # [T, B, 3]
@@ -2240,6 +2334,13 @@ for i in pbar:
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
 
+    # [新增] Stuck Loss: 卡住惩罚
+    loss_stuck_seq, loss_collision_duration_seq, stuck_ratio = compute_stuck_loss(
+        p_history, collision_depth,
+        stuck_window=args.stuck_window,
+        displacement_threshold=args.stuck_displacement_threshold
+    )
+
     actual_T = p_history.shape[0]
 
     # 高度约束损失 (固定权重, 不经LGN控制)
@@ -2260,6 +2361,17 @@ for i in pbar:
     weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
     effective_weights_seq = weights_seq_norm
 
+    # [诊断] 检查loss项和weights_seq_norm的梯度属性
+    if i % 100 == 0:
+        _wsn_req = weights_seq_norm.requires_grad
+        _wsn_gfn = type(weights_seq_norm.grad_fn).__name__ if weights_seq_norm.grad_fn else "None"
+        _ls_req = loss_speed_n.requires_grad
+        _ld_req = loss_dir_n.requires_grad
+        _la_req = loss_avoid_n.requires_grad
+        _le_req = loss_expl_n.requires_grad
+        print(f"[DIAG iter={i}] weights_seq_norm: requires_grad={_wsn_req}, grad_fn={_wsn_gfn}")
+        print(f"[DIAG iter={i}] loss_n requires_grad: speed={_ls_req}, dir={_ld_req}, avoid={_la_req}, expl={_le_req}")
+
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
         effective_weights_seq[:, :, 0] * loss_speed_n +
@@ -2268,8 +2380,29 @@ for i in pbar:
         effective_weights_seq[:, :, 3] * loss_expl_n
     )
 
-    # 3. 最终 Proxy Loss (含固定权重的高度约束)
-    proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
+    # [新增] 固定权重的卡住惩罚 (不经过LGN，保证基本安全性)
+    loss_stuck_total = args.stuck_loss_weight * loss_stuck_seq.mean()
+    loss_collision_duration_total = args.collision_duration_weight * loss_collision_duration_seq.mean()
+
+    # 3. 最终 Proxy Loss (含固定权重的高度约束、卡住惩罚)
+    proxy_loss = (
+        weighted_loss_map.mean() +
+        2.0 * loss_height_seq.mean() +
+        loss_stuck_total +
+        loss_collision_duration_total
+    )
+
+    # [诊断] 检查proxy_loss计算链中的梯度属性
+    if i % 100 == 0:
+        _wlm_req = weighted_loss_map.requires_grad
+        _wlm_gfn = type(weighted_loss_map.grad_fn).__name__ if weighted_loss_map.grad_fn else "None"
+        _ew_req = effective_weights_seq.requires_grad
+        _ew_gfn = type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else "None"
+        _pl_req = proxy_loss.requires_grad
+        _pl_gfn = type(proxy_loss.grad_fn).__name__ if proxy_loss.grad_fn else "None"
+        print(f"[DIAG iter={i}] effective_weights: requires_grad={_ew_req}, grad_fn={_ew_gfn}")
+        print(f"[DIAG iter={i}] weighted_loss_map: requires_grad={_wlm_req}, grad_fn={_wlm_gfn}")
+        print(f"[DIAG iter={i}] proxy_loss: requires_grad={_pl_req}, grad_fn={_pl_gfn}")
 
     # --- Meta Loss Components ---
     loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
@@ -2333,12 +2466,18 @@ for i in pbar:
             'avg_ref_speed': 0.0,
         }
 
-    # 训练目标仅使用位置/碰撞/高度/引导; 控制项仅用于日志监控
+    # 训练目标仅使用位置/碰撞/高度/引导/卡住; 控制项仅用于日志监控
+    # [新增] 在 meta loss 中也加入卡住惩罚
+    loss_meta_stuck = loss_stuck_seq.mean()
+    loss_meta_collision_duration = loss_collision_duration_seq.mean()
+
     meta_loss = (
         loss_meta_pos +
         loss_meta_coll +
         loss_meta_height * 2.0 +
-        args.meta_guidance_weight * loss_meta_guidance
+        args.meta_guidance_weight * loss_meta_guidance +
+        args.stuck_loss_weight * loss_meta_stuck +
+        args.collision_duration_weight * loss_meta_collision_duration
     )
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
@@ -2393,19 +2532,86 @@ for i in pbar:
         get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
 
     if train_lgn_phase:
-        # ===== Unrolled Bilevel: 可微内循环 =====
-        # Step 1: 用 proxy_loss 对 worker 做可微梯度下降
+        # ===== Unrolled Bilevel: 可微内循环 (梯度加权版) =====
+        # 核心改动：不再对 proxy_loss 统一求梯度，
+        # 而是分别对四个 proxy 分项求梯度，再用 LGN 权重直接加权
+
         fast_params = dict(worknet.named_parameters())
 
+        # 获取 LGN 输出的归一化权重（用最后一步的平均，或者用全序列平均）
+        # weights_seq_norm: [T, B, 4]，取平均得到 [4]
+        lgn_weights_for_grad = weights_seq_norm.mean(dim=[0, 1])  # [4]
+
+        # [诊断] 检查 lgn_weights_for_grad 的梯度属性
+        if i % 100 == 0:
+            print(f"[DIAG iter={i}] lgn_weights_for_grad: requires_grad={lgn_weights_for_grad.requires_grad}, "
+                  f"grad_fn={type(lgn_weights_for_grad.grad_fn).__name__ if lgn_weights_for_grad.grad_fn else 'None'}, "
+                  f"values={lgn_weights_for_grad.detach().cpu().tolist()}")
+
+        # 预先计算四个 loss 分项的标量（用于分别求梯度）
+        # loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n: [T, B]
+        loss_speed_scalar = loss_speed_n.mean()
+        loss_dir_scalar = loss_dir_n.mean()
+        loss_avoid_scalar = loss_avoid_n.mean()
+        loss_expl_scalar = loss_expl_n.mean()
+
         for _inner in range(args.inner_steps):
-            inner_grads = torch.autograd.grad(
-                proxy_loss, tuple(fast_params.values()),
-                create_graph=True, allow_unused=True, retain_graph=True,
+            # 分别对四个 loss 分项求梯度
+            g_speed = torch.autograd.grad(
+                loss_speed_scalar, tuple(fast_params.values()),
+                create_graph=True, allow_unused=True, retain_graph=True
             )
+            g_dir = torch.autograd.grad(
+                loss_dir_scalar, tuple(fast_params.values()),
+                create_graph=True, allow_unused=True, retain_graph=True
+            )
+            g_avoid = torch.autograd.grad(
+                loss_avoid_scalar, tuple(fast_params.values()),
+                create_graph=True, allow_unused=True, retain_graph=True
+            )
+            g_expl = torch.autograd.grad(
+                loss_expl_scalar, tuple(fast_params.values()),
+                create_graph=True, allow_unused=True, retain_graph=True
+            )
+
+            # 用 LGN 权重直接加权四组梯度，得到 combined_grads
+            # combined_grad[j] = w0 * g_speed[j] + w1 * g_dir[j] + w2 * g_avoid[j] + w3 * g_expl[j]
+            w0, w1, w2, w3 = lgn_weights_for_grad[0], lgn_weights_for_grad[1], lgn_weights_for_grad[2], lgn_weights_for_grad[3]
+            combined_grads = []
+            for gs, gd, ga, ge in zip(g_speed, g_dir, g_avoid, g_expl):
+                if gs is None and gd is None and ga is None and ge is None:
+                    combined_grads.append(None)
+                else:
+                    cg = (
+                        (w0 * gs if gs is not None else 0.0) +
+                        (w1 * gd if gd is not None else 0.0) +
+                        (w2 * ga if ga is not None else 0.0) +
+                        (w3 * ge if ge is not None else 0.0)
+                    )
+                    combined_grads.append(cg)
+
+            # [诊断] 在第一个 inner step 检查 combined_grads -> lgn
+            if _inner == 0 and i % 100 == 0:
+                _cg0 = next((g for g in combined_grads if g is not None), None)
+                if _cg0 is not None:
+                    try:
+                        _lgn_params = list(lgn.parameters())
+                        _cg_to_lgn = torch.autograd.grad(
+                            _cg0.sum(), _lgn_params,
+                            allow_unused=True, retain_graph=True, create_graph=False
+                        )
+                        _cg_none = sum(x is None for x in _cg_to_lgn)
+                        _cg_nonzero = sum((x is not None and x.abs().sum().item() > 1e-10) for x in _cg_to_lgn)
+                        print(f"[DIAG iter={i}] combined_grads[0] -> lgn: None={_cg_none}/{len(_cg_to_lgn)}, NonZero={_cg_nonzero}/{len(_cg_to_lgn)}")
+                    except Exception as _e:
+                        print(f"[DIAG iter={i}] combined_grads -> lgn check failed: {_e}")
+                else:
+                    print(f"[DIAG iter={i}] combined_grads all None")
+
+            # 用 combined_grads 更新 fast_params（不做 sanitize/clamp，保留高阶梯度链）
             fast_params = {
-                name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
-                       if g is not None else p)
-                for (name, p), g in zip(fast_params.items(), inner_grads)
+                name: (p - args.inner_lr * cg if cg is not None else p)
+                for (name, p), cg in zip(fast_params.items(), combined_grads)
             }
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
@@ -2415,24 +2621,163 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             continue
 
+        # ====== [诊断] 梯度链路检查 (在backward之前) ======
+        if i % 100 == 0:
+            # 检查各节点的 requires_grad
+            _diag_weights_req = weights_seq.requires_grad
+            _diag_proxy_req = proxy_loss.requires_grad
+            _diag_meta_req = meta_loss_unrolled.requires_grad
+
+            # 检查 weights_seq 的 grad_fn（如果有）
+            _diag_weights_grad_fn = type(weights_seq.grad_fn).__name__ if weights_seq.grad_fn else "None"
+            _diag_proxy_grad_fn = type(proxy_loss.grad_fn).__name__ if proxy_loss.grad_fn else "None"
+            _diag_meta_grad_fn = type(meta_loss_unrolled.grad_fn).__name__ if meta_loss_unrolled.grad_fn else "None"
+
+            # 使用 torch.autograd.grad 显式测试梯度是否能流到 lgn.parameters()
+            lgn_param_list = list(lgn.parameters())
+            try:
+                _test_grads = torch.autograd.grad(
+                    meta_loss_unrolled, lgn_param_list,
+                    allow_unused=True, retain_graph=True, create_graph=False
+                )
+                _grad_none_count = sum(1 for g in _test_grads if g is None)
+                _grad_nonzero_count = sum(1 for g in _test_grads if g is not None and g.abs().sum() > 1e-10)
+                _grad_total = len(_test_grads)
+            except Exception as _e:
+                _grad_none_count = -1
+                _grad_nonzero_count = -1
+                _grad_total = len(lgn_param_list)
+                print(f"[DIAG] autograd.grad failed: {_e}")
+
+            # 检查 proxy_loss -> lgn 的梯度
+            try:
+                _proxy_grads = torch.autograd.grad(
+                    proxy_loss, lgn_param_list,
+                    allow_unused=True, retain_graph=True, create_graph=False
+                )
+                _proxy_grad_none = sum(1 for g in _proxy_grads if g is None)
+                _proxy_grad_nonzero = sum(1 for g in _proxy_grads if g is not None and g.abs().sum() > 1e-10)
+            except Exception as _e:
+                _proxy_grad_none = -1
+                _proxy_grad_nonzero = -1
+                print(f"[DIAG] proxy->lgn grad failed: {_e}")
+
+            print(f"[DIAG iter={i}] weights_seq.requires_grad={_diag_weights_req}, grad_fn={_diag_weights_grad_fn}")
+            print(f"[DIAG iter={i}] proxy_loss.requires_grad={_diag_proxy_req}, grad_fn={_diag_proxy_grad_fn}")
+            print(f"[DIAG iter={i}] meta_loss_unrolled.requires_grad={_diag_meta_req}, grad_fn={_diag_meta_grad_fn}")
+            print(f"[DIAG iter={i}] meta_loss -> lgn: None={_grad_none_count}/{_grad_total}, NonZero={_grad_nonzero_count}/{_grad_total}")
+            print(f"[DIAG iter={i}] proxy_loss -> lgn: None={_proxy_grad_none}/{_grad_total}, NonZero={_proxy_grad_nonzero}/{_grad_total}")
+
+            # [关键检查] meta_loss_unrolled -> fast_params
+            # 如果这里也是全 None，说明问题在 unrolled_meta_rollout / env.run
+            # 如果这里不是 None，说明 meta -> fast_params 通了，但 fast_params -> lgn 的高阶链断了
+            try:
+                _fast_param_list = [p for _, p in fast_params.items()]
+                _meta_to_fast = torch.autograd.grad(
+                    meta_loss_unrolled, _fast_param_list,
+                    allow_unused=True, retain_graph=True, create_graph=False
+                )
+                _fast_none_cnt = sum(g is None for g in _meta_to_fast)
+                _fast_nonzero_cnt = sum((g is not None and g.abs().sum().item() > 1e-10) for g in _meta_to_fast)
+                _fast_total = len(_meta_to_fast)
+            except Exception as _e:
+                _fast_none_cnt = -1
+                _fast_nonzero_cnt = -1
+                _fast_total = len(fast_params)
+                print(f"[DIAG] meta->fast_params grad failed: {_e}")
+            print(f"[DIAG iter={i}] meta_loss -> fast_params: None={_fast_none_cnt}/{_fast_total}, NonZero={_fast_nonzero_cnt}/{_fast_total}")
+
+            # [最终定位] fast_params -> lgn 直接检查
+            # 如果这里全 None，说明 fast_params 根本不依赖 LGN（inner update 高阶链断了）
+            # 如果这里有 NonZero，说明依赖存在但被其他地方切断
+            try:
+                _fast_param_list = [p for _, p in fast_params.items()]
+                # 用所有 fast_params 的和作为中间输出
+                _fast_sum = sum([fp.sum() for fp in _fast_param_list])
+                _fast_to_lgn = torch.autograd.grad(
+                    _fast_sum, lgn_param_list,
+                    allow_unused=True, retain_graph=True, create_graph=False
+                )
+                _fast_lgn_none = sum(g is None for g in _fast_to_lgn)
+                _fast_lgn_nonzero = sum((g is not None and g.abs().sum().item() > 1e-10) for g in _fast_to_lgn)
+            except Exception as _e:
+                _fast_lgn_none = -1
+                _fast_lgn_nonzero = -1
+                print(f"[DIAG] fast_params->lgn grad failed: {_e}")
+            print(f"[DIAG iter={i}] fast_params -> lgn: None={_fast_lgn_none}/{_grad_total}, NonZero={_fast_lgn_nonzero}/{_grad_total}")
+
+            # 检查 trajectory_lgn_weights 的第一个元素
+            if len(trajectory_lgn_weights) > 0:
+                _first_w = trajectory_lgn_weights[0]
+                print(f"[DIAG iter={i}] first_lgn_weight.requires_grad={_first_w.requires_grad}, grad_fn={type(_first_w.grad_fn).__name__ if _first_w.grad_fn else 'None'}")
+
         # Step 3: 反向传播贯穿整条链路
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
         # 纯学习模式: LGN 仅由 unrolled meta loss 驱动
         lgn_total = meta_loss_unrolled
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
-        lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
-        optim_lgn.step()
-        sanitize_module_(lgn, clamp_value=5.0)
+
+        # [新增] LGN 梯度爆炸保护
+        lgn_grad_is_bad = (
+            not math.isfinite(lgn_grad_norm) or
+            lgn_grad_norm > args.grad_explosion_threshold or
+            lgn_grad_nonfinite > 0
+        )
+
+        if args.enable_grad_protection and lgn_grad_is_bad:
+            lgn_explosion_consecutive += 1
+            grad_explosion_count += 1
+            pbar.set_description(f"[{phase_str}] LGN grad explosion #{lgn_explosion_consecutive} skipped (norm={lgn_grad_norm:.2e})")
+
+            # 连续爆炸过多，重置优化器状态
+            if lgn_explosion_consecutive >= args.grad_explosion_skip_window:
+                optim_lgn.state.clear()
+                lgn_explosion_consecutive = 0
+                print(f"[WARN] LGN optimizer state reset at iter {i}")
+        else:
+            lgn_explosion_consecutive = 0
+            lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
+            optim_lgn.step()
+            sanitize_module_(lgn, clamp_value=5.0)
 
         lgn_update_loss = meta_loss_unrolled.detach()
+
+        # [新增] 诊断 LGN 梯度链路
+        with torch.no_grad():
+            lgn_params_with_grad = sum(1 for p in lgn.parameters() if p.grad is not None and p.grad.abs().sum() > 1e-10)
+            lgn_total_params = sum(1 for _ in lgn.parameters())
     else:
         proxy_loss.backward()
         worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
-        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
-        optim_worker.step()
-        sanitize_module_(worknet, clamp_value=10.0)
-        sched.step()
+
+        # [新增] Worker 梯度爆炸保护
+        worker_grad_is_bad = (
+            not math.isfinite(worker_grad_norm) or
+            worker_grad_norm > args.grad_explosion_threshold or
+            worker_grad_nonfinite > 0
+        )
+
+        if args.enable_grad_protection and worker_grad_is_bad:
+            worker_explosion_consecutive += 1
+            grad_explosion_count += 1
+            pbar.set_description(f"[{phase_str}] Worker grad explosion #{worker_explosion_consecutive} skipped (norm={worker_grad_norm:.2e})")
+
+            # 连续爆炸过多，重置优化器状态
+            if worker_explosion_consecutive >= args.grad_explosion_skip_window:
+                optim_worker.state.clear()
+                worker_explosion_consecutive = 0
+                print(f"[WARN] Worker optimizer state reset at iter {i}")
+        else:
+            worker_explosion_consecutive = 0
+            worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
+            optim_worker.step()
+            sanitize_module_(worknet, clamp_value=10.0)
+            sched.step()
+
+        # LGN 诊断变量初始化（仅在 worker phase）
+        lgn_params_with_grad = 0
+        lgn_total_params = sum(1 for _ in lgn.parameters())
 
     ###### D. Logging & Saving (Enhanced) ######
     if train_lgn_phase:
@@ -2455,118 +2800,325 @@ for i in pbar:
         act_cmd_norm_mean = real_act_history.norm(dim=-1).mean()
         
         log_data = {
-            # === 主要Loss ===
+            # ============================== 主要Loss ==============================
+            # Worker策略网络的总代理损失。当收敛时应逐渐下降。
+            # 现象：初期波动较大，训练中期应该趋势向下，如果持续增加则需要调整学习率或参数
             'Loss/1_Proxy_Total': proxy_loss,
+            # LGN元学习器在反向unroll中的总优化目标。应该能够自动学习合适的权重
+            # 现象：通常小于proxy_loss，训练中期应该相对稳定，大的波动表示元学习不稳定
             'Loss/2_Meta_Total': meta_loss,
 
-            # === [增强] 4个权重均值 (归一化后) ===
+            # ============================== 权重监控（LGN输出） ==============================
+            # [权重/0_速度] LGN学到的速度目标权重(经过softmax+温度变换后的归一化权重)
+            # 现象：应在0-1之间摇摆。快速任务中应该>0，追求高速通过
+            # [权重/0_速度] LGN学到的速度目标权重(经过softmax+温度变换后的归一化权重)
+            # 现象：应在0-1之间摇摆。快速任务中应该>0，追求高速通过
             'Weights/0_Speed': avg_weights[0],
+            # [权重/1_方向] LGN学到的方向一致性权重(经过softmax+温度变换后的归一化权重)
+            # 现象：应在0-1之间。狭窄环境中应该较大，求助路径一致性
             'Weights/1_Direction': avg_weights[1],
+            # [权重/2_避障] LGN学到的碰撞避免权重(经过softmax+温度变换后的归一化权重)
+            # 现象：应在0-1之间。复杂障碍环境中应该较大，保证安全
             'Weights/2_Avoidance': avg_weights[2],
+            # [权重/3_探索] LGN学到的鼓励探索权重(经过softmax+温度变换后的归一化权重)
+            # 现象：应在0-1之间。初期可能较小，训练后期若陷入局部最优会增大
             'Weights/3_Exploration': avg_weights[3],
-            # === 原始非归一化权重 ===
+
+            # ====== 原始非归一化权重（Softmax前的logits，用于诊断） ======
+            # 四个未经过softmax的原始logits值。用于判断权重生成的饱和度
+            # 现象：logits的max-min差距大表示分布尖锐，接近0表示权重分布平均
             'Weights_Raw/0_Speed': avg_weights_raw[0],
             'Weights_Raw/1_Direction': avg_weights_raw[1],
             'Weights_Raw/2_Avoidance': avg_weights_raw[2],
             'Weights_Raw/3_Exploration': avg_weights_raw[3],
+
+            # ====== 有效权重（应用了下限保护后） ======
+            # 应用了lgn_weight_floor下限保护后的权重。用于监控下限保护是否生效
+            # 现象：应该 >= lgn_weight_floor(通常0.01)。若等于下限值过多说明需要调整温度
             'Weights_Effective/0_Speed': avg_effective_weights[0],
             'Weights_Effective/1_Direction': avg_effective_weights[1],
             'Weights_Effective/2_Avoidance': avg_effective_weights[2],
             'Weights_Effective/3_Exploration': avg_effective_weights[3],
 
-            # === [新增] 权重分布监控 ===
+            # ============================== 权重分布统计 ==============================
+            # 整个Episode中的权重序列的最小值。用于检测权重下界
+            # 现象：应该 >= lgn_weight_floor，否则说明下限保护未正确应用
             'Weight_Stats/Raw_Min': weights_seq.min(),
+            # 整个Episode中的权重序列的最大值。用于检测权重上界
+            # 现象：应该接近1.0，如果远小于1.0说明权重分布过于分散
             'Weight_Stats/Raw_Max': weights_seq.max(),
+            # 整个Episode中的权重序列的平均值。用于监控总体权重水平
+            # 现象：应该在0.2-0.8之间，过小表示权重设置不当，过大表示某权重独占
             'Weight_Stats/Raw_Mean': weights_seq.mean(),
+            # 权重分布的熵值(Shannon entropy)。衡量权重分布的多样性
+            # 现象：高熵(>0.8)表示权重分布均匀，低熵(<0.5)表示某权重主要影响。好的学习应该熵值适中
             'Weight_Stats/Entropy': weight_entropy,
 
-            # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
+            # ============================== Proxy Loss 分项 ==============================
+            # [代理损失/0_速度] 鼓励无人机达到自适应速度目标的损失
+            # 现象：初期可能较大，应逐渐减小。持续增加表示无人机无法跟上速度目标
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
+            # [代理损失/1_方向] 鼓励无人机方向与参考路径对齐的损失
+            # 现象：应该相对较小(通常<0.5)。太大表示规划引导效果差或参考路径偏离实际
             'Proxy_Comp/1_Direction': loss_direction_seq.mean(),
+            # [代理损失/2_避障] 碰撞惩罚项(安全余度内的软惩罚)
+            # 现象：应该较小且趋势向下。如果>1.0说明无人机频繁接近障碍物
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
-            'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
+            # [代理损失/2_1_穿墙深度] 实际穿入障碍的深度(米)。诊断用，衡量碰撞严重程度
+            # 现象：应该接近0。若>0.1米说明有明显穿墙现象，需要提升避障能力
+            'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),
+            # [代理损失/3_探索] 鼓励多样化轨迹的散度惩罚(R^3中的轨迹方差)
+            # 现象：通常较小。初期可能较大，训练后减小，说明策略收敛
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
+            # [代理损失/4_高度] 惩罚与参考路径的高度偏差
+            # 现象：应该较小。如果>0.5说明无人机高度控制不当
             'Proxy_Comp/4_Height': loss_height_seq.mean(),
+
+            # ============================== 卡住(Stuck)损失 ==============================
+            # [卡住损失/5] 检测局部移动过慢的惩罚(看不到约15步的最小位移)
+            # 现象：应该接近0。如果>0.1说明无人机经常陷入局部卡住状态
+            'Proxy_Comp/5_Stuck': loss_stuck_seq.mean(),
+            # [碰撞时间损失/6] 连续碰撞时长的惩罚(与碰撞持续帧数成正比)
+            # 现象：应该接近0。若>0.2说明无人机碰撞后难以恢复
+            'Proxy_Comp/6_Collision_Duration': loss_collision_duration_seq.mean(),
+            # [卡住总损失/10] 整个Episode的卡住位移惩罚总和
+            # 现象：应该较小。若持续>1.0说明需要调整stuck_displacement_threshold或提升导航能力
+            'Proxy_Comp/10_Stuck_Total': loss_stuck_total,
+            # [碰撞时间总损失/11] 整个Episode的碰撞时长惩罚总和
+            # 现象：应该较小。若持续>1.0说明避障算法需要改进
+            'Proxy_Comp/11_Collision_Duration_Total': loss_collision_duration_total,
+
+            # ============================== 卡住状态诊断 ==============================
+            # [卡住比例] Episode中陷入卡住状态的步数占比 (0-1)
+            # 现象：应该 < 0.1。若 > 0.3 说明导航效率很低，无人机经常卡住
+            'Stuck/Ratio': stuck_ratio,
+            # [碰撞连续时长_平均] 单次碰撞持续的平均步数
+            # 现象：应该 < 5步。若 > 10步说明碰撞后无法及时脱离
+            'Stuck/Collision_Streak_Mean': loss_collision_duration_seq.mean(),
+            # [碰撞连续时长_最大] 单次碰撞持续的最长步数
+            # 现象：应该 < 30步。若 > 100步说明有严重的碰撞困境
+            'Stuck/Collision_Streak_Max': loss_collision_duration_seq.max(),
 
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
             'Meta_Comp/2_Collision': loss_meta_coll,
             'Meta_Comp/2_1_Collision_Soft': loss_meta_coll_soft,#软碰撞项（靠墙即升高，连续梯度）
-            'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对“已经进墙”的样本施加强惩罚，且穿得越深罚越重
+            'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对”已经进墙”的样本施加强惩罚，且穿得越深罚越重
             'Meta_Comp/2_3_Collision_Event': loss_meta_coll_event,# 可微事件惩罚（用于训练）
             'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
+            # === [新增] Meta Loss 中的卡住损失 ===
+            'Meta_Comp/6_Stuck': loss_meta_stuck,
+            'Meta_Comp/7_Collision_Duration': loss_meta_collision_duration,
 
-            # === 全局规划引导损失分项 ===
+            # ============================== 全局规划引导损失 ==============================
+            # [元损失/5_引导] 整个全局规划引导的加权总损失
+            # 现象：应该相对较小但稳定。若剧烈波动说明A*规划质量不稳定
             'Meta_Comp/5_Guidance': loss_meta_guidance,
+
+            # ====== 引导损失详细分项 ======
+            # 轨迹方向与参考路径的对齐误差。衡量是否沿着规划的路径行进
+            # 现象：应该 < 0.5。若 > 1.0说明无人机的方向与规划路径偏离太大
             'Guidance/Dir_Align': guidance_components['dir_align'],
+            # 超速惩罚。无人机速度超过规划给定的参考速度的惩罚
+            # 现象：应该较小。若较大说明无人机尝试以高于规划建议的速度行进
             'Guidance/Overspeed': guidance_components['overspeed'],
+            # 欠速惩罚。无人机速度远低于规划给定的参考速度的惩罚
+            # 现象：通常较小。若和超速都很大说明速度控制不稳定
             'Guidance/Underspeed': guidance_components.get('underspeed', 0.0),
+            # 速度差异总体惩罚(超速+欠速)
+            # 现象：应该 < 0.5。表示无人机能够相对准确地跟踪参考速度
             'Guidance/Speed_Diff': guidance_components.get('speed_diff', 0.0),
+            # 横向偏差。轨迹到参考路径的几何距离(m)
+            # 现象：应该 < 1.0m。若>2.0m说明路径跟踪精度差，可能需要调整LGN权重
             'Guidance/Lateral_Error': guidance_components['lateral_error'],
+            # 加速度不匹配。实际加速度与规划建议的加速度差异
+            # 现象：应该较小。若较大说明无人机加速度控制与规划预期不符
             'Guidance/Accel_Mismatch': guidance_components.get('accel_mismatch', 0.0),
+            # 逃脱惩罚。已碰撞位置重新脱离的难度
+            # 现象：应该较小。若>0.5说明无人机碰撞后难以逃脱(需要提升碰撞反应)
             'Guidance/Escape': guidance_components['escape'],
+            # 深度项。与规划路径的三维距离(或高度相关)
+            # 现象：应该较小。表示三维轨迹与规划路径吻合度好
             'Guidance/Depth': guidance_components['depth'],
+            # 恢复速度惩罚。在规划失效或阻挡区域恢复导航时的速度抑制
+            # 现象：通常很小。若>0.1说明经常遇到规划失效的情况
             'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
+            # 有效规划点比例 (A*规划成功的点数占比)
+            # 现象：应该接近1.0。若 < 0.9说明环境过于复杂或A*参数不当
             'Guidance/Valid_Ratio': guidance_components['valid_ratio'],
+            # 无效规划点比例 (A*规划失败/blocked的点数占比)
+            # 现象：应该接近0。若 > 0.1说明存在无法规划通过的点，需要检查参数
             'Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
+            # 采样点中碰撞的比例 (用于A*路径的碰撞检测)
+            # 现象：应该接近0。若 > 0.1说明参考路径本身与障碍物碰撞，需要检查障碍物膨胀边距
             'Guidance/Collision_Ratio': guidance_components['collision_ratio'],
+            # 本Episode中从轨迹采样的关键引导点总数
+            # 现象：应该等于guide_sample_count参数。表示正常的采样策略工作
             'Guidance/Sample_Count': guidance_components['sample_count'],
+            # 规划路径的曲率平均值(弯度)。用于判断任务难度
+            # 现象：直线任务<0.5，弯曲任务>1.0。表示任务复杂性
             'Guidance/Avg_Curvature': guidance_components.get('avg_curvature', 0.0),
+            # 规划路径的平均进展比例(已覆盖距离/总距离)
+            # 现象：应该逐步增加到1.0。表示无人机沿着规划路径前进
             'Guidance/Avg_Path_Progress': guidance_components.get('avg_path_progress', 0.0),
+            # 规划路径上的平均参考速度
+            # 现象：3-8 m/s之间合理。表示A*规划计算的梯形速度剖面
             'Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
+            # 横向偏差的平均值
+            # 现象：应该 < 'Guidance/Lateral_Error'的一半。表示偏差分布相对均匀
             'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
+            # 横向偏差的最大值(最坏情况)
+            # 现象：应该接近'Guidance/Lateral_Error'。若远小于说明偏差集中在某些点
             'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
+            # A*规划成功率(从起点到终点规划成功的比例)
+            # 现象：应该 > 0.95。若 < 0.8说明规划器参数需要调整
             'Guidance/Planner_Success_Ratio': guidance_components.get('planner_success_ratio', 0.0),
 
-            # === 性能指标 ===
+            # ============================== 性能指标 ==============================
+            # 到达目标的成功率(batch维度平均)
+            # 现象：初期接近0，随训练应逐渐增加到 > 0.8。好的模型应 > 0.95
             'Metrics/Success_Rate': success.float().mean(),
+            # Episode中整体平均速度
+            # 现象：应该 3-8 m/s。初期可能较低(0.5-2.0)，训练后应加快
             'Metrics/Avg_Speed': avg_speed,
+            # 是否平均速度低于最小值阈值的标记(0或1)
+            # 现象：应该 < 0.2。若持续 > 0.5说明无人机移动过慢，需要提升速度目标权重
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
+            # Episode中的最小瞬间速度
+            # 现象：应该 > 0.1 m/s。若接近0说明无人机在卡住或悬停
             'Metrics/Min_Speed': v_norm.min(),
+            # Episode中的最大瞬间速度
+            # 现象：应该 < 15 m/s。若 > 20 m/s说明速度限制失效或参数设置过大
             'Metrics/Max_Speed': v_norm.max(),
+            # Episode持续的实际步数(在goal_radius内提前结束前)
+            # 现象：应该 < timesteps参数。通常 100-280步。远小于说明到达快(效率高)
             'Metrics/Episode_Length': actual_T,
+            # 自适应速度目标值(综合考虑障碍物距离和目标距离)
+            # 现象：应该 3-12 m/s。表示动态调整的速度参考
             'Metrics/Adaptive_Speed_Target': v_target_adaptive.mean(),
+
+            # ============================== 控制信号监控 ==============================
+            # 加速度命令的平均模长 (与速度类似，单位m/s^2)
+            # 现象：应该 1-5 m/s^2。表示平均控制强度
             'Control/Accel_Cmd_Norm_Mean': act_cmd_norm_mean,
+            # X轴加速度命令的平均值(可正可负，表示前后方向)
+            # 现象：应该接近0。若持续 > 1.0或 < -1.0说明前后控制不平衡
             'Control/Accel_Cmd_X_Mean': act_cmd_mean[0],
+            # Y轴加速度命令的平均值(可正可负，表示左右方向)
+            # 现象：应该接近0。表示左右平衡
             'Control/Accel_Cmd_Y_Mean': act_cmd_mean[1],
+            # Z轴加速度命令的平均值(可正可负，表示上下方向)
+            # 现象：应该接近0。若持续 > 0.5说明无人机倾向向上移动
             'Control/Accel_Cmd_Z_Mean': act_cmd_mean[2],
+            # X轴加速度命令的绝对值平均(表示强度，不考虑方向)
+            # 现象：应该 < 5 m/s^2。表示前后方向的平均控制强度
             'Control/Accel_Cmd_X_AbsMean': act_cmd_abs_mean[0],
+            # Y轴加速度命令的绝对值平均
+            # 现象：应该 < 5 m/s^2
             'Control/Accel_Cmd_Y_AbsMean': act_cmd_abs_mean[1],
+            # Z轴加速度命令的绝对值平均
+            # 现象：应该 < 3 m/s^2。Z方向控制通常小于水平方向
             'Control/Accel_Cmd_Z_AbsMean': act_cmd_abs_mean[2],
 
-            # === [对齐] 归一化统计命名（与第二脚本风格一致） ===
+            # ============================== 状态归一化统计 ==============================
+            # 运行平均的状态向量平均值。实时更新的归一化器均值
+            # 现象：应该接近0(全局平均的偏差应为0)。非0表示状态分布偏移
             'Norm/State_Mean': state_normalizer.mean[0],
+            # 运行平均的状态向量方差。实时更新的归一化器方差
+            # 现象：应该接近1.0。远离1.0表示状态分布方差不均
             'Norm/State_Var': state_normalizer.var[0],
+            # 运行平均的更新次数计数器
+            # 现象：应该与迭代数相关。可用来检查归一化器是否在更新
             'Norm/Update_Count': state_normalizer.count,
 
-            # === [兼容] 保留旧命名 ===
+            # [备用] 与上述重复，保留以兼容旧版脚本
             'Stats/Norm_Mean': state_normalizer.mean[0],
             'Stats/Norm_Var': state_normalizer.var[0],
             'Stats/Norm_Count': state_normalizer.count,
 
-            # === 梯度监控（用于判断梯度爆炸） ===
+            # ============================== 梯度监控(梯度爆炸诊断) ==============================
+            # Worker网络的全局梯度范数(所有参数的梯度的L2范数)
+            # 现象：应该 < 100。若 > 1000表示梯度爆炸。通常 1-50是正常范围
             'Grad/Worker_Global_Norm': worker_grad_norm,
+            # Worker网络中单个梯度元素的最大绝对值
+            # 现象：应该 < 10。若 > 100表示存在爆炸的梯度
             'Grad/Worker_Max_Abs': worker_grad_max,
+            # Worker网络中非有限梯度(NaN/Inf)的参数数量
+            # 现象：应该 = 0。若 > 0表示梯度爆炸或数值不稳定
             'Grad/Worker_NonFinite_Count': worker_grad_nonfinite,
+            # Worker网络的总梯度元素数量
+            # 现象：应该固定(取决于模型大小)。可用来归一化梯度统计
             'Grad/Worker_GradElem_Count': worker_grad_elems,
+            # Worker梯度裁剪前的范数(如果启用了梯度裁剪)
+            # 现象：应该 >= Worker_Global_Norm。差异大表示梯度裁剪反复触发
             'Grad/Worker_Clip_PreNorm': worker_clip_pre,
+
+            # LGN网络的全局梯度范数(二阶可微unroll中的梯度)
+            # 现象：应该 < 100。LGN梯度通常大于Worker(因为是Hessian-vec计算)
             'Grad/LGN_Global_Norm': lgn_grad_norm,
+            # LGN网络中单个梯度元素的最大绝对值
+            # 现象：应该 < 10。通常大于Worker的对应值
             'Grad/LGN_Max_Abs': lgn_grad_max,
+            # LGN网络中非有限梯度的参数数量
+            # 现象：应该 = 0。若 > 0表示二阶梯度数值不稳定，需要减小inner_steps或inner_lr
             'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
+            # LGN网络的总梯度元素数量
+            # 现象：应该固定，通常小于Worker(因为LGN设计更小)
             'Grad/LGN_GradElem_Count': lgn_grad_elems,
+            # LGN梯度裁剪前的范数
+            # 现象：应该 >= LGN_Global_Norm
             'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
 
-            # === [新增] 四个代理损失对 Worker 梯度的 norm ===
+            # ============================== 梯度爆炸保护监控 ==============================
+            # 自训练开始以来检测到梯度爆炸的总次数
+            # 现象：应该接近0或增速很慢。若快速增加说明梯度不稳定
+            'Grad_Protection/Explosion_Count_Total': grad_explosion_count,
+            # Worker网络连续爆炸的次数(重置前)
+            # 现象：应该 < skip_window。若等于skip_window说明刚重置了优化器状态
+            'Grad_Protection/Worker_Consecutive_Explosions': worker_explosion_consecutive,
+            # LGN网络连续爆炸的次数(重置前)
+            # 现象：应该 < skip_window
+            'Grad_Protection/LGN_Consecutive_Explosions': lgn_explosion_consecutive,
+
+            # ============================== LGN梯度链路诊断 ==============================
+            # LGN参数中有梯度流动的参数数量
+            # 现象：应该等于或接近Total_Params。若远小于说明存在断梯问题
+            'LGN_Diag/Params_With_Grad': lgn_params_with_grad,
+            # LGN的总参数数量
+            # 现象：固定值(取决于LGN架构)。通常 数千到 数十万
+            'LGN_Diag/Total_Params': lgn_total_params,
+            # 有梯度的参数比例 (0-1)
+            # 现象：应该接近1.0。若 < 0.95说明部分参数未参与梯度更新(可能被冻结或有bug)
+            'LGN_Diag/Grad_Coverage_Ratio': lgn_params_with_grad / max(lgn_total_params, 1),
+            # 权重序列(weights_seq)是否requires_grad的标记(Unroll中是否启用)
+            # 现象：LGN phase期间应该=1.0。Worker phase应该=0.0。不符合表示Unroll配置有问题
+            'LGN_Diag/Weights_Seq_Requires_Grad': float(weights_seq.requires_grad),
+
+            # ============================== 四个权重对Worker梯度的单独贡献 ==============================
+            # 速度损失对Worker梯度的贡献范数
+            # 现象：应该 > 0。表示速度目标正常诱导梯度
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
+            # 方向损失对Worker梯度的贡献范数
+            # 现象：应该 > 0。表示方向约束正常诱导梯度
             'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
+            # 避障损失对Worker梯度的贡献范数
+            # 现象：应该 > 0。通常这项很大(避障很重要)
             'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
+            # 探索损失对Worker梯度的贡献范数
+            # 现象：通常较小。在某些训练阶段可能增大以鼓励多样性
             'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
+
+            # 每项损失对应梯度中的非有限元素数(NaN/Inf)
+            # 现象：应该 = 0
             'Grad_ProxyWorker/0_Speed_NonFinite': proxy_grad_speed_nonfinite,
             'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
             'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
             'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
+
+            # 每项损失对应梯度的元素数量(用于归一化比较)
+            # 现象：应该相同(因为Worker输出相同)
             'Grad_ProxyWorker/0_Speed_GradElem': proxy_grad_speed_elems,
             'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
             'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
@@ -2581,11 +3133,17 @@ for i in pbar:
 
         smooth_dict(log_data)
 
+        # ============================== 每25次迭代记录一次 ==============================
         if (i + 1) % 25 == 0:
+            # 将收集的所有标量的平均值写入tensorboard
             for k, v in scaler_q.items():
                 writer.add_scalar(k, sum(v) / len(v), i + 1)
             scaler_q.clear()
+            # [训练模式] 1.0=LGN阶段(元学习), 0.0=Worker阶段(策略学习)
+            # 用于在tensorboard中直观看训练的两个阶段交替
             writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
+            # [迷宫年龄] 当前迷宫的年龄(从0开始，每maze_update_interval次更新后重置)
+            # 值范围[0, maze_update_interval-1]，用来监控环境是否在定期更新
             writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
 
         if is_save_iter(i):
@@ -2596,7 +3154,9 @@ for i in pbar:
         if is_save_trajectory_iter(i):
             idx = 0
             
-            # 1. 轨迹时序图 (X,Y,Z vs T)
+            # ============================== 1. 位置时序图 (X,Y,Z vs T) ==============================
+            # 显示无人机在episode中的三维位置随时间的变化
+            # 用于观察：轨迹是否平滑，是否快速到达目标，是否存在振荡
             fig_p, ax = plt.subplots()
             p_cpu = p_history[:, idx].cpu()
             ax.plot(p_cpu[:, 0], label='x'); ax.plot(p_cpu[:, 1], label='y'); ax.plot(p_cpu[:, 2], label='z')
@@ -2604,7 +3164,9 @@ for i in pbar:
             writer.add_figure('Trajectory/Position_Series', fig_p, i + 1)
             plt.close(fig_p)
 
-            # 2. [改造] 三维轨迹 + 障碍物显示（非俯视图）
+            # ============================== 2. 三维轨迹 + 障碍物可视化 ==============================
+            # 立体显示无人机轨迹(按速度着色)、所有障碍物(不同类型不同颜色)、起点(绿)、终点(黑)、目标(红)
+            # 用于观察：是否成功避障，轨迹与障碍物的距离，是否有不必要的绕路
             fig_map = plt.figure(figsize=(8, 6))
             ax = fig_map.add_subplot(111, projection='3d')
 
@@ -2701,10 +3263,45 @@ for i in pbar:
 
             interactive_html = os.path.join(video_dir, f'trajectory3d_iter_{i+1:06d}.html')
             R_cpu = R_history[:, idx].cpu()  # [T, 3, 3] 姿态矩阵
-            if save_interactive_3d_html(interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx):
+
+            # 计算A*规划路径用于可视化
+            astar_path_viz = None
+            astar_paths_sampled = []
+            try:
+                # 使用轨迹起点和目标点进行A*规划
+                goal_pos = env.p_target[idx].detach().cpu().numpy()
+
+                # 构建占用栅格
+                global_planner.build_occupancy_grid(env, batch_idx=idx)
+
+                # 起点到终点的路径
+                start_pos = p_history[0, idx].detach().cpu().numpy()
+                astar_path_raw = global_planner.plan_astar(start_pos, goal_pos)
+                if astar_path_raw is not None:
+                    astar_path_viz = global_planner.smooth_path(astar_path_raw, window_size=5)
+
+                # 采样所有轨迹点的A*路径 (每隔一定步数采样)
+                T_total = p_history.shape[0]
+                sample_interval = max(1, T_total // 20)  # 最多约20条采样路径
+                for t in range(0, T_total, sample_interval):
+                    sample_pos = p_history[t, idx].detach().cpu().numpy()
+                    path_raw = global_planner.plan_astar(sample_pos, goal_pos)
+                    if path_raw is not None:
+                        path_smooth = global_planner.smooth_path(path_raw, window_size=5)
+                        astar_paths_sampled.append((t, path_smooth))
+
+            except Exception as e:
+                print(f"[Warning] A* path visualization failed: {e}")
+                astar_path_viz = None
+                astar_paths_sampled = []
+
+            if save_interactive_3d_html(interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx,
+                                        astar_path=astar_path_viz, astar_paths_sampled=astar_paths_sampled):
                 writer.add_text('Trajectory/Interactive3D_HTML', interactive_html, i + 1)
             
-            # 3. [新增] 速度时序图 (Vx,Vy,Vz,Speed)
+            # ============================== 3. 速度时序图 (Vx,Vy,Vz,Speed) ==============================
+            # 显示无人机三个轴方向的速度分量以及合成速度随时间的变化
+            # 用于观察：速度是否平稳，是否达到目标速度，是否存在制动现象(接近目标时减速)
             fig_v, ax = plt.subplots()
             v_cpu = v_history[:, idx].cpu()
             ax.plot(v_cpu[:, 0], label='vx'); ax.plot(v_cpu[:, 1], label='vy'); ax.plot(v_cpu[:, 2], label='vz')
@@ -2713,7 +3310,9 @@ for i in pbar:
             writer.add_figure('Trajectory/Velocity_Series', fig_v, i + 1)
             plt.close(fig_v)
 
-            # 3.1 [新增] 姿态时序图 (Roll/Pitch/Yaw, deg)
+            # ============================== 3.1 姿态时序图 (Roll/Pitch/Yaw, 度) ==============================
+            # 显示无人机姿态角(欧拉角)随时间的变化
+            # 用于观察：无人机倾斜程度，是否有过度倾斜，转向动作是否平稳
             fig_rpy, ax = plt.subplots()
             rpy_cpu = rpy_history[:, idx].cpu()
             ax.plot(rpy_cpu[:, 0], label='roll(deg)')
@@ -2723,7 +3322,9 @@ for i in pbar:
             writer.add_figure('Trajectory/Attitude_RPY_Series', fig_rpy, i + 1)
             plt.close(fig_rpy)
 
-            # 3.2 [新增] WorkNet映射到真实环境的控制量 (加速度) 时序图
+            # ============================== 3.2 控制加速度时序图 (ax,ay,az) ==============================
+            # 显示WorkNet网络输出的加速度命令随时间的变化(已映射到真实物理量)
+            # 用于观察：控制输入是否饱和，是否平滑，是否存在过大的突跳或振荡
             fig_act, ax = plt.subplots()
             act_cpu = real_act_history[:, idx].cpu()
             ax.plot(act_cpu[:, 0], label='ax_cmd')
@@ -2744,18 +3345,22 @@ for i in pbar:
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 
-            # 4.1 [新增] 权重精确值记录（与轨迹同步，用于分析权重动态变化）
+            # ============================== 4.1 权重精确值记录 ==============================
+            # 与轨迹同步记录的权重快照，用于分析权重的动态变化规律
+            # 与每25次迭代记录一次的Weights/*不同，这里是在每300步(保存轨迹时)记录一次，便于与轨迹直接对应
             writer.add_scalar('Weights_Snapshot/0_Speed', avg_weights[0], i + 1)
             writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
             writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
             writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)
             writer.add_scalar('Weights_Snapshot/Entropy', weight_entropy, i + 1)
-            # 权重统计
+            # 权重分布统计(与轨迹同步)。用于精确对应时刻的权重分布
             writer.add_scalar('Weights_Snapshot/Raw_Min', weights_seq.min(), i + 1)
             writer.add_scalar('Weights_Snapshot/Raw_Max', weights_seq.max(), i + 1)
             writer.add_scalar('Weights_Snapshot/Raw_Mean', weights_seq.mean(), i + 1)
 
-            # 5. [新增] 深度图视频（保存到本地）
+            # ============================== 5. 深度图视频序列 ==============================
+            # 深度相机的原始输入序列转换为彩色视频，便于可视化学习过程中的感知能力
+            # 用于观察：深度估计是否准确，是否能正确检测障碍物距离
             if len(depth_history) > 0:
                 depth_stack = torch.stack(depth_history).float()  # [T, H, W], meters
                 # 使用逆深度增强近处障碍可见性，并做分位数拉伸避免整段几乎同值导致全黑

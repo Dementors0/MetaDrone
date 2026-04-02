@@ -47,7 +47,7 @@ class Env(BaseEnv):
         self.fixed_spawn_half_span = 1.0
         self.boundary_thickness = 0.10
         self.boundary_half = 0.5 * self.boundary_thickness
-        self.full_wall_hz = 2.45
+        self.full_wall_hz = 2.50  # 稍微超出，确保与地面和天花板无缝隙
         self.inner_wall_hz = 2.30
         self.region_types = ("easy", "hard", "u-minimal")
 
@@ -332,17 +332,17 @@ class Env(BaseEnv):
             self.inner_wall_hz if hz is None else hz,
         ])
 
-    def _append_horizontal_wall(self, walls, x0, x1, y_center, half_thickness):
+    def _append_horizontal_wall(self, walls, x0, x1, y_center, half_thickness, hz=None):
         x_lo = min(x0, x1)
         x_hi = max(x0, x1)
-        self._append_wall_box(walls, 0.5 * (x_lo + x_hi), y_center, 0.5 * (x_hi - x_lo), half_thickness)
+        self._append_wall_box(walls, 0.5 * (x_lo + x_hi), y_center, 0.5 * (x_hi - x_lo), half_thickness, hz=hz)
 
-    def _append_vertical_wall(self, walls, x_center, y0, y1, half_thickness):
+    def _append_vertical_wall(self, walls, x_center, y0, y1, half_thickness, hz=None):
         y_lo = min(y0, y1)
         y_hi = max(y0, y1)
-        self._append_wall_box(walls, x_center, 0.5 * (y_lo + y_hi), half_thickness, 0.5 * (y_hi - y_lo))
+        self._append_wall_box(walls, x_center, 0.5 * (y_lo + y_hi), half_thickness, 0.5 * (y_hi - y_lo), hz=hz)
 
-    def _append_stepped_wall(self, walls, x0, y0, x1, y1, half_thickness, steps=8):
+    def _append_stepped_wall(self, walls, x0, y0, x1, y1, half_thickness, steps=8, hz=None):
         """构造斜墙离散段，沿 x/y 双向加密封重叠，避免穿缝。"""
         total_steps = max(2, int(steps))
         seg_dx = (x1 - x0) / total_steps
@@ -360,23 +360,24 @@ class Env(BaseEnv):
             y_center = 0.5 * (seg_y0 + seg_y1)
             t = (idx + 0.5) / total_steps
             x_center = x0 + (x1 - x0) * t
-            self._append_wall_box(walls, x_center, y_center, hx, hy)
+            self._append_wall_box(walls, x_center, y_center, hx, hy, hz=hz)
 
         # 端点封口，防止与相邻竖墙/边界拼接处出现小孔。
         cap_hx = half_thickness + 0.5 * abs(seg_dx) + overlap_x
         cap_hy = half_thickness + 0.04
-        self._append_wall_box(walls, x0, y0, cap_hx, cap_hy)
-        self._append_wall_box(walls, x1, y1, cap_hx, cap_hy)
+        self._append_wall_box(walls, x0, y0, cap_hx, cap_hy, hz=hz)
+        self._append_wall_box(walls, x1, y1, cap_hx, cap_hy, hz=hz)
 
     def _generate_u_region(self, y0, y1):
-        """生成 U 型局部最优陷阱区域。"""
+        """生成 U 型局部最优陷阱区域，墙与边界/地面/天花板无缝隙。"""
         walls = []
         wall_half = 0.14
         corridor_half_width = 1.0  # 通道半宽，总宽 2 米
         corridor_x_left = self.spawn_x_center - corridor_half_width   # 4.0
         corridor_x_right = self.spawn_x_center + corridor_half_width  # 6.0
-        outer_left_x = wall_half
-        outer_right_x = self.map_x_max - wall_half
+        # 漏斗起点贴近左右边界墙（稍微嵌入以消除缝隙）
+        outer_left_x = self.boundary_half
+        outer_right_x = self.map_x_max - self.boundary_half
 
         # 漏斗区域 y 范围
         funnel_y0 = y0 + 0.04
@@ -391,34 +392,37 @@ class Env(BaseEnv):
         exit_y0 = exit_center_y - 0.5 * exit_gap
         exit_y1 = exit_center_y + 0.5 * exit_gap
 
+        # U 型区域内所有墙使用 full_wall_hz，消除与天花板的缝隙
+        hz = self.full_wall_hz
+
         # 漏斗入口斜墙（无间隙）
-        self._append_stepped_wall(walls, outer_left_x, funnel_y0, corridor_x_left, funnel_y1, wall_half, steps=12)
-        self._append_stepped_wall(walls, outer_right_x, funnel_y0, corridor_x_right, funnel_y1, wall_half, steps=12)
+        self._append_stepped_wall(walls, outer_left_x, funnel_y0, corridor_x_left, funnel_y1, wall_half, steps=12, hz=hz)
+        self._append_stepped_wall(walls, outer_right_x, funnel_y0, corridor_x_right, funnel_y1, wall_half, steps=12, hz=hz)
 
         open_left = random.random() < 0.5
         if open_left:
             # 左墙有出口：分成两段
-            self._append_vertical_wall(walls, corridor_x_left, corridor_y0, exit_y0, wall_half)
-            self._append_vertical_wall(walls, corridor_x_left, exit_y1, corridor_y1, wall_half)
+            self._append_vertical_wall(walls, corridor_x_left, corridor_y0, exit_y0, wall_half, hz=hz)
+            self._append_vertical_wall(walls, corridor_x_left, exit_y1, corridor_y1, wall_half, hz=hz)
             # 右墙完整
-            self._append_vertical_wall(walls, corridor_x_right, corridor_y0, corridor_y1, wall_half)
+            self._append_vertical_wall(walls, corridor_x_right, corridor_y0, corridor_y1, wall_half, hz=hz)
 
             # 出口外侧引导墙：保留 2 米间距
             guide_x = corridor_x_left - 2.0 - wall_half  # 距离出口 2 米
-            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half)
+            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half, hz=hz)
         else:
             # 左墙完整
-            self._append_vertical_wall(walls, corridor_x_left, corridor_y0, corridor_y1, wall_half)
+            self._append_vertical_wall(walls, corridor_x_left, corridor_y0, corridor_y1, wall_half, hz=hz)
             # 右墙有出口：分成两段
-            self._append_vertical_wall(walls, corridor_x_right, corridor_y0, exit_y0, wall_half)
-            self._append_vertical_wall(walls, corridor_x_right, exit_y1, corridor_y1, wall_half)
+            self._append_vertical_wall(walls, corridor_x_right, corridor_y0, exit_y0, wall_half, hz=hz)
+            self._append_vertical_wall(walls, corridor_x_right, exit_y1, corridor_y1, wall_half, hz=hz)
 
             # 出口外侧引导墙：保留 2 米间距
             guide_x = corridor_x_right + 2.0 + wall_half  # 距离出口 2 米
-            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half)
+            self._append_vertical_wall(walls, guide_x, exit_y0, exit_y1 + 1.0, wall_half, hz=hz)
 
         # 死胡同尽头的墙
-        self._append_horizontal_wall(walls, corridor_x_left - 0.12, corridor_x_right + 0.12, deadend_y, wall_half)
+        self._append_horizontal_wall(walls, corridor_x_left - 0.12, corridor_x_right + 0.12, deadend_y, wall_half, hz=hz)
 
         return walls, {
             "open_left": open_left,

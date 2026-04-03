@@ -453,7 +453,8 @@ class Env(BaseEnv):
         self.maze_cell_size = 1.0
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
-        self.n_drones_per_group = 1 if self.single else random.choice([4, 8])
+        # Force-disable inter-drone interaction: keep one drone per interaction group.
+        self.n_drones_per_group = 1
         self.drone_radius = random.uniform(0.10, 0.15)
         self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
         self._obstacle_scale = torch.ones((B, 1), device=device)

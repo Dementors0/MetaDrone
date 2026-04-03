@@ -2143,14 +2143,11 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     )
 
     m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
-    collision_depth_val = F.relu(-dist_val)
-    m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
-    m_coll_hard = collision_depth_val.pow(2).mean()
-    m_coll_peak = collision_depth_val.max(dim=0).values
-    m_coll_event = torch.sigmoid((m_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp).mean()
-    m_coll = (args.meta_coll_soft_weight * m_coll_soft
-              + args.meta_coll_hard_weight * m_coll_hard
-              + args.meta_coll_event_weight * m_coll_event)
+    with torch.no_grad():
+        v_to_pt = torch.ones_like(dist_val)
+        if dist_val.shape[0] > 1:
+            v_to_pt[1:] = (-torch.diff(dist_val, 1, 0) * 135.0).clamp_min(1.0)
+    m_coll = (F.softplus(dist_val.mul(-32.0)) * v_to_pt).mean()
     m_ctrl = act_val.norm(2, -1).sum()
     # 与 main_cuda.py 一致的平滑损失构造：jerk + snap
     m_jerk = act_val.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
@@ -2175,9 +2172,8 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     v_val = torch.stack(v_list)  # [T, B, 3]
     m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
     
-    # [新增] 卡住惩罚和碰撞持续时间
+    # [新增] 卡住惩罚
     m_stuck = loss_stuck_val.mean()
-    m_collision_duration = loss_collision_duration_val.mean()
     m_guidance, _ = compute_global_guidance_meta_loss(
         env, p_val, v_val, env.p_target, vec_val, dist_val,
         a_history=a_val,
@@ -2199,13 +2195,12 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     meta_val = sanitize_tensor(
         m_pos
         + m_coll
-        + m_height * 2.0
+        + m_height 
         + args.meta_guidance_weight * m_guidance
         + args.meta_smooth_jerk_weight * m_jerk
         + args.meta_smooth_snap_weight * m_snap
         + args.meta_smooth_v_pred_weight * m_v_pred
-        + args.stuck_loss_weight * m_stuck
-        + args.collision_duration_weight * m_collision_duration,
+        + args.stuck_loss_weight * m_stuck,
         nan=1e3, posinf=1e3, neginf=1e3
     )
     return meta_val, m_pos, m_coll, m_ctrl
@@ -2355,6 +2350,10 @@ for i in pbar:
 
     # 碰撞距离 (先计算, 后续速度目标依赖它)
     dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
+    with torch.no_grad():
+        v_to_pt = torch.ones_like(dist_obj)
+        if dist_obj.shape[0] > 1:
+            v_to_pt[1:] = (-torch.diff(dist_obj, 1, 0) * 135.0).clamp_min(1.0)
 
     # 自适应速度目标: 近障碍物/近终点时自动减速
     speed_actual = v_history.norm(2, -1)  # [T, B]
@@ -2369,20 +2368,10 @@ for i in pbar:
     v_dir = safe_normalize(v_history, dim=-1)
     loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
 
-    # 多尺度避障 + 前瞻碰撞预测
-    vec_to_pt_dir = safe_normalize(vec_to_pt, dim=-1)
-    approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
-    dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
-    dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
+    # 参考 main_cuda.py：代理损失使用软势场避障，元损失使用碰撞惩罚
     collision_depth = F.relu(-dist_obj)
-    safe_margin = args.avoid_safe_margin
-    loss_avoidance_seq = (
-        F.softplus((safe_margin - dist_obj) * 12.0) +
-        0.5 * F.softplus(-dist_obj * 32.0) +
-        0.3 * F.softplus((safe_margin - dist_future_02) * 10.0) +
-        0.2 * F.softplus((safe_margin - dist_future_04) * 10.0) +
-        collision_depth.pow(2)
-    )
+    loss_avoidance_seq = v_to_pt * (1.0 - dist_obj).relu().pow(2)
+    loss_collision_seq = F.softplus(dist_obj.mul(-32.0)) * v_to_pt
 
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
@@ -2439,17 +2428,11 @@ for i in pbar:
         effective_weights_seq[:, :, 3] * loss_expl_n
     )
 
-    # [新增] 固定权重的卡住惩罚 (不经过LGN，保证基本安全性)
+    # [新增] 固定权重的卡住惩罚 (仅用于监控，不再加入 proxy loss)
     loss_stuck_total = args.stuck_loss_weight * loss_stuck_seq.mean()
-    loss_collision_duration_total = args.collision_duration_weight * loss_collision_duration_seq.mean()
 
-    # 3. 最终 Proxy Loss (含固定权重的高度约束、卡住惩罚)
-    proxy_loss = (
-        weighted_loss_map.mean() +
-        2.0 * loss_height_seq.mean() +
-        loss_stuck_total +
-        loss_collision_duration_total
-    )
+    # 3. 最终 Proxy Loss (仅保留任务/避障/探索相关项)
+    proxy_loss = weighted_loss_map.mean()
 
     # [诊断] 检查proxy_loss计算链中的梯度属性
     if i % 100 == 0:
@@ -2465,18 +2448,7 @@ for i in pbar:
 
     # --- Meta Loss Components ---
     loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
-    loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
-    loss_meta_coll_hard = collision_depth.pow(2).mean()
-    loss_meta_coll_peak = collision_depth.max(dim=0).values
-    loss_meta_coll_event = torch.sigmoid(
-        (loss_meta_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp
-    ).mean()
-    loss_meta_coll_event_rate = (loss_meta_coll_peak > 0).float().mean()
-    loss_meta_coll = (
-        args.meta_coll_soft_weight * loss_meta_coll_soft
-        + args.meta_coll_hard_weight * loss_meta_coll_hard
-        + args.meta_coll_event_weight * loss_meta_coll_event
-    )
+    loss_meta_coll = loss_collision_seq.mean()
     loss_meta_ctrl = act_buffer.norm(2, -1).sum()
     # 与 main_cuda.py 一致的平滑损失构造：jerk + snap
     loss_meta_jerk = act_buffer.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
@@ -2534,21 +2506,19 @@ for i in pbar:
             'avg_ref_speed': 0.0,
         }
 
-    # 训练目标仅使用位置/碰撞/高度/引导/卡住; 控制项仅用于日志监控
+    # 训练目标仅使用位置/碰撞/高度/引导/平滑/速度预测/卡住; 控制项仅用于日志监控
     # [新增] 在 meta loss 中也加入卡住惩罚
     loss_meta_stuck = loss_stuck_seq.mean()
-    loss_meta_collision_duration = loss_collision_duration_seq.mean()
 
     meta_loss = (
         loss_meta_pos +
         loss_meta_coll +
-        loss_meta_height * 2.0 +
+        loss_meta_height +
         args.meta_guidance_weight * loss_meta_guidance +
         args.meta_smooth_jerk_weight * loss_meta_jerk +
         args.meta_smooth_snap_weight * loss_meta_snap +
         args.meta_smooth_v_pred_weight * loss_meta_v_pred +
-        args.stuck_loss_weight * loss_meta_stuck +
-        args.collision_duration_weight * loss_meta_collision_duration
+        args.stuck_loss_weight * loss_meta_stuck
     )
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
@@ -2906,32 +2876,29 @@ for i in pbar:
             # [代理损失/1_方向] 鼓励无人机方向与参考路径对齐的损失
             # 现象：应该相对较小(通常<0.5)。太大表示规划引导效果差或参考路径偏离实际
             'Proxy_Comp/1_Direction': loss_direction_seq.mean(),
-            # [代理损失/2_避障] 碰撞惩罚项(安全余度内的软惩罚)
-            # 现象：应该较小且趋势向下。如果>1.0说明无人机频繁接近障碍物
-            'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
-            # [代理损失/2_1_穿墙深度] 实际穿入障碍的深度(米)。诊断用，衡量碰撞严重程度
+            # [代理损失/2_软避障] 软势场避障项，越靠近墙壁惩罚越大
+            # 现象：应该较小且趋势向下。如果持续升高，说明无人机总是贴近障碍物
+            'Proxy_Comp/2_Avoidance_SoftField': loss_avoidance_seq.mean(),
+            # [代理损失/2_1_穿墙深度] 仅用于诊断是否真的穿墙
             # 现象：应该接近0。若>0.1米说明有明显穿墙现象，需要提升避障能力
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),
             # [代理损失/3_探索] 鼓励多样化轨迹的散度惩罚(R^3中的轨迹方差)
             # 现象：通常较小。初期可能较大，训练后减小，说明策略收敛
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
-            # [代理损失/4_高度] 惩罚与参考路径的高度偏差
+            # [代理诊断/4_高度] 高度偏差监控，不参与 proxy_loss
             # 现象：应该较小。如果>0.5说明无人机高度控制不当
-            'Proxy_Comp/4_Height': loss_height_seq.mean(),
+            'Diagnostics/Proxy_Height': loss_height_seq.mean(),
 
-            # ============================== 卡住(Stuck)损失 ==============================
-            # [卡住损失/5] 检测局部移动过慢的惩罚(看不到约15步的最小位移)
+            # ============================== 卡住(Stuck)诊断 ==============================
+            # [卡住诊断/5] 局部移动过慢的监控，不参与 proxy_loss
             # 现象：应该接近0。如果>0.1说明无人机经常陷入局部卡住状态
-            'Proxy_Comp/5_Stuck': loss_stuck_seq.mean(),
-            # [碰撞时间损失/6] 连续碰撞时长的惩罚(与碰撞持续帧数成正比)
+            'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
+            # [碰撞时长诊断/6] 连续碰撞时长的监控，不参与 proxy_loss
             # 现象：应该接近0。若>0.2说明无人机碰撞后难以恢复
-            'Proxy_Comp/6_Collision_Duration': loss_collision_duration_seq.mean(),
-            # [卡住总损失/10] 整个Episode的卡住位移惩罚总和
+            'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
+            # [卡住总损失监控/10] 整个Episode的卡住位移惩罚总和
             # 现象：应该较小。若持续>1.0说明需要调整stuck_displacement_threshold或提升导航能力
-            'Proxy_Comp/10_Stuck_Total': loss_stuck_total,
-            # [碰撞时间总损失/11] 整个Episode的碰撞时长惩罚总和
-            # 现象：应该较小。若持续>1.0说明避障算法需要改进
-            'Proxy_Comp/11_Collision_Duration_Total': loss_collision_duration_total,
+            'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
 
             # ============================== 卡住状态诊断 ==============================
             # [卡住比例] Episode中陷入卡住状态的步数占比 (0-1)
@@ -2946,11 +2913,11 @@ for i in pbar:
 
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
+            # [元损失/2_碰撞] 真实碰撞惩罚，针对穿墙现象作出反馈
+            # 现象：应该尽量接近0；若持续升高，说明策略在发生实际碰撞
             'Meta_Comp/2_Collision': loss_meta_coll,
-            'Meta_Comp/2_1_Collision_Soft': loss_meta_coll_soft,#软碰撞项（靠墙即升高，连续梯度）
-            'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对”已经进墙”的样本施加强惩罚，且穿得越深罚越重
-            'Meta_Comp/2_3_Collision_Event': loss_meta_coll_event,# 可微事件惩罚（用于训练）
-            'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
+            # [元损失/2_1_穿墙深度] 仅用于观察是否真的穿墙
+            'Meta_Comp/2_1_Collision_Depth': collision_depth.mean(),
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
             'Meta_Comp/8_Smooth_Jerk': loss_meta_jerk,
@@ -2958,7 +2925,6 @@ for i in pbar:
             'Meta_Comp/10_Smooth_V_Pred': loss_meta_v_pred,  # [新增] 速度预测误差
             # === [新增] Meta Loss 中的卡住损失 ===
             'Meta_Comp/6_Stuck': loss_meta_stuck,
-            'Meta_Comp/7_Collision_Duration': loss_meta_collision_duration,
 
             # ============================== 全局规划引导损失 ==============================
             # [元损失/5_引导] 整个全局规划引导的加权总损失
@@ -3175,6 +3141,7 @@ for i in pbar:
 
         if train_lgn_phase:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss
+            # unrolled 指标和主元损失保持同一命名语义，便于对照
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
             log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur

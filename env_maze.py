@@ -203,10 +203,8 @@ class Env:
         # ---------------------------------------------------------------------
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.drone_radius = random.uniform(0.1, 0.15)
-        if self.single:
-            self.n_drones_per_group = 1
-        else:
-            self.n_drones_per_group = 8 # Default to 8 or choice
+        # Force-disable inter-drone interaction for rendering and nearest-point queries.
+        self.n_drones_per_group = 1
 
         self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
@@ -273,10 +271,7 @@ class Env:
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.drone_radius = random.uniform(0.1, 0.15)
-        if self.single:
-            self.n_drones_per_group = 1
-        else:
-            self.n_drones_per_group = 8
+        self.n_drones_per_group = 1
 
         self.max_speed = min(5.0 * self.speed_mtp, 5.0)
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
@@ -425,15 +420,15 @@ class Env:
         # assert self.voxels.is_contiguous()
         # assert Rt.is_contiguous()
         quadsim_cuda.render(canvas, self.flow, self.balls, self.cyl, self.cyl_h,
-                            self.voxels, self.R @ self.R_cam, self.R_old, self.p,
-                            self.p_old, self.drone_radius, self.n_drones_per_group,
-                            self._fov_x_half_tan)
+                    self.voxels, self.R @ self.R_cam, self.R_old, self.p,
+                    self.p_old, self.drone_radius, 1,
+                    self._fov_x_half_tan)
         return canvas, None
 
     def find_vec_to_nearest_pt(self):
         p = self.p + self.v * self.sub_div
         nearest_pt = torch.empty_like(p)
-        quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
+        quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, 1)
         return nearest_pt - p
 
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):

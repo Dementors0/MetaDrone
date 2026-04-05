@@ -1,4 +1,4 @@
-#7.1
+#7.2
 #修改地圖起始位置和終點
 #可調整地圖大小和障礙物密度
 
@@ -248,6 +248,8 @@ parser.add_argument('--planner_workers', type=int, default=0,
                     help='Number of planner worker processes (<=0 means auto)')
 parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
                     help='maxtasksperchild for planner process pool to avoid long-run memory growth')
+parser.add_argument('--diag_interval', type=int, default=100,
+                    help='Print detailed DIAG logs every N iterations (<=0 disables)')
 
 args = parser.parse_args()
 
@@ -423,6 +425,148 @@ def merge_intervals(intervals, min_gap=1e-4):
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+def _diag_should_log(iter_idx):
+    return args.diag_interval > 0 and (iter_idx % args.diag_interval == 0)
+
+
+def _diag_grad_meta(x):
+    if x is None:
+        return "None"
+    gfn = type(x.grad_fn).__name__ if getattr(x, 'grad_fn', None) is not None else "None"
+    return f"requires_grad={x.requires_grad}, is_leaf={x.is_leaf}, grad_fn={gfn}"
+
+
+def _diag_tensor_finite(tag, x, iter_idx):
+    if x is None:
+        print(f"[DIAG iter={iter_idx}] {tag}: None")
+        return
+    with torch.no_grad():
+        xd = x.detach()
+        finite_mask = torch.isfinite(xd)
+        finite_cnt = int(finite_mask.sum().item())
+        total_cnt = int(xd.numel())
+        nonfinite_cnt = total_cnt - finite_cnt
+        if finite_cnt > 0:
+            vals = xd[finite_mask]
+            vmin = float(vals.min().item())
+            vmax = float(vals.max().item())
+        else:
+            vmin = float('nan')
+            vmax = float('nan')
+    print(
+        f"[DIAG iter={iter_idx}] {tag}: finite={finite_cnt}/{total_cnt}, "
+        f"nonfinite={nonfinite_cnt}/{total_cnt}, min={vmin:.6g}, max={vmax:.6g}"
+    )
+
+
+def _diag_grad_tuple_to_params(tag, grad_tuple, params, iter_idx, retain_graph=True):
+    params = list(params)
+    total_params = len(params)
+    if total_params == 0:
+        print(f"[DIAG iter={iter_idx}] {tag}: None=0/0, NonZero=0/0, Norm=0.000000, NonFinite=0/0")
+        return
+
+    if grad_tuple is None:
+        print(f"[DIAG iter={iter_idx}] {tag}: None={total_params}/{total_params}, NonZero=0/{total_params}, Norm=0.000000, NonFinite=0/0")
+        return
+
+    grads = [g for g in grad_tuple if g is not None]
+    if len(grads) == 0:
+        print(f"[DIAG iter={iter_idx}] {tag}: None={total_params}/{total_params}, NonZero=0/{total_params}, Norm=0.000000, NonFinite=0/0")
+        return
+
+    probe = None
+    for g in grads:
+        s = g.sum()
+        probe = s if probe is None else (probe + s)
+
+    try:
+        mapped = torch.autograd.grad(
+            probe,
+            params,
+            allow_unused=True,
+            retain_graph=retain_graph,
+            create_graph=False,
+        )
+    except Exception as e:
+        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
+        return
+
+    none_cnt = sum(g is None for g in mapped)
+    nonzero_cnt = 0
+    total_sq = 0.0
+    nonfinite = 0
+    total_elems = 0
+    for g in mapped:
+        if g is None:
+            continue
+        gd = g.detach()
+        finite_mask = torch.isfinite(gd)
+        nonfinite += int((~finite_mask).sum().item())
+        total_elems += gd.numel()
+        if finite_mask.any():
+            vals = gd[finite_mask]
+            total_sq += float((vals * vals).sum().item())
+            if float(vals.abs().sum().item()) > 1e-12:
+                nonzero_cnt += 1
+
+    print(
+        f"[DIAG iter={iter_idx}] {tag}: None={none_cnt}/{total_params}, "
+        f"NonZero={nonzero_cnt}/{total_params}, Norm={math.sqrt(total_sq):.6f}, "
+        f"NonFinite={nonfinite}/{total_elems}"
+    )
+
+
+def _diag_output_to_params(tag, output, params, iter_idx, retain_graph=True):
+    params = list(params)
+    total_params = len(params)
+    if total_params == 0:
+        print(f"[DIAG iter={iter_idx}] {tag}: norm=0.000000, NonFinite=0/0")
+        return
+    try:
+        grads = torch.autograd.grad(
+            output,
+            params,
+            allow_unused=True,
+            retain_graph=retain_graph,
+            create_graph=False,
+        )
+    except Exception as e:
+        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
+        return
+
+    norm, nonfinite, grad_elems = get_grad_norm_from_grads(grads)
+    print(f"[DIAG iter={iter_idx}] {tag}: norm={norm:.6f}, NonFinite={nonfinite}/{grad_elems}")
+
+
+def _diag_output_to_params_count(tag, output, params, iter_idx, retain_graph=True):
+    params = list(params)
+    total_params = len(params)
+    if total_params == 0:
+        print(f"[DIAG iter={iter_idx}] {tag}: None=0/0, NonZero=0/0")
+        return
+    try:
+        grads = torch.autograd.grad(
+            output,
+            params,
+            allow_unused=True,
+            retain_graph=retain_graph,
+            create_graph=False,
+        )
+    except Exception as e:
+        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
+        return
+
+    none_cnt = sum(g is None for g in grads)
+    nonzero_cnt = 0
+    for g in grads:
+        if g is None:
+            continue
+        if float(g.detach().abs().sum().item()) > 1e-12:
+            nonzero_cnt += 1
+    print(f"[DIAG iter={iter_idx}] {tag}: None={none_cnt}/{total_params}, NonZero={nonzero_cnt}/{total_params}")
 
 
 ########## 6.1 全局规划引导元损失辅助函数 ##########
@@ -2122,6 +2266,7 @@ for i in pbar:
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
+    act_for_diag = None
 
     h = None
     lgn_hx = None
@@ -2165,11 +2310,20 @@ for i in pbar:
         # LGN Forward (输出非负权重，不限于0-1)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
         current_weights = sanitize_tensor(current_weights, nan=1.0, posinf=100.0, neginf=0.0).clamp(0.01, 100.0)
+
+        if t == 0 and _diag_should_log(i):
+            first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
+            print(
+                f"[DIAG iter={i} t=0] current_weights={_diag_grad_meta(current_weights)}, "
+                f"lgn_hx={_diag_grad_meta(lgn_hx)}, "
+                f"first_lgn_weight={_diag_grad_meta(first_lgn_weight)}"
+            )
         trajectory_lgn_weights.append(current_weights)
 
         # Worker Forward
         act, _, h = worknet(x_pooled, state_tensor, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        act_for_diag = act
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
@@ -2197,6 +2351,8 @@ for i in pbar:
     a_history = torch.stack(a_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
     weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
+    if _diag_should_log(i):
+        print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
     rpy_history = torch.stack(rpy_history) # [T, B, 3]
     R_history = torch.stack(R_history)     # [T, B, 3, 3]
     real_act_history = torch.stack(real_act_history) # [T, B, 3]
@@ -2258,7 +2414,18 @@ for i in pbar:
 
     # 纯学习模式: 仅使用 LGN 动态权重，不叠加先验或规则门控
     weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    if _diag_should_log(i):
+        print(f"[DIAG iter={i}] weights_seq_norm: requires_grad={weights_seq_norm.requires_grad}, grad_fn={type(weights_seq_norm.grad_fn).__name__ if weights_seq_norm.grad_fn else 'None'}")
+        print(
+            f"[DIAG iter={i}] loss_n requires_grad: speed={loss_speed_n.requires_grad}, "
+            f"dir={loss_dir_n.requires_grad}, avoid={loss_avoid_n.requires_grad}, expl={loss_expl_n.requires_grad}"
+        )
     effective_weights_seq = weights_seq_norm
+    if _diag_should_log(i):
+        print(
+            f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
+            f"grad_fn={type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else 'None'}"
+        )
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
@@ -2270,6 +2437,30 @@ for i in pbar:
 
     # 3. 最终 Proxy Loss (含固定权重的高度约束)
     proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
+    if _diag_should_log(i):
+        print(
+            f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
+            f"grad_fn={type(weighted_loss_map.grad_fn).__name__ if weighted_loss_map.grad_fn else 'None'}"
+        )
+        print(
+            f"[DIAG iter={i}] proxy_loss: requires_grad={proxy_loss.requires_grad}, "
+            f"grad_fn={type(proxy_loss.grad_fn).__name__ if proxy_loss.grad_fn else 'None'}"
+        )
+
+        _diag_tensor_finite("act_for_diag", act_for_diag, i)
+        _diag_tensor_finite("real_act_history", real_act_history, i)
+        _diag_tensor_finite("p_history", p_history, i)
+        _diag_tensor_finite("v_history", v_history, i)
+        _diag_tensor_finite("a_history", a_history, i)
+        _diag_tensor_finite("vec_to_pt", vec_to_pt, i)
+        _diag_tensor_finite("dist_obj", dist_obj, i)
+        _diag_tensor_finite("loss_speed_seq", loss_speed_seq, i)
+        _diag_tensor_finite("loss_direction_seq", loss_direction_seq, i)
+        _diag_tensor_finite("loss_avoidance_seq", loss_avoidance_seq, i)
+        _diag_tensor_finite("loss_exploration_seq", loss_exploration_seq, i)
+        _diag_tensor_finite("weights_seq_norm", weights_seq_norm, i)
+        _diag_tensor_finite("weighted_loss_map", weighted_loss_map, i)
+        _diag_tensor_finite("proxy_loss", proxy_loss, i)
 
     # --- Meta Loss Components ---
     loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
@@ -2340,6 +2531,8 @@ for i in pbar:
         loss_meta_height * 2.0 +
         args.meta_guidance_weight * loss_meta_guidance
     )
+    if _diag_should_log(i):
+        _diag_tensor_finite("meta_loss", meta_loss, i)
     proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
     meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
 
@@ -2391,6 +2584,14 @@ for i in pbar:
         get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
     proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
         get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
+    if _diag_should_log(i):
+        print(
+            f"[DIAG iter={i}] loss_to_worker: "
+            f"speed={proxy_grad_speed:.6f} (NonFinite={proxy_grad_speed_nonfinite}/{proxy_grad_speed_elems}), "
+            f"dir={proxy_grad_dir:.6f} (NonFinite={proxy_grad_dir_nonfinite}/{proxy_grad_dir_elems}), "
+            f"avoid={proxy_grad_avoid:.6f} (NonFinite={proxy_grad_avoid_nonfinite}/{proxy_grad_avoid_elems}), "
+            f"expl={proxy_grad_expl:.6f} (NonFinite={proxy_grad_expl_nonfinite}/{proxy_grad_expl_elems})"
+        )
 
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
@@ -2402,11 +2603,59 @@ for i in pbar:
                 proxy_loss, tuple(fast_params.values()),
                 create_graph=True, allow_unused=True, retain_graph=True,
             )
+
+            if _inner == 0 and _diag_should_log(i):
+                fast_param_values = tuple(fast_params.values())
+
+                g_speed = torch.autograd.grad(
+                    loss_speed_seq.mean(), fast_param_values,
+                    create_graph=True, allow_unused=True, retain_graph=True,
+                )
+                g_dir = torch.autograd.grad(
+                    loss_direction_seq.mean(), fast_param_values,
+                    create_graph=True, allow_unused=True, retain_graph=True,
+                )
+                g_avoid = torch.autograd.grad(
+                    loss_avoidance_seq.mean(), fast_param_values,
+                    create_graph=True, allow_unused=True, retain_graph=True,
+                )
+                g_expl = torch.autograd.grad(
+                    loss_exploration_seq.mean(), fast_param_values,
+                    create_graph=True, allow_unused=True, retain_graph=True,
+                )
+
+                lgn_param_list = list(lgn.parameters())
+                _diag_grad_tuple_to_params("speed second_order(worker_grad)->lgn", g_speed, lgn_param_list, i)
+                _diag_grad_tuple_to_params("direction second_order(worker_grad)->lgn", g_dir, lgn_param_list, i)
+                _diag_grad_tuple_to_params("avoidance second_order(worker_grad)->lgn", g_avoid, lgn_param_list, i)
+                _diag_grad_tuple_to_params("exploration second_order(worker_grad)->lgn", g_expl, lgn_param_list, i)
+                _diag_grad_tuple_to_params("proxy_total second_order(worker_grad)->lgn", inner_grads, lgn_param_list, i)
+
+                act_only_loss = (act_for_diag.pow(2).mean() if act_for_diag is not None else torch.tensor(0.0, device=device))
+                g_act_only = torch.autograd.grad(
+                    act_only_loss, fast_param_values,
+                    create_graph=True, allow_unused=True, retain_graph=True,
+                )
+                _diag_grad_tuple_to_params("act_only second_order(worker_grad)->lgn", g_act_only, lgn_param_list, i)
+
+                _diag_grad_tuple_to_params("inner_grads(sum) -> lgn", inner_grads, lgn_param_list, i)
+                toy_grad = tuple((g.pow(2) if g is not None else None) for g in inner_grads)
+                _diag_grad_tuple_to_params("toy_grad(sqsum) -> lgn", toy_grad, lgn_param_list, i)
+
+                inner_norm, inner_nonfinite, inner_elems = get_grad_norm_from_grads(inner_grads)
+                print(f"[DIAG iter={i}] inner_grads finite: nonfinite={inner_nonfinite}/{inner_elems}")
+
             fast_params = {
                 name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
                        if g is not None else p)
                 for (name, p), g in zip(fast_params.items(), inner_grads)
             }
+
+        if _diag_should_log(i):
+            fast_param_vals = list(fast_params.values())
+            if len(fast_param_vals) > 0:
+                _diag_tensor_finite("first_fast_param", fast_param_vals[0], i)
+                _diag_output_to_params_count("fast_params(sum) -> lgn", sum(fp.sum() for fp in fast_param_vals), lgn.parameters(), i)
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
@@ -2414,6 +2663,17 @@ for i in pbar:
         if not torch.isfinite(meta_loss_unrolled):
             pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             continue
+
+        if _diag_should_log(i):
+            print(
+                f"[DIAG iter={i}] meta_loss_unrolled: requires_grad={meta_loss_unrolled.requires_grad}, "
+                f"grad_fn={type(meta_loss_unrolled.grad_fn).__name__ if meta_loss_unrolled.grad_fn else 'None'}"
+            )
+            _diag_tensor_finite("meta_loss_unrolled", meta_loss_unrolled, i)
+            _diag_output_to_params_count("meta_loss_unrolled -> lgn", meta_loss_unrolled, lgn.parameters(), i)
+            _diag_output_to_params("meta_loss_unrolled -> fast_params", meta_loss_unrolled, fast_params.values(), i)
+            _diag_output_to_params("proxy_loss -> lgn", proxy_loss, lgn.parameters(), i)
+            _diag_output_to_params("meta_loss -> lgn", meta_loss, lgn.parameters(), i)
 
         # Step 3: 反向传播贯穿整条链路
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params

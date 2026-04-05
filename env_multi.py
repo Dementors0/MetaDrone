@@ -4,7 +4,7 @@ import random
 import torch
 import quadsim_cuda
 
-from env import Env as BaseEnv, run as differentiable_run, safe_normalize
+from env import Env as BaseEnv, run as differentiable_run, run_torch as differentiable_run_torch, safe_normalize, update_state_vec_torch
 
 
 class Env(BaseEnv):
@@ -602,7 +602,8 @@ class Env(BaseEnv):
 
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
-        self.act, p_free, v_free, a_free = differentiable_run(
+        dyn_fn = differentiable_run_torch if self.use_meta_fallback else differentiable_run
+        self.act, p_free, v_free, a_free = dyn_fn(
             self.R,
             self.dg,
             self.z_drag_coef,
@@ -640,5 +641,8 @@ class Env(BaseEnv):
 
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
+        if self.use_meta_fallback:
+            self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
+        else:
+            self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
         self.R = torch.nan_to_num(self.R, nan=0.0, posinf=1.0, neginf=-1.0)

@@ -4,7 +4,7 @@
 import argparse
 import atexit
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from random import normalvariate
 import os
 import datetime
@@ -50,6 +50,7 @@ except ModuleNotFoundError:
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
     from env_multi import Env
+from env import probe_update_state_vec_common_upstream
 try:
     from WorkNet_transformer import WorkNet
     from LossGenNet_transformer import LossGenNet
@@ -113,6 +114,11 @@ def safe_normalize(x, dim=-1, eps=1e-6):
     return F.normalize(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, eps=eps)
 
 
+def safe_l2_norm(x, dim=-1, keepdim=False, eps=1e-6):
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.sqrt((x * x).sum(dim=dim, keepdim=keepdim) + eps)
+
+
 def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
     return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
 
@@ -127,7 +133,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--num_iters', type=int, default=5000000)
 
 # [优化策略参数]
@@ -153,8 +159,10 @@ parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節�
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=300)
-parser.add_argument('--lgn_timesteps', type=int, default=300,
+parser.add_argument('--lgn_timesteps', type=int, default=40,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
+parser.add_argument('--exploration_time_window', type=int, default=50,
+                    help='Look-back gap for exploration overlap loss; effective window is auto-clipped to rollout_len-1')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
 parser.add_argument('--cam_angle', type=int, default=10)
@@ -182,6 +190,10 @@ parser.add_argument('--inner_lr', type=float, default=3e-3,
                     help='Inner loop LR for differentiable worker update in LGN phase')
 parser.add_argument('--inner_steps', type=int, default=1,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
+parser.add_argument('--inner_grad_clip', type=float, default=50.0,
+                    help='Global-norm cap for differentiable inner gradients to stabilize second-order chain')
+parser.add_argument('--lgn_proxy_aux_weight', type=float, default=0.2,
+                    help='Auxiliary proxy-loss weight for LGN update; also used as fallback update when meta gradients are unusable')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
 # 避障/碰撞超参
@@ -234,6 +246,8 @@ parser.add_argument('--guide_collision_threshold', type=float, default=-0.05,
                     help='Penetration threshold below which point is considered collided')
 parser.add_argument('--guide_accel_weight', type=float, default=0.1,
                     help='Weight for acceleration mismatch penalty (deceleration requirement)')
+parser.add_argument('--unrolled_guidance_weight', type=float, default=0.0,
+                    help='Guidance-loss weight used in unrolled meta rollout; default 0.0 for second-order stability')
 parser.add_argument('--planner_resolution', type=float, default=0.3,
                     help='Resolution of the occupancy grid for A* planning (meters)')
 parser.add_argument('--planner_margin', type=float, default=0.15,
@@ -247,8 +261,10 @@ parser.add_argument('--planner_workers', type=int, default=0,
                     help='Number of planner worker processes (<=0 means auto)')
 parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
                     help='maxtasksperchild for planner process pool to avoid long-run memory growth')
-parser.add_argument('--diag_interval', type=int, default=100,
+parser.add_argument('--diag_interval', type=int, default=1,
                     help='Print detailed DIAG logs every N iterations (<=0 disables)')
+parser.add_argument('--diag_second_order', default=True, action='store_true',
+                    help='Enable heavy second-order diagnostic probes (can be noisy and slow)')
 
 args = parser.parse_args()
 
@@ -290,6 +306,13 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           hard_vpred_clip=args.hard_vpred_clip,
           hard_speed_clip=args.hard_speed_clip,
           start_goal_plane_y_abs=args.start_goal_plane_y_abs)
+
+_upstream_probe = probe_update_state_vec_common_upstream(device)
+env.update_state_vec_in_meta_path = bool(_upstream_probe["is_common_upstream"])
+print(
+    f"[Phase1 Probe] update_state_vec common-upstream="
+    f"{env.update_state_vec_in_meta_path} (delta={_upstream_probe['delta']:.6g})"
+)
 
 state_dim = 7 if args.no_odom else 10
 
@@ -411,6 +434,14 @@ def get_loss_to_worker_grad_norm(loss, params):
         loss, params, allow_unused=True, retain_graph=True, create_graph=False,
     )
     return get_grad_norm_from_grads(grads)
+
+
+def scale_scalar_objective(x, target_mag=10.0, eps=1e-6):
+    """Rescale scalar objective by detached magnitude to avoid gradient blow-up."""
+    if x is None:
+        return x
+    denom = x.detach().abs().clamp_min(eps)
+    return x * (float(target_mag) / denom)
 
 
 def merge_intervals(intervals, min_gap=1e-4):
@@ -566,6 +597,19 @@ def _diag_output_to_params_count(tag, output, params, iter_idx, retain_graph=Tru
         if float(g.detach().abs().sum().item()) > 1e-12:
             nonzero_cnt += 1
     print(f"[DIAG iter={iter_idx}] {tag}: None={none_cnt}/{total_params}, NonZero={nonzero_cnt}/{total_params}")
+
+
+def _grad_or_none_tuple(loss, params, create_graph=True, retain_graph=True):
+    params = tuple(params)
+    if not getattr(loss, "requires_grad", False):
+        return tuple(None for _ in params)
+    return torch.autograd.grad(
+        loss,
+        params,
+        create_graph=create_graph,
+        allow_unused=True,
+        retain_graph=retain_graph,
+    )
 
 
 ########## 6.1 全局规划引导元损失辅助函数 ##########
@@ -2186,9 +2230,9 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     if vec_val.dim() == 4:
         vec_val = vec_val.mean(1)
 
-    dist_val = sanitize_tensor(vec_val.norm(2, -1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
+    dist_val = sanitize_tensor(safe_l2_norm(vec_val, dim=-1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
-    m_pos  = torch.norm(p_val[-1] - env.p_target, 2, -1).mean()
+    m_pos  = safe_l2_norm(p_val[-1] - env.p_target, dim=-1).mean()
     collision_depth_val = F.relu(-dist_val)
     m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
     m_coll_hard = collision_depth_val.pow(2).mean()
@@ -2197,36 +2241,36 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     m_coll = (args.meta_coll_soft_weight * m_coll_soft
               + args.meta_coll_hard_weight * m_coll_hard
               + args.meta_coll_event_weight * m_coll_event)
-    m_ctrl = act_val.norm(2, -1).sum()
+    m_ctrl = safe_l2_norm(act_val, dim=-1).sum()
     # Meta rollout 的高度惩罚，与主训练分支保持一致
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
                + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
                + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
-    # 全局规划引导损失（与主訓練分支保持一致）
-    v_val = torch.stack(v_list)  # [T, B, 3]
-    m_guidance, _ = compute_global_guidance_meta_loss(
-        env, p_val, v_val, env.p_target, vec_val, dist_val,
-        a_history=a_val,
-        sample_count=args.guide_sample_count,
-        strategy=args.guide_sample_strategy,
-        max_speed=float(env.max_speed),
-        max_accel=args.guide_max_accel,
-        max_decel=args.guide_max_decel,
-        dir_weight=args.guide_dir_weight,
-        speed_weight=args.guide_speed_weight,
-        lateral_weight=args.guide_lateral_weight,
-        escape_weight=args.guide_escape_weight,
-        collision_threshold=args.guide_collision_threshold,
-        accel_weight=args.guide_accel_weight,
-        speed_diff_weight=args.guide_speed_diff_weight,
-        recovery_speed_weight=args.guide_recovery_speed_weight,
-    )
+    # 全局规划引导损失（默认不进入 unrolled 二阶链路，必要时可通过参数开启）
+    if args.unrolled_guidance_weight > 0.0:
+        v_val = torch.stack(v_list)  # [T, B, 3]
+        m_guidance, _ = compute_global_guidance_meta_loss(
+            env, p_val, v_val, env.p_target, vec_val, dist_val,
+            a_history=a_val,
+            sample_count=args.guide_sample_count,
+            strategy=args.guide_sample_strategy,
+            max_speed=float(env.max_speed),
+            max_accel=args.guide_max_accel,
+            max_decel=args.guide_max_decel,
+            dir_weight=args.guide_dir_weight,
+            speed_weight=args.guide_speed_weight,
+            lateral_weight=args.guide_lateral_weight,
+            escape_weight=args.guide_escape_weight,
+            collision_threshold=args.guide_collision_threshold,
+            accel_weight=args.guide_accel_weight,
+            speed_diff_weight=args.guide_speed_diff_weight,
+            recovery_speed_weight=args.guide_recovery_speed_weight,
+        )
+    else:
+        m_guidance = p_val.new_zeros(())
 
-    meta_val = sanitize_tensor(
-        m_pos + m_coll + m_height * 2.0 + args.meta_guidance_weight * m_guidance,
-        nan=1e3, posinf=1e3, neginf=1e3
-    )
+    meta_val = m_pos + m_coll + m_height * 2.0 + args.unrolled_guidance_weight * m_guidance
     return meta_val, m_pos, m_coll, m_ctrl
 
 ########## 7. 训练主循环 ##########
@@ -2243,6 +2287,7 @@ pbar = tqdm(range(args.num_iters), ncols=120)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
+meta_lgn_grad_window = deque(maxlen=20)
 
 state_normalizer.train()
 
@@ -2250,6 +2295,7 @@ for i in pbar:
     cycle_pos = i % cycle_len
     train_lgn_phase = cycle_pos < args.lgn_steps
     phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
+    env.set_meta_differentiable_mode(train_lgn_phase)
 
     if maze_update_counter % args.maze_update_interval == 0:
         env.reset()          # full reset: new maze + new drones
@@ -2306,9 +2352,8 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        # LGN Forward (输出非负权重，不限于0-1)
+        # LGN Forward (无约束原始权重)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
-        current_weights = sanitize_tensor(current_weights, nan=1.0, posinf=100.0, neginf=0.0).clamp(0.01, 100.0)
 
         if t == 0 and _diag_should_log(i):
             first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
@@ -2362,11 +2407,11 @@ for i in pbar:
     # 1. 计算各项 Raw Loss (保留 [T, B] 维度用于 Step-wise 加权)
 
     # 碰撞距离 (先计算, 后续速度目标依赖它)
-    dist_obj = vec_to_pt.norm(2, -1) - env.margin  # [T, B]
+    dist_obj = safe_l2_norm(vec_to_pt, dim=-1) - env.margin  # [T, B]
 
     # 自适应速度目标: 近障碍物/近终点时自动减速
-    speed_actual = v_history.norm(2, -1)  # [T, B]
-    dist_to_goal = (env.p_target - p_history).norm(2, -1)  # [T, B]
+    speed_actual = safe_l2_norm(v_history, dim=-1)  # [T, B]
+    dist_to_goal = safe_l2_norm(env.p_target - p_history, dim=-1)  # [T, B]
     v_max = float(env.max_speed)
     speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
     speed_factor_goal = torch.clamp(dist_to_goal / args.speed_goal_slow_dist, 0.0, 1.0)
@@ -2392,10 +2437,18 @@ for i in pbar:
         collision_depth.pow(2)
     )
 
-    # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
-    loss_exploration_seq = compute_overlap_loss_per_step(p_history, sigma=1.0, time_window=50).permute(1, 0)
-
     actual_T = p_history.shape[0]
+    exploration_window = min(int(args.exploration_time_window), max(0, actual_T - 1))
+    if _diag_should_log(i) and exploration_window != int(args.exploration_time_window):
+        print(
+            f"[DIAG iter={i}] exploration_time_window adjusted: "
+            f"requested={int(args.exploration_time_window)}, effective={exploration_window}, rollout_steps={actual_T}"
+        )
+
+    # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
+    loss_exploration_seq = compute_overlap_loss_per_step(
+        p_history, sigma=1.0, time_window=exploration_window
+    ).permute(1, 0)
 
     # 高度约束损失 (固定权重, 不经LGN控制)
     z_pos = p_history[:, :, 2]  # [T, B]
@@ -2411,15 +2464,15 @@ for i in pbar:
             loss_speed_seq, loss_direction_seq, loss_avoidance_seq, loss_exploration_seq
         )
 
-    # 纯学习模式: 仅使用 LGN 动态权重，不叠加先验或规则门控
-    weights_seq_norm = weights_seq / weights_seq.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    # 纯学习模式: 直接使用 LGN 原始输出，不做归一化/非负约束
+    weights_seq_raw = weights_seq
     if _diag_should_log(i):
-        print(f"[DIAG iter={i}] weights_seq_norm: requires_grad={weights_seq_norm.requires_grad}, grad_fn={type(weights_seq_norm.grad_fn).__name__ if weights_seq_norm.grad_fn else 'None'}")
+        print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
         print(
             f"[DIAG iter={i}] loss_n requires_grad: speed={loss_speed_n.requires_grad}, "
             f"dir={loss_dir_n.requires_grad}, avoid={loss_avoid_n.requires_grad}, expl={loss_expl_n.requires_grad}"
         )
-    effective_weights_seq = weights_seq_norm
+    effective_weights_seq = weights_seq_raw
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
@@ -2457,12 +2510,12 @@ for i in pbar:
         _diag_tensor_finite("loss_direction_seq", loss_direction_seq, i)
         _diag_tensor_finite("loss_avoidance_seq", loss_avoidance_seq, i)
         _diag_tensor_finite("loss_exploration_seq", loss_exploration_seq, i)
-        _diag_tensor_finite("weights_seq_norm", weights_seq_norm, i)
+        _diag_tensor_finite("weights_seq_raw", weights_seq_raw, i)
         _diag_tensor_finite("weighted_loss_map", weighted_loss_map, i)
         _diag_tensor_finite("proxy_loss", proxy_loss, i)
 
     # --- Meta Loss Components ---
-    loss_meta_pos = torch.norm(p_history[-1] - env.p_target, 2, -1).mean()
+    loss_meta_pos = safe_l2_norm(p_history[-1] - env.p_target, dim=-1).mean()
     loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
     loss_meta_coll_hard = collision_depth.pow(2).mean()
     loss_meta_coll_peak = collision_depth.max(dim=0).values
@@ -2475,7 +2528,7 @@ for i in pbar:
         + args.meta_coll_hard_weight * loss_meta_coll_hard
         + args.meta_coll_event_weight * loss_meta_coll_event
     )
-    loss_meta_ctrl = act_buffer.norm(2, -1).sum()
+    loss_meta_ctrl = safe_l2_norm(act_buffer, dim=-1).sum()
     loss_meta_height = loss_height_seq.mean()
 
     # --- 全局规划引导损失 ---
@@ -2532,8 +2585,7 @@ for i in pbar:
     )
     if _diag_should_log(i):
         _diag_tensor_finite("meta_loss", meta_loss, i)
-    proxy_loss = sanitize_tensor(proxy_loss, nan=1e3, posinf=1e3, neginf=1e3)
-    meta_loss = sanitize_tensor(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
+    # Keep root losses untouched for higher-order gradients; skip iteration via finite checks below.
 
     ###### C. Optimization ######
     optim_worker.zero_grad()
@@ -2561,6 +2613,15 @@ for i in pbar:
     lgn_grad_nonfinite = 0.0
     lgn_grad_elems = 0.0
     lgn_clip_pre = 0.0
+    meta_grad_window_mean = 0.0
+    meta_grad_window_min = 0.0
+    meta_grad_window_max = 0.0
+    meta_grad_window_finite_ratio = 0.0
+    meta_grad_window_nonzero_ratio = 0.0
+    lgn_meta_probe_norm = 0.0
+    lgn_meta_probe_nonfinite = 0.0
+    lgn_meta_probe_elems = 0.0
+    lgn_used_proxy_fallback = 0.0
 
     rollout_is_finite = bool(
         torch.isfinite(proxy_loss).all()
@@ -2596,6 +2657,7 @@ for i in pbar:
         # ===== Unrolled Bilevel: 可微内循环 =====
         # Step 1: 用 proxy_loss 对 worker 做可微梯度下降
         fast_params = dict(worknet.named_parameters())
+        inner_update_is_finite = True
 
         for _inner in range(args.inner_steps):
             inner_grads = torch.autograd.grad(
@@ -2603,52 +2665,61 @@ for i in pbar:
                 create_graph=True, allow_unused=True, retain_graph=True,
             )
 
+            inner_sq_terms = [(g * g).sum() for g in inner_grads if g is not None]
+            if inner_sq_terms:
+                inner_grad_norm_tensor = torch.sqrt(torch.stack(inner_sq_terms).sum() + 1e-12)
+                if not bool(torch.isfinite(inner_grad_norm_tensor).item()):
+                    inner_update_is_finite = False
+                    break
+                inner_scale = (args.inner_grad_clip / (inner_grad_norm_tensor + 1e-6)).clamp(max=1.0)
+                inner_grads = tuple((g * inner_scale) if g is not None else None for g in inner_grads)
+
             if _inner == 0 and _diag_should_log(i):
                 fast_param_values = tuple(fast_params.values())
 
-                g_speed = torch.autograd.grad(
-                    loss_speed_seq.mean(), fast_param_values,
-                    create_graph=True, allow_unused=True, retain_graph=True,
-                )
-                g_dir = torch.autograd.grad(
-                    loss_direction_seq.mean(), fast_param_values,
-                    create_graph=True, allow_unused=True, retain_graph=True,
-                )
-                g_avoid = torch.autograd.grad(
-                    loss_avoidance_seq.mean(), fast_param_values,
-                    create_graph=True, allow_unused=True, retain_graph=True,
-                )
-                g_expl = torch.autograd.grad(
-                    loss_exploration_seq.mean(), fast_param_values,
-                    create_graph=True, allow_unused=True, retain_graph=True,
-                )
+                if args.diag_second_order:
+                    # Probe weighted per-term proxy components so each branch truly depends on LGN weights.
+                    weighted_speed = (effective_weights_seq[:, :, 0] * loss_speed_n).mean()
+                    weighted_dir = (effective_weights_seq[:, :, 1] * loss_dir_n).mean()
+                    weighted_avoid = (effective_weights_seq[:, :, 2] * loss_avoid_n).mean()
+                    weighted_expl = (effective_weights_seq[:, :, 3] * loss_expl_n).mean()
 
-                lgn_param_list = list(lgn.parameters())
-                _diag_grad_tuple_to_params("speed second_order(worker_grad)->lgn", g_speed, lgn_param_list, i)
-                _diag_grad_tuple_to_params("direction second_order(worker_grad)->lgn", g_dir, lgn_param_list, i)
-                _diag_grad_tuple_to_params("avoidance second_order(worker_grad)->lgn", g_avoid, lgn_param_list, i)
-                _diag_grad_tuple_to_params("exploration second_order(worker_grad)->lgn", g_expl, lgn_param_list, i)
-                _diag_grad_tuple_to_params("proxy_total second_order(worker_grad)->lgn", inner_grads, lgn_param_list, i)
+                    g_speed = _grad_or_none_tuple(weighted_speed, fast_param_values)
+                    g_dir = _grad_or_none_tuple(weighted_dir, fast_param_values)
+                    g_avoid = _grad_or_none_tuple(weighted_avoid, fast_param_values)
+                    g_expl = _grad_or_none_tuple(weighted_expl, fast_param_values)
 
-                act_only_loss = (act_for_diag.pow(2).mean() if act_for_diag is not None else torch.tensor(0.0, device=device))
-                g_act_only = torch.autograd.grad(
-                    act_only_loss, fast_param_values,
-                    create_graph=True, allow_unused=True, retain_graph=True,
-                )
-                _diag_grad_tuple_to_params("act_only second_order(worker_grad)->lgn", g_act_only, lgn_param_list, i)
+                    lgn_param_list = list(lgn.parameters())
+                    _diag_grad_tuple_to_params("speed(weighted) second_order(worker_grad)->lgn", g_speed, lgn_param_list, i)
+                    _diag_grad_tuple_to_params("direction(weighted) second_order(worker_grad)->lgn", g_dir, lgn_param_list, i)
+                    _diag_grad_tuple_to_params("avoidance(weighted) second_order(worker_grad)->lgn", g_avoid, lgn_param_list, i)
+                    _diag_grad_tuple_to_params("exploration(weighted) second_order(worker_grad)->lgn", g_expl, lgn_param_list, i)
+                    _diag_grad_tuple_to_params("proxy_total second_order(worker_grad)->lgn", inner_grads, lgn_param_list, i)
 
-                _diag_grad_tuple_to_params("inner_grads(sum) -> lgn", inner_grads, lgn_param_list, i)
-                toy_grad = tuple((g.pow(2) if g is not None else None) for g in inner_grads)
-                _diag_grad_tuple_to_params("toy_grad(sqsum) -> lgn", toy_grad, lgn_param_list, i)
+                    act_only_loss = (act_for_diag.pow(2).mean() if act_for_diag is not None else torch.tensor(0.0, device=device))
+                    act_only_weighted = effective_weights_seq[:, :, 0].mean() * act_only_loss
+                    g_act_only = torch.autograd.grad(
+                        act_only_weighted, fast_param_values,
+                        create_graph=True, allow_unused=True, retain_graph=True,
+                    )
+                    _diag_grad_tuple_to_params("act_only(weighted) second_order(worker_grad)->lgn", g_act_only, lgn_param_list, i)
+
+                    _diag_grad_tuple_to_params("inner_grads(sum) -> lgn", inner_grads, lgn_param_list, i)
+                    toy_grad = tuple((g.pow(2) if g is not None else None) for g in inner_grads)
+                    _diag_grad_tuple_to_params("toy_grad(sqsum) -> lgn", toy_grad, lgn_param_list, i)
 
                 inner_norm, inner_nonfinite, inner_elems = get_grad_norm_from_grads(inner_grads)
                 print(f"[DIAG iter={i}] inner_grads finite: nonfinite={inner_nonfinite}/{inner_elems}")
 
             fast_params = {
-                name: (p - args.inner_lr * sanitize_tensor(g, nan=0.0, posinf=3.0, neginf=-3.0).clamp(-3.0, 3.0)
+                name: (p - args.inner_lr * g
                        if g is not None else p)
                 for (name, p), g in zip(fast_params.items(), inner_grads)
             }
+
+        if not inner_update_is_finite:
+            pbar.set_description(f"[{phase_str}] non-finite inner-update skipped")
+            continue
 
         if _diag_should_log(i):
             fast_param_vals = list(fast_params.values())
@@ -2676,10 +2747,67 @@ for i in pbar:
 
         # Step 3: 反向传播贯穿整条链路
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # 纯学习模式: LGN 仅由 unrolled meta loss 驱动
-        lgn_total = meta_loss_unrolled
+        # 当 meta->LGN 梯度不可用(非有限或全零)时, 回退到 proxy 辅助更新以避免 NaN 污染。
+        meta_probe_grads = torch.autograd.grad(
+            meta_loss_unrolled,
+            tuple(lgn.parameters()),
+            allow_unused=True,
+            retain_graph=True,
+            create_graph=False,
+        )
+        lgn_meta_probe_norm, lgn_meta_probe_nonfinite, lgn_meta_probe_elems = get_grad_norm_from_grads(meta_probe_grads)
+        meta_grad_usable = (
+            lgn_meta_probe_elems > 0
+            and lgn_meta_probe_nonfinite == 0
+            and lgn_meta_probe_norm > 0.0
+            and math.isfinite(lgn_meta_probe_norm)
+        )
+        scaled_meta = scale_scalar_objective(meta_loss_unrolled)
+        scaled_proxy = scale_scalar_objective(proxy_loss)
+        if meta_grad_usable:
+            lgn_total = scaled_meta + args.lgn_proxy_aux_weight * scaled_proxy
+        else:
+            lgn_total = args.lgn_proxy_aux_weight * scaled_proxy
+            lgn_used_proxy_fallback = 1.0
+            if _diag_should_log(i):
+                print(
+                    f"[DIAG iter={i}] fallback: use proxy_loss for LGN update "
+                    f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
+                    f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
+                )
+
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
+        if _diag_should_log(i):
+            print(
+                f"[DIAG iter={i}] lgn_grads: norm={lgn_grad_norm:.6f}, "
+                f"nonfinite={int(lgn_grad_nonfinite)}/{int(lgn_grad_elems)}, max={lgn_grad_max:.6f}"
+            )
+        if math.isfinite(lgn_grad_norm):
+            meta_lgn_grad_window.append(float(lgn_grad_norm))
+        else:
+            meta_lgn_grad_window.append(float('nan'))
+
+        valid_meta_grad = [g for g in meta_lgn_grad_window if math.isfinite(g)]
+        if valid_meta_grad:
+            meta_grad_window_mean = float(sum(valid_meta_grad) / len(valid_meta_grad))
+            meta_grad_window_min = float(min(valid_meta_grad))
+            meta_grad_window_max = float(max(valid_meta_grad))
+        meta_grad_window_finite_ratio = float(
+            sum(1 for g in meta_lgn_grad_window if math.isfinite(g)) / max(1, len(meta_lgn_grad_window))
+        )
+        meta_grad_window_nonzero_ratio = float(
+            sum(1 for g in meta_lgn_grad_window if math.isfinite(g) and g > 0.0) / max(1, len(meta_lgn_grad_window))
+        )
+
+        if _diag_should_log(i):
+            print(
+                f"[DIAG iter={i}] meta_loss_unrolled->LGN grad window "
+                f"len={len(meta_lgn_grad_window)}, finite_ratio={meta_grad_window_finite_ratio:.3f}, "
+                f"nonzero_ratio={meta_grad_window_nonzero_ratio:.3f}, mean={meta_grad_window_mean:.6g}, "
+                f"min={meta_grad_window_min:.6g}, max={meta_grad_window_max:.6g}"
+            )
+
         lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
         optim_lgn.step()
         sanitize_module_(lgn, clamp_value=5.0)
@@ -2702,10 +2830,10 @@ for i in pbar:
     with torch.no_grad():
         success = torch.all(dist_obj > 0, 0)
         # 计算平均权重 (用于 Scalar 显示)
-        avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始非归一化权重
-        avg_weights = weights_seq_norm.mean(dim=[0, 1]).cpu()  # 归一化后的权重
+        avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始输出权重
+        avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际使用权重
         avg_effective_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()
-        weight_entropy = (-weights_seq_norm * torch.log(weights_seq_norm.clamp_min(1e-8))).sum(dim=-1).mean()
+        weight_std = effective_weights_seq.std(dim=-1).mean()
         v_norm = v_history.norm(dim=-1)
         avg_speed = v_norm.mean()
         min_speed_threshold = float(env.max_speed) * 0.7
@@ -2718,12 +2846,12 @@ for i in pbar:
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
 
-            # === [增强] 4个权重均值 (归一化后) ===
+            # === [增强] 4个权重均值 (实际使用) ===
             'Weights/0_Speed': avg_weights[0],
             'Weights/1_Direction': avg_weights[1],
             'Weights/2_Avoidance': avg_weights[2],
             'Weights/3_Exploration': avg_weights[3],
-            # === 原始非归一化权重 ===
+            # === 原始输出权重 ===
             'Weights_Raw/0_Speed': avg_weights_raw[0],
             'Weights_Raw/1_Direction': avg_weights_raw[1],
             'Weights_Raw/2_Avoidance': avg_weights_raw[2],
@@ -2737,7 +2865,7 @@ for i in pbar:
             'Weight_Stats/Raw_Min': weights_seq.min(),
             'Weight_Stats/Raw_Max': weights_seq.max(),
             'Weight_Stats/Raw_Mean': weights_seq.mean(),
-            'Weight_Stats/Entropy': weight_entropy,
+            'Weight_Stats/Std': weight_std,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
@@ -2816,6 +2944,15 @@ for i in pbar:
             'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
             'Grad/LGN_GradElem_Count': lgn_grad_elems,
             'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
+            'Grad/LGN_MetaWindow_Mean': meta_grad_window_mean,
+            'Grad/LGN_MetaWindow_Min': meta_grad_window_min,
+            'Grad/LGN_MetaWindow_Max': meta_grad_window_max,
+            'Grad/LGN_MetaWindow_FiniteRatio': meta_grad_window_finite_ratio,
+            'Grad/LGN_MetaWindow_NonZeroRatio': meta_grad_window_nonzero_ratio,
+            'Grad/LGN_MetaProbe_Norm': lgn_meta_probe_norm,
+            'Grad/LGN_MetaProbe_NonFinite_Count': lgn_meta_probe_nonfinite,
+            'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
+            'Train/LGN_UsedProxyFallback': lgn_used_proxy_fallback,
 
             # === [新增] 四个代理损失对 Worker 梯度的 norm ===
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
@@ -2995,11 +3132,11 @@ for i in pbar:
 
             # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
             fig_w, ax = plt.subplots()
-            w_cpu = weights_seq_norm[:, idx, :].cpu() # [T, 4] 归一化后的权重
+            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际使用权重（无约束）
             labels = ['Speed', 'Dir', 'Avoid', 'Expl']
             for wi in range(4):
                 ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Normalized)")
+            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Unconstrained)")
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 
@@ -3008,7 +3145,7 @@ for i in pbar:
             writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
             writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
             writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)
-            writer.add_scalar('Weights_Snapshot/Entropy', weight_entropy, i + 1)
+            writer.add_scalar('Weights_Snapshot/Std', weight_std, i + 1)
             # 权重统计
             writer.add_scalar('Weights_Snapshot/Raw_Min', weights_seq.min(), i + 1)
             writer.add_scalar('Weights_Snapshot/Raw_Max', weights_seq.max(), i + 1)

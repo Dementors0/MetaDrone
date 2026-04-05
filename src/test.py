@@ -1,6 +1,14 @@
 import math
+import os
+import sys
 import torch
 import quadsim_cuda
+
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if repo_root not in sys.path:
+    sys.path.append(repo_root)
+
+from env import run as custom_cuda_run, run_torch, update_state_vec_torch
 
 
 class GDecay(torch.autograd.Function):
@@ -73,3 +81,57 @@ assert torch.allclose(d_act, act.grad)
 assert torch.allclose(d_p, p.grad)
 assert torch.allclose(d_v, v.grad)
 assert torch.allclose(d_a, a.grad)
+
+
+# --- Path-level higher-order probe ---
+# Fallback path: should support second-order gradients.
+w = torch.randn((1,), dtype=torch.double, device='cuda', requires_grad=True)
+act_pred_meta = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True) + w
+act_meta = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+p_meta = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+v_meta = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+a_meta = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+v_wind_meta = torch.randn((64, 3), dtype=torch.double, device='cuda')
+R_meta = torch.randn((64, 3, 3), dtype=torch.double, device='cuda')
+
+act_1, p_1, v_1, a_1 = run_torch(
+    R_meta, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+    act_pred_meta, act_meta, p_meta, v_meta, v_wind_meta, a_meta,
+    grad_decay, ctl_dt, 0.5,
+)
+alpha_yaw = torch.exp(-pitch_ctl_delay * ctl_dt)
+v_pred_meta = torch.randn((64, 3), dtype=torch.double, device='cuda')
+R_1 = update_state_vec_torch(R_meta, act_1, v_pred_meta, alpha_yaw, 2)
+act_2_pred = 0.5 * act_pred_meta + R_1[:, :, 2]
+_, p_2, v_2, _ = run_torch(
+    R_1, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+    act_2_pred, act_1, p_1, v_1, v_wind_meta, a_1,
+    grad_decay, ctl_dt, 0.5,
+)
+meta_loss = (p_2.pow(2).mean() + v_2.pow(2).mean())
+inner_grad = torch.autograd.grad(meta_loss, act_pred_meta, create_graph=True, allow_unused=False)[0]
+second_grad = torch.autograd.grad(inner_grad.sum(), w, allow_unused=True)[0]
+assert second_grad is not None
+assert torch.isfinite(second_grad).all()
+
+# CUDA custom backward path: still first-order only for higher-order chain.
+w2 = torch.randn((1,), dtype=torch.double, device='cuda', requires_grad=True)
+act_pred_cuda = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True) + w2
+act_cuda = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+p_cuda = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+v_cuda = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+a_cuda = torch.randn((64, 3), dtype=torch.double, device='cuda', requires_grad=True)
+act_next_cuda, p_next_cuda, v_next_cuda, a_next_cuda = custom_cuda_run(
+    R_meta, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+    act_pred_cuda, act_cuda, p_cuda, v_cuda, v_wind_meta, a_cuda,
+    grad_decay, ctl_dt, 0.5,
+)
+loss_cuda = p_next_cuda.pow(2).mean() + v_next_cuda.pow(2).mean() + a_next_cuda.pow(2).mean()
+inner_grad_cuda = torch.autograd.grad(loss_cuda, act_pred_cuda, create_graph=True, allow_unused=True)[0]
+second_grad_cuda = None
+if inner_grad_cuda is not None:
+    try:
+        second_grad_cuda = torch.autograd.grad(inner_grad_cuda.sum(), w2, allow_unused=True)[0]
+    except RuntimeError:
+        second_grad_cuda = None
+assert second_grad_cuda is None

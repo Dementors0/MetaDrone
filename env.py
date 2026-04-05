@@ -40,6 +40,174 @@ class RunFunction(torch.autograd.Function):
 run = RunFunction.apply
 
 
+def run_torch(
+    R,
+    dg,
+    z_drag_coef,
+    drag_2,
+    pitch_ctl_delay,
+    act_pred,
+    act,
+    p,
+    v,
+    v_wind,
+    a,
+    grad_decay,
+    ctl_dt,
+    airmode_av2a,
+):
+    alpha = torch.exp(-pitch_ctl_delay * ctl_dt)
+    act_next = act_pred * (1 - alpha) + act * alpha
+
+    v_rel = v - v_wind
+    v_fwd_s, v_left_s, v_up_s = (v_rel[:, None] @ R).unbind(-1)
+
+    drag_quad = drag_2[:, :1] * (
+        v_fwd_s.abs() * v_fwd_s * R[..., 0]
+        + v_left_s.abs() * v_left_s * R[..., 1]
+        + v_up_s.abs() * v_up_s * R[..., 2] * z_drag_coef
+    )
+    drag_lin = drag_2[:, 1:] * (
+        v_fwd_s * R[..., 0]
+        + v_left_s * R[..., 1]
+        + v_up_s * R[..., 2] * z_drag_coef
+    )
+
+    g_bias = act.new_tensor([0.0, 0.0, 9.80665]).view(1, 3)
+    act_g = act + g_bias
+    act_next_g = act_next + g_bias
+    dot = (act_g * act_next_g).sum(-1, keepdim=True)
+    n1 = act_g.norm(2, -1, keepdim=True)
+    n2 = act_next_g.norm(2, -1, keepdim=True)
+    # Keep acos input away from +/-1 to avoid infinite slope in backward.
+    cosv = torch.clamp(dot / (n1 * n2).clamp_min(1e-8), -1.0 + 1e-4, 1.0 - 1e-4)
+    av = torch.acos(cosv) / max(float(ctl_dt), 1e-6)
+    thrust_dir = act_g / n1.clamp_min(1e-8)
+    airmode_a = thrust_dir * av * airmode_av2a
+
+    a_next = act_next + dg - drag_quad - drag_lin + airmode_a
+    p_next = g_decay(p, grad_decay ** ctl_dt) + v * ctl_dt + 0.5 * a * ctl_dt ** 2
+    v_next = g_decay(v, grad_decay ** ctl_dt) + 0.5 * (a + a_next) * ctl_dt
+    return act_next, p_next, v_next, a_next
+
+
+def update_state_vec_torch(R, a_thr, v_pred, alpha, yaw_inertia=2, eps=1e-6):
+    ax = a_thr[:, 0]
+    ay = a_thr[:, 1]
+    az = a_thr[:, 2] + 9.80665
+    thrust = torch.sqrt((ax * ax + ay * ay + az * az).clamp_min(eps))
+    ux = ax / thrust
+    uy = ay / thrust
+    uz = az / thrust
+
+    fx = R[:, 0, 0] * yaw_inertia + v_pred[:, 0]
+    fy = R[:, 1, 0] * yaw_inertia + v_pred[:, 1]
+    fz = R[:, 2, 0] * yaw_inertia + v_pred[:, 2]
+    t = torch.sqrt((fx * fx + fy * fy + fz * fz).clamp_min(eps))
+    a0 = alpha[:, 0]
+    fx = (1 - a0) * (fx / t) + a0 * R[:, 0, 0]
+    fy = (1 - a0) * (fy / t) + a0 * R[:, 1, 0]
+    fz = (1 - a0) * (fz / t) + a0 * R[:, 2, 0]
+    fz = (fx * ux + fy * uy) / (-uz).clamp_max(-eps)
+    t2 = torch.sqrt((fx * fx + fy * fy + fz * fz).clamp_min(eps))
+    fx = fx / t2
+    fy = fy / t2
+    fz = fz / t2
+
+    r_new = torch.empty_like(R)
+    r_new[:, 0, 0] = fx
+    r_new[:, 0, 1] = uy * fz - uz * fy
+    r_new[:, 0, 2] = ux
+    r_new[:, 1, 0] = fy
+    r_new[:, 1, 1] = uz * fx - ux * fz
+    r_new[:, 1, 2] = uy
+    r_new[:, 2, 0] = fz
+    r_new[:, 2, 1] = ux * fy - uy * fx
+    r_new[:, 2, 2] = uz
+    return r_new
+
+
+@torch.no_grad()
+def probe_update_state_vec_common_upstream(device, batch_size=8):
+    """Classify whether update_state_vec sits on the shared upstream of proxy losses."""
+    B = int(batch_size)
+    R0 = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
+    dg = torch.zeros((B, 3), device=device)
+    z_drag_coef = torch.ones((B, 1), device=device)
+    drag_2 = torch.zeros((B, 2), device=device)
+    pitch_ctl_delay = torch.full((B, 1), 12.0, device=device)
+    act = torch.randn((B, 3), device=device) * 0.2
+    p = torch.randn((B, 3), device=device) * 0.1
+    v = torch.randn((B, 3), device=device) * 0.1
+    a = torch.randn((B, 3), device=device) * 0.1
+    v_wind = torch.zeros_like(v)
+    alpha = torch.zeros((B, 1), device=device)
+    v_pred = safe_normalize(torch.randn((B, 3), device=device), dim=-1)
+
+    act1 = torch.tanh(torch.randn((B, 3), device=device))
+    act_next, p1, v1, a1 = run_torch(
+        R0,
+        dg,
+        z_drag_coef,
+        drag_2,
+        pitch_ctl_delay,
+        act1,
+        act,
+        p,
+        v,
+        v_wind,
+        a,
+        0.4,
+        1.0 / 15.0,
+        0.5,
+    )
+
+    R1 = update_state_vec_torch(R0, act_next, v_pred, alpha, 2)
+    W = torch.randn((9, 3), device=device)
+    state_from_R = torch.cat([p1, v1, R1[:, :, 2]], dim=-1)
+    state_no_R = torch.cat([p1, v1, R0[:, :, 2]], dim=-1)
+    act2_from_R = torch.tanh(state_from_R @ W)
+    act2_no_R = torch.tanh(state_no_R @ W)
+
+    _, p2a, v2a, _ = run_torch(
+        R1,
+        dg,
+        z_drag_coef,
+        drag_2,
+        pitch_ctl_delay,
+        act2_from_R,
+        act_next,
+        p1,
+        v1,
+        v_wind,
+        a1,
+        0.4,
+        1.0 / 15.0,
+        0.5,
+    )
+    _, p2b, v2b, _ = run_torch(
+        R0,
+        dg,
+        z_drag_coef,
+        drag_2,
+        pitch_ctl_delay,
+        act2_no_R,
+        act_next,
+        p1,
+        v1,
+        v_wind,
+        a1,
+        0.4,
+        1.0 / 15.0,
+        0.5,
+    )
+    delta = (p2a - p2b).abs().mean().item() + (v2a - v2b).abs().mean().item()
+    return {
+        "is_common_upstream": bool(delta > 1e-5),
+        "delta": float(delta),
+    }
+
+
 def safe_normalize(x, dim=-1, eps=1e-6):
     x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return F.normalize(x, p=2, dim=dim, eps=eps)
@@ -116,8 +284,13 @@ class Env:
         self.hard_vpred_clip = max(0.1, float(hard_vpred_clip))
         self.hard_speed_clip = max(0.1, float(hard_speed_clip))
         self.start_goal_plane_y_abs = abs(float(start_goal_plane_y_abs))
+        self.use_meta_fallback = False
+        self.update_state_vec_in_meta_path = None
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
+
+    def set_meta_differentiable_mode(self, enabled):
+        self.use_meta_fallback = bool(enabled)
 
     def _scaled_count(self, base_count, min_count=1):
         return max(min_count, int(round(base_count * self.obstacle_count_scale)))
@@ -450,7 +623,8 @@ class Env:
             v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=self.hard_vpred_clip, neginf=-self.hard_vpred_clip).clamp(-self.hard_vpred_clip, self.hard_vpred_clip)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
-        self.act, p_free, v_free, a_free = run(
+        dyn_fn = run_torch if self.use_meta_fallback else run
+        self.act, p_free, v_free, a_free = dyn_fn(
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
             self.grad_decay, ctl_dt, 0.5)
@@ -468,7 +642,10 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
+        if self.use_meta_fallback:
+            self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
+        else:
+            self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)
         self.R = torch.nan_to_num(self.R, nan=0.0, posinf=1.0, neginf=-1.0)
 
     def _run(self, act_pred, ctl_dt=1/15, v_pred=None):

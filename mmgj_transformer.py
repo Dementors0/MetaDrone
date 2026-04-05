@@ -1,6 +1,5 @@
 #7.2
-#修改地圖起始位置和終點
-#可調整地圖大小和障礙物密度
+#添加梯度链路日志
 
 import argparse
 import atexit

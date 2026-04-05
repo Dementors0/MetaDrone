@@ -1,5 +1,5 @@
-#7.2
-#添加梯度链路日志
+#7.4
+#添加梯度链路日志增加路径修复二阶梯度
 
 import argparse
 import atexit

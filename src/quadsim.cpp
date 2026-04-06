@@ -72,6 +72,56 @@ std::vector<torch::Tensor> run_backward_cuda(
     float grad_decay,
     float ctl_dt);
 
+// Explicitly named wrappers for API clarity.
+std::vector<torch::Tensor> run_forward_first_order_cuda(
+        torch::Tensor R,
+        torch::Tensor dg,
+        torch::Tensor z_drag_coef,
+        torch::Tensor drag_2,
+        torch::Tensor pitch_ctl_delay,
+        torch::Tensor act_pred,
+        torch::Tensor act,
+        torch::Tensor p,
+        torch::Tensor v,
+        torch::Tensor v_wind,
+        torch::Tensor a,
+        float ctl_dt,
+        float airmode_av2a) {
+    return run_forward_cuda(
+            R, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+            act_pred, act, p, v, v_wind, a, ctl_dt, airmode_av2a);
+}
+
+std::vector<torch::Tensor> run_backward_first_order_cuda(
+        torch::Tensor R,
+        torch::Tensor dg,
+        torch::Tensor z_drag_coef,
+        torch::Tensor drag_2,
+        torch::Tensor pitch_ctl_delay,
+        torch::Tensor v,
+        torch::Tensor v_wind,
+        torch::Tensor act_next,
+        torch::Tensor _d_act_next,
+        torch::Tensor d_p_next,
+        torch::Tensor d_v_next,
+        torch::Tensor _d_a_next,
+        float grad_decay,
+        float ctl_dt) {
+    return run_backward_cuda(
+            R, dg, z_drag_coef, drag_2, pitch_ctl_delay,
+            v, v_wind, act_next, _d_act_next, d_p_next, d_v_next, _d_a_next,
+            grad_decay, ctl_dt);
+}
+
+torch::Tensor update_state_vec_first_order_cuda(
+        torch::Tensor R,
+        torch::Tensor a_thr,
+        torch::Tensor v_pred,
+        torch::Tensor alpha,
+        float yaw_inertia) {
+    return update_state_vec_cuda(R, a_thr, v_pred, alpha, yaw_inertia);
+}
+
 // C++ interface
 
 // // NOTE: AT_ASSERT has become AT_CHECK on master after 0.4.
@@ -102,4 +152,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run_forward", &run_forward_cuda, "run_forward_cuda (CUDA)");
   m.def("run_backward", &run_backward_cuda, "run_backward_cuda (CUDA)");
   m.def("rerender_backward", &rerender_backward_cuda, "rerender_backward_cuda (CUDA)");
+
+    // Explicit first-order aliases for training scripts to avoid API ambiguity.
+    m.def("run_forward_first_order", &run_forward_first_order_cuda, "run_forward first-order (CUDA)");
+    m.def("run_backward_first_order", &run_backward_first_order_cuda, "run_backward first-order (CUDA)");
+    m.def("update_state_vec_first_order", &update_state_vec_first_order_cuda, "update_state_vec first-order (CUDA)");
 }

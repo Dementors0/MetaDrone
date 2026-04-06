@@ -20,8 +20,9 @@ class LossGenNet(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
-        self.output_temperature = float(max(output_temperature, 1e-3))
-        self.weight_floor = float(min(max(weight_floor, 0.0), 0.249))
+        # Kept only for backward compatibility with older checkpoints/configs.
+        self.output_temperature = float(output_temperature)
+        self.weight_floor = float(weight_floor)
         
         # 1. 增强视觉特征提取 (3层卷积)
         # Input: [B, 1, 12, 16]
@@ -104,7 +105,7 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成权重（无约束输出，不做归一化）
+        # 5. 生成权重 logits（完全无约束，训练侧也不做裁剪/归一化）
         raw = self.head(last_token)
         weights = raw
 

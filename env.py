@@ -284,13 +284,19 @@ class Env:
         self.hard_vpred_clip = max(0.1, float(hard_vpred_clip))
         self.hard_speed_clip = max(0.1, float(hard_speed_clip))
         self.start_goal_plane_y_abs = abs(float(start_goal_plane_y_abs))
+        # LGN/meta phase should use the autograd-traceable dynamics path
+        # (run_torch + update_state_vec_torch) so higher-order gradients can flow.
+        self.use_meta_differentiable_dynamics = False
+        # Backward-compatible alias for older call sites.
         self.use_meta_fallback = False
         self.update_state_vec_in_meta_path = None
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
     def set_meta_differentiable_mode(self, enabled):
-        self.use_meta_fallback = bool(enabled)
+        enabled = bool(enabled)
+        self.use_meta_differentiable_dynamics = enabled
+        self.use_meta_fallback = enabled
 
     def _scaled_count(self, base_count, min_count=1):
         return max(min_count, int(round(base_count * self.obstacle_count_scale)))
@@ -623,7 +629,7 @@ class Env:
             v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=self.hard_vpred_clip, neginf=-self.hard_vpred_clip).clamp(-self.hard_vpred_clip, self.hard_vpred_clip)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
-        dyn_fn = run_torch if self.use_meta_fallback else run
+        dyn_fn = run_torch if self.use_meta_differentiable_dynamics else run
         self.act, p_free, v_free, a_free = dyn_fn(
             self.R, self.dg, self.z_drag_coef, self.drag_2, self.pitch_ctl_delay,
             act_pred, self.act, self.p, self.v, self.v_wind, self.a,
@@ -642,7 +648,7 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        if self.use_meta_fallback:
+        if self.use_meta_differentiable_dynamics:
             self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
         else:
             self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)

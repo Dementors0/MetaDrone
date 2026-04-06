@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import quadsim_cuda
 
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -113,6 +114,77 @@ inner_grad = torch.autograd.grad(meta_loss, act_pred_meta, create_graph=True, al
 second_grad = torch.autograd.grad(inner_grad.sum(), w, allow_unused=True)[0]
 assert second_grad is not None
 assert torch.isfinite(second_grad).all()
+
+
+# --- Real-rollout higher-order probe (proxy_loss(real dynamics) -> worker_grad -> LGN) ---
+B = 32
+T = 4
+feature_dim = 9
+
+worker = torch.nn.Linear(feature_dim, 3, bias=False).double().cuda()
+lgn_head = torch.nn.Linear(feature_dim, 4, bias=False).double().cuda()
+
+R_roll = torch.eye(3, dtype=torch.double, device='cuda').unsqueeze(0).repeat(B, 1, 1)
+p_roll = torch.randn((B, 3), dtype=torch.double, device='cuda') * 0.1
+v_roll = torch.randn((B, 3), dtype=torch.double, device='cuda') * 0.1
+a_roll = torch.randn((B, 3), dtype=torch.double, device='cuda') * 0.05
+act_roll = torch.randn((B, 3), dtype=torch.double, device='cuda') * 0.05
+v_wind_roll = torch.zeros((B, 3), dtype=torch.double, device='cuda')
+p_target_roll = torch.tensor([0.0, 3.0, 1.0], dtype=torch.double, device='cuda').view(1, 3).repeat(B, 1)
+
+proxy_terms = []
+for _ in range(T):
+    feat = torch.cat([p_roll, v_roll, R_roll[:, :, 2]], dim=-1)
+    raw_w = lgn_head(feat)
+    weights = F.softplus(raw_w) + 0.01  # non-normalized positive weights
+
+    act_pred_roll = worker(feat)
+    act_next_roll, p_next_roll, v_next_roll, a_next_roll = run_torch(
+        R_roll, dg[:B], z_drag_coef[:B], drag_2[:B], pitch_ctl_delay[:B],
+        act_pred_roll, act_roll, p_roll, v_roll, v_wind_roll, a_roll,
+        grad_decay, ctl_dt, 0.5,
+    )
+    alpha_roll = torch.exp(-pitch_ctl_delay[:B] * ctl_dt)
+    R_next_roll = update_state_vec_torch(R_roll, act_next_roll, v_next_roll, alpha_roll, 2)
+
+    speed = v_next_roll.norm(2, -1)
+    dir_term = 1.0 - (F.normalize(v_next_roll, dim=-1, eps=1e-6) * F.normalize(p_target_roll - p_next_roll, dim=-1, eps=1e-6)).sum(-1)
+    # Synthetic clearance surrogate that still depends on real rollout states.
+    dist_obj_roll = p_next_roll[:, 2] - 0.3
+    avoid = F.softplus((0.35 - dist_obj_roll) * 12.0)
+    expl = torch.exp(-((p_next_roll - p_roll).pow(2).sum(-1)))
+
+    proxy_step = (
+        weights[:, 0] * speed
+        + weights[:, 1] * dir_term
+        + weights[:, 2] * avoid
+        + weights[:, 3] * expl
+    ).mean()
+    proxy_terms.append(proxy_step)
+
+    act_roll, p_roll, v_roll, a_roll, R_roll = act_next_roll, p_next_roll, v_next_roll, a_next_roll, R_next_roll
+
+proxy_real_rollout = torch.stack(proxy_terms).mean()
+worker_grads_real = torch.autograd.grad(proxy_real_rollout, tuple(worker.parameters()), create_graph=True, allow_unused=False)
+meta_obj_real = sum(g.pow(2).mean() for g in worker_grads_real)
+lgn_meta_grads_real = torch.autograd.grad(meta_obj_real, tuple(lgn_head.parameters()), allow_unused=True)
+assert all(g is not None for g in lgn_meta_grads_real)
+assert all(torch.isfinite(g).all() for g in lgn_meta_grads_real if g is not None)
+
+
+# --- update_state_vec isolated double-backward probe ---
+w_update = torch.randn((1,), dtype=torch.double, device='cuda', requires_grad=True)
+R_u = torch.eye(3, dtype=torch.double, device='cuda').unsqueeze(0).repeat(B, 1, 1)
+a_thr_u = torch.randn((B, 3), dtype=torch.double, device='cuda', requires_grad=True) + w_update
+v_pred_u = torch.randn((B, 3), dtype=torch.double, device='cuda')
+alpha_u = torch.sigmoid(torch.randn((B, 1), dtype=torch.double, device='cuda'))
+
+R_u_next = update_state_vec_torch(R_u, a_thr_u, v_pred_u, alpha_u, 2)
+loss_u = (R_u_next[:, :, 0].pow(2).mean() + R_u_next[:, :, 2].pow(2).mean())
+g1_u = torch.autograd.grad(loss_u, a_thr_u, create_graph=True, allow_unused=False)[0]
+g2_u = torch.autograd.grad(g1_u.sum(), w_update, allow_unused=True)[0]
+assert g2_u is not None
+assert torch.isfinite(g2_u).all()
 
 # CUDA custom backward path: still first-order only for higher-order chain.
 w2 = torch.randn((1,), dtype=torch.double, device='cuda', requires_grad=True)

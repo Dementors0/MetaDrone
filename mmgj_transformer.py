@@ -89,27 +89,6 @@ class RunningMeanStd(nn.Module):
                 self.count.copy_(tot_count)
         return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
 
-class LossNormalizer:
-    """Tracks running std of each loss component for scale normalization.
-    Ensures all loss components contribute equally regardless of raw magnitude.
-    Division is differentiable; statistics are detached."""
-    def __init__(self, n_losses, momentum=0.01):
-        self.running_std = [1.0] * n_losses
-        self.momentum = momentum
-
-    def normalize(self, *losses):
-        normalized = []
-        for i, loss in enumerate(losses):
-            with torch.no_grad():
-                batch_std = loss.detach().std()
-                if not torch.isfinite(batch_std):
-                    batch_std = torch.tensor(1.0, device=loss.device)
-                batch_std = max(batch_std.item(), 1e-6)
-                self.running_std[i] = (1 - self.momentum) * self.running_std[i] + self.momentum * batch_std
-            normalized.append(loss / self.running_std[i])
-        return normalized
-
-
 def safe_normalize(x, dim=-1, eps=1e-6):
     return F.normalize(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, eps=eps)
 
@@ -133,7 +112,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--num_iters', type=int, default=5000000)
 
 # [优化策略参数]
@@ -162,7 +141,7 @@ parser.add_argument('--timesteps', type=int, default=300)
 parser.add_argument('--lgn_timesteps', type=int, default=40,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--exploration_time_window', type=int, default=50,
-                    help='Look-back gap for exploration overlap loss; effective window is auto-clipped to rollout_len-1')
+                    help='Look-back gap for exploration overlap loss; effective window is auto-clipped to keep valid long-range pairs')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
 parser.add_argument('--cam_angle', type=int, default=10)
@@ -184,25 +163,29 @@ parser.add_argument('--random_rotation', default=False, action='store_true')
 parser.add_argument('--no_odom', default=False, action='store_true')
 
 # 学习率
-parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--lgn_lr', type=float, default=2e-4)
-parser.add_argument('--inner_lr', type=float, default=3e-3,
+parser.add_argument('--inner_lr', type=float, default=5e-4,
                     help='Inner loop LR for differentiable worker update in LGN phase')
 parser.add_argument('--inner_steps', type=int, default=1,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
-parser.add_argument('--inner_grad_clip', type=float, default=50.0,
+parser.add_argument('--inner_grad_clip', type=float, default=10.0,
                     help='Global-norm cap for differentiable inner gradients to stabilize second-order chain')
-parser.add_argument('--lgn_proxy_aux_weight', type=float, default=0.2,
+parser.add_argument('--lgn_proxy_aux_weight', type=float, default=0.02,
                     help='Auxiliary proxy-loss weight for LGN update; also used as fallback update when meta gradients are unusable')
+parser.add_argument('--lgn_allow_proxy_fallback', default=False, action='store_true',
+                    help='Allow proxy-only fallback update when unrolled meta gradients to LGN are unusable')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
 # 避障/碰撞超参
 parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
                     help='Proxy avoidance rises smoothly inside this clearance to walls')
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
-                    help='Temperature for LGN softmax output (lower = sharper)')
+                    help='Compatibility arg (unused): LGN output is used as raw unconstrained weights')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
-                    help='Minimum per-channel LGN weight after simplex projection')
+                    help='Compatibility arg (unused): no floor constraint is applied to LGN weights')
+parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
+                    help='Compatibility arg (unused): no ceiling constraint is applied to LGN weights')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
                     help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
@@ -217,6 +200,20 @@ parser.add_argument('--meta_coll_event_threshold', type=float, default=0.01,
                     help='Penetration-depth threshold (m) where differentiable collision-event penalty turns on')
 parser.add_argument('--speed_near_obs_floor', type=float, default=0.05,
                     help='Minimum speed factor near obstacles in adaptive speed target (lower = stronger braking)')
+parser.add_argument('--stuck_loss_weight', type=float, default=2.0,
+                    help='Weight for local displacement-based stuck penalty')
+parser.add_argument('--stuck_window', type=int, default=15,
+                    help='Window size for stuck detection (steps)')
+parser.add_argument('--stuck_displacement_threshold', type=float, default=0.3,
+                    help='Minimum displacement in window before stuck penalty activates (m)')
+parser.add_argument('--collision_duration_weight', type=float, default=10.0,
+                    help='Weight for collision-duration diagnostic penalty')
+parser.add_argument('--meta_smooth_jerk_weight', type=float, default=0.001,
+                    help='Meta loss weight for first-order action difference (jerk) smoothing')
+parser.add_argument('--meta_smooth_snap_weight', type=float, default=0.0002,
+                    help='Meta loss weight for second-order normalized action difference (snap) smoothing')
+parser.add_argument('--meta_smooth_v_pred_weight', type=float, default=0.1,
+                    help='Meta loss weight for velocity prediction error')
 
 # 全局规划引导元损失参数
 parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
@@ -246,8 +243,6 @@ parser.add_argument('--guide_collision_threshold', type=float, default=-0.05,
                     help='Penetration threshold below which point is considered collided')
 parser.add_argument('--guide_accel_weight', type=float, default=0.1,
                     help='Weight for acceleration mismatch penalty (deceleration requirement)')
-parser.add_argument('--unrolled_guidance_weight', type=float, default=0.0,
-                    help='Guidance-loss weight used in unrolled meta rollout; default 0.0 for second-order stability')
 parser.add_argument('--planner_resolution', type=float, default=0.3,
                     help='Resolution of the occupancy grid for A* planning (meters)')
 parser.add_argument('--planner_margin', type=float, default=0.15,
@@ -359,8 +354,6 @@ state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
 optim_worker = AdamW(worknet.parameters(), args.lr)
 optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
-
-loss_normalizer = LossNormalizer(4)  # normalize 4 loss components to equal scale
 
 ########## 6. 辅助函数 ##########
 scaler_q = defaultdict(list)
@@ -1181,6 +1174,7 @@ def _plan_sample_points_worker(payload):
     cyl_h_np = payload['cyl_h']
     sampled_positions = payload['sampled_positions']  # [S, 3]
     sampled_dist = payload['sampled_dist']            # [S]
+    sampled_steps = payload.get('sampled_steps', None)
     goal_np = payload['goal']                         # [3]
     resolution = float(payload['resolution'])
     margin = float(payload['margin'])
@@ -1220,19 +1214,26 @@ def _plan_sample_points_worker(payload):
     lat_sum = 0.0
     lat_max = 0.0
     metric_count = 0
+    sampled_paths = []
 
     for s in range(S):
         pos_np = sampled_positions[s]
         dist = float(sampled_dist[s])
 
+        step_t = int(sampled_steps[s]) if sampled_steps is not None else int(s)
+
         if dist < invalid_dist_threshold:
+            sampled_paths.append((step_t, None))
             continue
 
         plan_total += 1
         path = planner.plan_astar(pos_np, goal_np)
         if path is None:
+            sampled_paths.append((step_t, None))
             continue
         path = planner.smooth_path(path, window_size=5)
+        path_np = np.asarray(path, dtype=np.float32)
+        sampled_paths.append((step_t, path_np))
 
         ref_info = planner.extract_reference_from_path(
             pos_np,
@@ -1271,6 +1272,7 @@ def _plan_sample_points_worker(payload):
         'lat_sum': float(lat_sum),
         'lat_max': float(lat_max),
         'metric_count': int(metric_count),
+        'sampled_paths': sampled_paths,
     }
 
 
@@ -1280,7 +1282,8 @@ global_planner = GlobalPlanner(resolution=0.3, margin=0.15)
 
 def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, planner: GlobalPlanner,
                                              max_speed=5.0, max_accel=5.0, max_decel=6.0,
-                                             lookahead_dist=1.0, invalid_dist_threshold=-0.05):
+                                             lookahead_dist=1.0, invalid_dist_threshold=-0.05,
+                                             sampled_steps=None):
     """
     使用全局规划器生成参考方向、速度、加速度和横向偏差
 
@@ -1332,6 +1335,7 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
     metric_count = 0
     sample_plan_total = 0
     sample_plan_success = 0
+    sampled_astar_paths = [[] for _ in range(B)]
 
     used_parallel = False
     pool = _get_planner_pool()
@@ -1351,6 +1355,10 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
                     'cyl_h': np.asarray(cyl_h_np, dtype=np.float32),
                     'sampled_positions': np.asarray(p[:, b].detach().cpu().numpy(), dtype=np.float32),
                     'sampled_dist': np.asarray(dist_obj[:, b].detach().cpu().numpy(), dtype=np.float32),
+                    'sampled_steps': (
+                        np.asarray(sampled_steps[:, b].detach().cpu().numpy(), dtype=np.int64)
+                        if sampled_steps is not None else None
+                    ),
                     'goal': np.asarray(p_target[b].detach().cpu().numpy(), dtype=np.float32),
                     'resolution': planner.resolution,
                     'margin': planner.margin,
@@ -1380,6 +1388,13 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
                 lat_sum += float(out['lat_sum'])
                 lat_max = max(lat_max, float(out['lat_max']))
                 metric_count += int(out['metric_count'])
+
+                out_paths = out.get('sampled_paths', [])
+                for item in out_paths:
+                    if item is None:
+                        continue
+                    step_t, path_s = item
+                    sampled_astar_paths[b].append((int(step_t), np.asarray(path_s, dtype=np.float32)))
         except Exception:
             used_parallel = False
 
@@ -1402,14 +1417,20 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
                 pos_np = p[s, b].detach().cpu().numpy()
                 dist = dist_obj[s, b].item()
 
+                step_t = int(sampled_steps[s, b].item()) if sampled_steps is not None else int(s)
+
                 if dist < invalid_dist_threshold:
+                    sampled_astar_paths[b].append((step_t, None))
                     continue
 
                 sample_plan_total += 1
                 path = planner.plan_astar(pos_np, goal_np)
                 if path is None:
+                    sampled_astar_paths[b].append((step_t, None))
                     continue
                 path = planner.smooth_path(path, window_size=5)
+                path_np = np.asarray(path, dtype=np.float32)
+                sampled_astar_paths[b].append((step_t, path_np))
 
                 ref_info = planner.extract_reference_from_path(
                     pos_np, path,
@@ -1445,6 +1466,7 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
         'reference_valid_ratio': float(valid_mask.float().mean().item()),
         'sample_plan_total': int(sample_plan_total),
         'sample_plan_success': int(sample_plan_success),
+        'sampled_astar_paths': sampled_astar_paths,
     }
 
     if squeeze_output:
@@ -1647,6 +1669,7 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
         max_speed=max_speed, max_accel=max_accel, max_decel=max_decel,
         lookahead_dist=1.0,
         invalid_dist_threshold=collision_threshold,
+        sampled_steps=sample_indices,
     )
 
     # 4. 计算各项损失
@@ -1758,6 +1781,7 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
         'max_lateral_error': planner_info.get('max_lateral_error', 0.0),
         'planner_success_ratio': planner_info.get('planner_success_ratio', 0.0),
         'avg_ref_speed': ref_speed.mean().item(),
+        'sampled_astar_paths': planner_info.get('sampled_astar_paths', []),
     }
 
     return guidance_loss, loss_components
@@ -1909,8 +1933,9 @@ def _is_ceiling_or_side_boundary_voxel(box_xyz_half, env):
     return bool(side_x or side_y or ceiling)
 
 
-def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5):
-    """保存交互式3D轨迹HTML，带有无人机姿态坐标系
+def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5,
+                             astar_path=None, astar_paths_sampled=None):
+    """保存交互式3D轨迹HTML，带有无人机姿态坐标系和A*全局引导轨迹
 
     Args:
         R_cpu: 姿态矩阵 [T, 3, 3]，如果提供则绘制坐标系
@@ -1938,6 +1963,81 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         line=dict(color='limegreen', width=5),
         name='Trajectory'
     ))
+
+    # 绘制全局A*引导轨迹（起点到终点）
+    if astar_path is not None and len(astar_path) > 1:
+        fig.add_trace(go.Scatter3d(
+            x=astar_path[:, 0], y=astar_path[:, 1], z=astar_path[:, 2],
+            mode='lines+markers',
+            marker=dict(size=2, color='gold', symbol='diamond'),
+            line=dict(color='orange', width=4, dash='dash'),
+            name='A* Global Path'
+        ))
+
+    # 绘制采样点对应的所有A*轨迹（直接复用已计算结果，不额外规划）
+    if astar_paths_sampled is not None and len(astar_paths_sampled) > 0:
+        normalized_paths = []
+        for item in astar_paths_sampled:
+            if item is None:
+                continue
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                sample_t, path = item
+            else:
+                # Fallback for legacy/malformed records: treat as path-only entry.
+                sample_t, path = 0, item
+
+            path_arr = None
+            if path is not None:
+                try:
+                    if isinstance(path, torch.Tensor):
+                        path_arr = path.detach().cpu().numpy()
+                    else:
+                        path_arr = np.asarray(path)
+                    if path_arr.ndim == 1 and path_arr.size == 3:
+                        path_arr = path_arr.reshape(1, 3)
+                    if not (path_arr.ndim == 2 and path_arr.shape[1] == 3):
+                        path_arr = None
+                except Exception:
+                    path_arr = None
+
+            normalized_paths.append((sample_t, path_arr))
+
+        num_paths = len(normalized_paths)
+        for path_idx, (sample_t, path) in enumerate(normalized_paths):
+            color_ratio = path_idx / max(num_paths - 1, 1)
+            r = int(100 + 100 * color_ratio)
+            g = int(150 * (1 - color_ratio))
+            b = int(200 + 55 * color_ratio)
+            color = f'rgb({r},{g},{b})'
+
+            if path is not None and len(path) >= 2:
+                fig.add_trace(go.Scatter3d(
+                    x=path[:, 0], y=path[:, 1], z=path[:, 2],
+                    mode='lines',
+                    line=dict(color=color, width=2),
+                    opacity=0.6,
+                    showlegend=(path_idx == 0),
+                    name='A* Sampled Paths' if path_idx == 0 else None,
+                    legendgroup='astar_sampled',
+                    hovertemplate=f't={sample_t}<br>x=%{{x:.2f}}<br>y=%{{y:.2f}}<br>z=%{{z:.2f}}<extra></extra>'
+                ))
+
+            # 标记采样锚点，便于核对“路径从采样点出发”
+            try:
+                sample_t_int = int(np.asarray(sample_t).reshape(-1)[0])
+            except Exception:
+                sample_t_int = 0
+            t_idx = int(max(0, min(sample_t_int, len(traj_xyz) - 1)))
+            anchor = traj_xyz[t_idx]
+            fig.add_trace(go.Scatter3d(
+                x=[anchor[0]], y=[anchor[1]], z=[anchor[2]],
+                mode='markers',
+                marker=dict(size=4, color='orange', symbol='cross'),
+                showlegend=(path_idx == 0),
+                name='A* Sample Anchors' if path_idx == 0 else None,
+                legendgroup='astar_sampled_anchor',
+                hovertemplate=f'anchor t={sample_t}<br>x=%{{x:.2f}}<br>y=%{{y:.2f}}<br>z=%{{z:.2f}}<extra></extra>'
+            ))
 
     # 绘制无人机姿态坐标系 (X-红, Y-绿, Z-蓝)
     if R_cpu is not None:
@@ -2035,6 +2135,29 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         x_vals.append([tgt[0]])
         y_vals.append([tgt[1]])
         z_vals.append([tgt[2]])
+
+    if astar_path is not None and len(astar_path) > 0:
+        x_vals.append(astar_path[:, 0])
+        y_vals.append(astar_path[:, 1])
+        z_vals.append(astar_path[:, 2])
+
+    if astar_paths_sampled is not None:
+        for item in astar_paths_sampled:
+            if not (isinstance(item, (tuple, list)) and len(item) == 2):
+                continue
+            _, path = item
+            if path is None:
+                continue
+            try:
+                path_arr = path.detach().cpu().numpy() if isinstance(path, torch.Tensor) else np.asarray(path)
+                if path_arr.ndim == 1 and path_arr.size == 3:
+                    path_arr = path_arr.reshape(1, 3)
+                if path_arr.ndim == 2 and path_arr.shape[1] == 3 and path_arr.shape[0] > 0:
+                    x_vals.append(path_arr[:, 0])
+                    y_vals.append(path_arr[:, 1])
+                    z_vals.append(path_arr[:, 2])
+            except Exception:
+                continue
 
     x_all = np.concatenate([np.asarray(v) for v in x_vals])
     y_all = np.concatenate([np.asarray(v) for v in y_vals])
@@ -2135,7 +2258,7 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     """
     p_history = p_history.permute(1, 0, 2) # [B, T, 3]
     n_batch, n_points, n_dims = p_history.shape
-    
+
     if n_points < time_window + 1:
         return torch.zeros((n_batch, n_points), device=p_history.device)
 
@@ -2156,6 +2279,39 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     return loss_per_step
 
 
+def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement_threshold=0.3):
+    """
+    计算卡住惩罚损失
+
+    检测两种卡住状态：
+    1. 局部窗口内位移过小
+    2. 持续碰撞状态
+    """
+    T, B, _ = p_history.shape
+    device = p_history.device
+
+    loss_stuck = torch.zeros((T, B), device=device)
+    if T > stuck_window:
+        for t in range(stuck_window, T):
+            window_start = t - stuck_window
+            displacement = safe_l2_norm(p_history[t] - p_history[window_start], dim=-1)  # [B]
+            loss_stuck[t] = F.softplus((displacement_threshold - displacement) * 10.0)
+
+    in_collision = (collision_depth > 0).float()  # [T, B]
+    loss_collision_duration = torch.zeros_like(in_collision)
+
+    collision_streak = torch.zeros((B,), device=device)
+    for t in range(T):
+        collision_streak = collision_streak * in_collision[t] + in_collision[t]
+        loss_collision_duration[t] = collision_streak * in_collision[t]
+
+    with torch.no_grad():
+        stuck_mask = loss_stuck > 0.5
+        stuck_ratio = stuck_mask.float().mean()
+
+    return loss_stuck, loss_collision_duration, stuck_ratio
+
+
 def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
     """
     Validation rollout with virtually-updated worker params (via functional_call).
@@ -2169,6 +2325,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     p_list, v_list, a_list, vec_list = [], [], [], []
     act_buf = [env.act.detach()] * 2
+    v_preds_val = []
     h_val = None
 
     for t in range(args.lgn_timesteps):
@@ -2205,6 +2362,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
+        v_preds_val.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
@@ -2232,45 +2390,62 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 
     dist_val = sanitize_tensor(safe_l2_norm(vec_val, dim=-1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
 
-    m_pos  = safe_l2_norm(p_val[-1] - env.p_target, dim=-1).mean()
     collision_depth_val = F.relu(-dist_val)
-    m_coll_soft = F.softplus(-dist_val * 32.0).clamp(max=100.0).mean()
-    m_coll_hard = collision_depth_val.pow(2).mean()
-    m_coll_peak = collision_depth_val.max(dim=0).values
-    m_coll_event = torch.sigmoid((m_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp).mean()
-    m_coll = (args.meta_coll_soft_weight * m_coll_soft
-              + args.meta_coll_hard_weight * m_coll_hard
-              + args.meta_coll_event_weight * m_coll_event)
+    loss_stuck_val, loss_collision_duration_val, stuck_ratio = compute_stuck_loss(
+        p_val, collision_depth_val,
+        stuck_window=args.stuck_window,
+        displacement_threshold=args.stuck_displacement_threshold,
+    )
+
+    m_pos  = safe_l2_norm(p_val[-1] - env.p_target, dim=-1).mean()
+    with torch.no_grad():
+        v_to_pt = torch.ones_like(dist_val)
+        if dist_val.shape[0] > 1:
+            v_to_pt[1:] = (-torch.diff(dist_val, 1, 0) * 135.0).clamp_min(1.0)
+    m_coll = (F.softplus(dist_val.mul(-32.0)) * v_to_pt).mean()
     m_ctrl = safe_l2_norm(act_val, dim=-1).sum()
+    m_jerk = act_val.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
+    m_snap = (F.normalize(act_val - env.g_std, dim=-1)
+              .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
     # Meta rollout 的高度惩罚，与主训练分支保持一致
     m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
                + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
                + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
-    # 全局规划引导损失（默认不进入 unrolled 二阶链路，必要时可通过参数开启）
-    if args.unrolled_guidance_weight > 0.0:
-        v_val = torch.stack(v_list)  # [T, B, 3]
-        m_guidance, _ = compute_global_guidance_meta_loss(
-            env, p_val, v_val, env.p_target, vec_val, dist_val,
-            a_history=a_val,
-            sample_count=args.guide_sample_count,
-            strategy=args.guide_sample_strategy,
-            max_speed=float(env.max_speed),
-            max_accel=args.guide_max_accel,
-            max_decel=args.guide_max_decel,
-            dir_weight=args.guide_dir_weight,
-            speed_weight=args.guide_speed_weight,
-            lateral_weight=args.guide_lateral_weight,
-            escape_weight=args.guide_escape_weight,
-            collision_threshold=args.guide_collision_threshold,
-            accel_weight=args.guide_accel_weight,
-            speed_diff_weight=args.guide_speed_diff_weight,
-            recovery_speed_weight=args.guide_recovery_speed_weight,
-        )
-    else:
-        m_guidance = p_val.new_zeros(())
+    v_preds_val_tensor = torch.stack(v_preds_val)  # [T, B, 3]
+    v_val = torch.stack(v_list)  # [T, B, 3]
+    m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
+    m_stuck = loss_stuck_val.mean()
 
-    meta_val = m_pos + m_coll + m_height * 2.0 + args.unrolled_guidance_weight * m_guidance
+    # 全局规划引导损失：始终进入 unrolled 二阶链路
+    m_guidance, _ = compute_global_guidance_meta_loss(
+        env, p_val, v_val, env.p_target, vec_val, dist_val,
+        a_history=a_val,
+        sample_count=args.guide_sample_count,
+        strategy=args.guide_sample_strategy,
+        max_speed=float(env.max_speed),
+        max_accel=args.guide_max_accel,
+        max_decel=args.guide_max_decel,
+        dir_weight=args.guide_dir_weight,
+        speed_weight=args.guide_speed_weight,
+        lateral_weight=args.guide_lateral_weight,
+        escape_weight=args.guide_escape_weight,
+        collision_threshold=args.guide_collision_threshold,
+        accel_weight=args.guide_accel_weight,
+        speed_diff_weight=args.guide_speed_diff_weight,
+        recovery_speed_weight=args.guide_recovery_speed_weight,
+    )
+
+    meta_val = (
+        m_pos
+        + m_coll
+        + m_height
+        + args.meta_guidance_weight * m_guidance
+        + args.meta_smooth_jerk_weight * m_jerk
+        + args.meta_smooth_snap_weight * m_snap
+        + args.meta_smooth_v_pred_weight * m_v_pred
+        + args.stuck_loss_weight * m_stuck
+    )
     return meta_val, m_pos, m_coll, m_ctrl
 
 ########## 7. 训练主循环 ##########
@@ -2311,6 +2486,7 @@ for i in pbar:
     depth_history = []
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
+    v_preds = []
     act_for_diag = None
 
     h = None
@@ -2352,7 +2528,7 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        # LGN Forward (无约束原始权重)
+        # LGN Forward (训练侧执行正值非归一化约束)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
 
         if t == 0 and _diag_should_log(i):
@@ -2369,6 +2545,7 @@ for i in pbar:
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         act_for_diag = act
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+        v_preds.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         real_act_history.append(real_act)
@@ -2422,33 +2599,27 @@ for i in pbar:
     v_dir = safe_normalize(v_history, dim=-1)
     loss_direction_seq = (1.0 - (v_dir * target_dir).sum(-1))
 
-    # 多尺度避障 + 前瞻碰撞预测
-    vec_to_pt_dir = safe_normalize(vec_to_pt, dim=-1)
-    approach_speed = (v_history * vec_to_pt_dir).sum(-1)  # 正值=正在靠近障碍物
-    dist_future_02 = dist_obj - F.relu(approach_speed) * 0.2  # 0.2s前瞻
-    dist_future_04 = dist_obj - F.relu(approach_speed) * 0.4  # 0.4s前瞻
-    collision_depth = F.relu(-dist_obj)
-    safe_margin = args.avoid_safe_margin
-    loss_avoidance_seq = (
-        F.softplus((safe_margin - dist_obj) * 12.0) +
-        0.5 * F.softplus(-dist_obj * 32.0) +
-        0.3 * F.softplus((safe_margin - dist_future_02) * 10.0) +
-        0.2 * F.softplus((safe_margin - dist_future_04) * 10.0) +
-        collision_depth.pow(2)
-    )
+    with torch.no_grad():
+        v_to_pt = torch.ones_like(dist_obj)
+        if dist_obj.shape[0] > 1:
+            v_to_pt[1:] = (-torch.diff(dist_obj, 1, 0) * 135.0).clamp_min(1.0)
 
-    actual_T = p_history.shape[0]
-    exploration_window = min(int(args.exploration_time_window), max(0, actual_T - 1))
-    if _diag_should_log(i) and exploration_window != int(args.exploration_time_window):
-        print(
-            f"[DIAG iter={i}] exploration_time_window adjusted: "
-            f"requested={int(args.exploration_time_window)}, effective={exploration_window}, rollout_steps={actual_T}"
-        )
+    collision_depth = F.relu(-dist_obj)
+    loss_avoidance_seq = v_to_pt * (1.0 - dist_obj).relu().pow(2)
+    loss_collision_seq = F.softplus(dist_obj.mul(-32.0)) * v_to_pt
 
     # 注意: compute_overlap_loss_per_step 返回 [B, T], 需要 permute 成 [T, B]
     loss_exploration_seq = compute_overlap_loss_per_step(
-        p_history, sigma=1.0, time_window=exploration_window
+        p_history, sigma=1.0, time_window=int(args.exploration_time_window)
     ).permute(1, 0)
+
+    loss_stuck_seq, loss_collision_duration_seq, stuck_ratio = compute_stuck_loss(
+        p_history, collision_depth,
+        stuck_window=args.stuck_window,
+        displacement_threshold=args.stuck_displacement_threshold,
+    )
+    loss_stuck_total = args.stuck_loss_weight * loss_stuck_seq.mean()
+    actual_T = p_history.shape[0]
 
     # 高度约束损失 (固定权重, 不经LGN控制)
     z_pos = p_history[:, :, 2]  # [T, B]
@@ -2458,21 +2629,21 @@ for i in pbar:
                        + F.softplus((z_pos - z_max) * 20.0)
                        + F.softplus((z_min - z_pos) * 20.0))
 
-    # 归一化各损失项到相同尺度 (可微除法, 统计量不反传)
-    loss_speed_n, loss_dir_n, loss_avoid_n, loss_expl_n = \
-        loss_normalizer.normalize(
-            loss_speed_seq, loss_direction_seq, loss_avoidance_seq, loss_exploration_seq
-        )
-
-    # 纯学习模式: 直接使用 LGN 原始输出，不做归一化/非负约束
+    # 有界负权重策略:
+    # speed/direction/exploration 允许轻微反向(-0.2及以上), avoidance 保持非负
     weights_seq_raw = weights_seq
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
         print(
-            f"[DIAG iter={i}] loss_n requires_grad: speed={loss_speed_n.requires_grad}, "
-            f"dir={loss_dir_n.requires_grad}, avoid={loss_avoid_n.requires_grad}, expl={loss_expl_n.requires_grad}"
+            f"[DIAG iter={i}] loss_raw requires_grad: speed={loss_speed_seq.requires_grad}, "
+            f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, expl={loss_exploration_seq.requires_grad}"
         )
-    effective_weights_seq = weights_seq_raw
+    effective_weights_seq = torch.stack([
+        weights_seq_raw[:, :, 0].clamp(min=-0.2),
+        weights_seq_raw[:, :, 1].clamp(min=-0.2),
+        weights_seq_raw[:, :, 2].clamp(min=0.0),
+        weights_seq_raw[:, :, 3].clamp(min=-0.2),
+    ], dim=-1)
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
@@ -2481,14 +2652,15 @@ for i in pbar:
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
-        effective_weights_seq[:, :, 0] * loss_speed_n +
-        effective_weights_seq[:, :, 1] * loss_dir_n +
-        effective_weights_seq[:, :, 2] * loss_avoid_n +
-        effective_weights_seq[:, :, 3] * loss_expl_n
+        effective_weights_seq[:, :, 0] * loss_speed_seq +
+        effective_weights_seq[:, :, 1] * loss_direction_seq +
+        effective_weights_seq[:, :, 2] * loss_avoidance_seq +
+        effective_weights_seq[:, :, 3] * loss_exploration_seq
     )
 
-    # 3. 最终 Proxy Loss (含固定权重的高度约束)
-    proxy_loss = weighted_loss_map.mean() + 2.0 * loss_height_seq.mean()
+    # 3. 最终 Proxy Loss + 权重幅值正则，抑制单项权重塌缩放大
+    weight_l2 = effective_weights_seq.pow(2).mean()
+    proxy_loss = weighted_loss_map.mean() + 0.001 * weight_l2
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
@@ -2498,6 +2670,7 @@ for i in pbar:
             f"[DIAG iter={i}] proxy_loss: requires_grad={proxy_loss.requires_grad}, "
             f"grad_fn={type(proxy_loss.grad_fn).__name__ if proxy_loss.grad_fn else 'None'}"
         )
+        print(f"[DIAG iter={i}] weight_l2={float(weight_l2.detach().item()):.6f}")
 
         _diag_tensor_finite("act_for_diag", act_for_diag, i)
         _diag_tensor_finite("real_act_history", real_act_history, i)
@@ -2516,20 +2689,14 @@ for i in pbar:
 
     # --- Meta Loss Components ---
     loss_meta_pos = safe_l2_norm(p_history[-1] - env.p_target, dim=-1).mean()
-    loss_meta_coll_soft = F.softplus(-dist_obj * 32.0).clamp(max=100.0).mean()
-    loss_meta_coll_hard = collision_depth.pow(2).mean()
-    loss_meta_coll_peak = collision_depth.max(dim=0).values
-    loss_meta_coll_event = torch.sigmoid(
-        (loss_meta_coll_peak - args.meta_coll_event_threshold) * args.meta_coll_event_temp
-    ).mean()
-    loss_meta_coll_event_rate = (loss_meta_coll_peak > 0).float().mean()
-    loss_meta_coll = (
-        args.meta_coll_soft_weight * loss_meta_coll_soft
-        + args.meta_coll_hard_weight * loss_meta_coll_hard
-        + args.meta_coll_event_weight * loss_meta_coll_event
-    )
+    loss_meta_coll = loss_collision_seq.mean()
     loss_meta_ctrl = safe_l2_norm(act_buffer, dim=-1).sum()
+    loss_meta_jerk = act_buffer.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
+    loss_meta_snap = (F.normalize(act_buffer - env.g_std, dim=-1)
+                      .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
     loss_meta_height = loss_height_seq.mean()
+    v_preds_tensor = torch.stack(v_preds)  # [T, B, 3]
+    loss_meta_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
 
     # --- 全局规划引导损失 ---
     # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
@@ -2574,14 +2741,20 @@ for i in pbar:
             'max_lateral_error': 0.0,
             'planner_success_ratio': 0.0,
             'avg_ref_speed': 0.0,
+            'sampled_astar_paths': [],
         }
 
     # 训练目标仅使用位置/碰撞/高度/引导; 控制项仅用于日志监控
+    loss_meta_stuck = loss_stuck_seq.mean()
     meta_loss = (
         loss_meta_pos +
         loss_meta_coll +
-        loss_meta_height * 2.0 +
-        args.meta_guidance_weight * loss_meta_guidance
+        loss_meta_height +
+        args.meta_guidance_weight * loss_meta_guidance +
+        args.meta_smooth_jerk_weight * loss_meta_jerk +
+        args.meta_smooth_snap_weight * loss_meta_snap +
+        args.meta_smooth_v_pred_weight * loss_meta_v_pred +
+        args.stuck_loss_weight * loss_meta_stuck
     )
     if _diag_should_log(i):
         _diag_tensor_finite("meta_loss", meta_loss, i)
@@ -2679,10 +2852,10 @@ for i in pbar:
 
                 if args.diag_second_order:
                     # Probe weighted per-term proxy components so each branch truly depends on LGN weights.
-                    weighted_speed = (effective_weights_seq[:, :, 0] * loss_speed_n).mean()
-                    weighted_dir = (effective_weights_seq[:, :, 1] * loss_dir_n).mean()
-                    weighted_avoid = (effective_weights_seq[:, :, 2] * loss_avoid_n).mean()
-                    weighted_expl = (effective_weights_seq[:, :, 3] * loss_expl_n).mean()
+                    weighted_speed = (effective_weights_seq[:, :, 0] * loss_speed_seq).mean()
+                    weighted_dir = (effective_weights_seq[:, :, 1] * loss_direction_seq).mean()
+                    weighted_avoid = (effective_weights_seq[:, :, 2] * loss_avoidance_seq).mean()
+                    weighted_expl = (effective_weights_seq[:, :, 3] * loss_exploration_seq).mean()
 
                     g_speed = _grad_or_none_tuple(weighted_speed, fast_param_values)
                     g_dir = _grad_or_none_tuple(weighted_dir, fast_param_values)
@@ -2766,7 +2939,7 @@ for i in pbar:
         scaled_proxy = scale_scalar_objective(proxy_loss)
         if meta_grad_usable:
             lgn_total = scaled_meta + args.lgn_proxy_aux_weight * scaled_proxy
-        else:
+        elif args.lgn_allow_proxy_fallback:
             lgn_total = args.lgn_proxy_aux_weight * scaled_proxy
             lgn_used_proxy_fallback = 1.0
             if _diag_should_log(i):
@@ -2775,6 +2948,15 @@ for i in pbar:
                     f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
                     f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
                 )
+        else:
+            if _diag_should_log(i):
+                print(
+                    f"[DIAG iter={i}] skip LGN step: unusable meta gradients and fallback disabled "
+                    f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
+                    f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
+                )
+            pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
+            continue
 
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
@@ -2816,7 +2998,7 @@ for i in pbar:
     else:
         proxy_loss.backward()
         worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
-        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 5.0).item())
+        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 1.0).item())
         optim_worker.step()
         sanitize_module_(worknet, clamp_value=10.0)
         sched.step()
@@ -2866,6 +3048,7 @@ for i in pbar:
             'Weight_Stats/Raw_Max': weights_seq.max(),
             'Weight_Stats/Raw_Mean': weights_seq.mean(),
             'Weight_Stats/Std': weight_std,
+            'Weight_Stats/L2_Reg': weight_l2,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
@@ -2874,16 +3057,23 @@ for i in pbar:
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Height': loss_height_seq.mean(),
+            'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
+            'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
+            'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
+            'Stuck/Ratio': stuck_ratio,
+            'Stuck/Collision_Streak_Mean': loss_collision_duration_seq.mean(),
+            'Stuck/Collision_Streak_Max': loss_collision_duration_seq.max(),
 
             # === [增强] Meta Loss 分项 ===
             'Meta_Comp/1_Position': loss_meta_pos,
             'Meta_Comp/2_Collision': loss_meta_coll,
-            'Meta_Comp/2_1_Collision_Soft': loss_meta_coll_soft,#软碰撞项（靠墙即升高，连续梯度）
-            'Meta_Comp/2_2_Collision_Hard': loss_meta_coll_hard,# 穿墙深度平方项。对“已经进墙”的样本施加强惩罚，且穿得越深罚越重
-            'Meta_Comp/2_3_Collision_Event': loss_meta_coll_event,# 可微事件惩罚（用于训练）
-            'Meta_Comp/2_4_Collision_Event_Rate': loss_meta_coll_event_rate,# 真实事件率（监控用）
+            'Meta_Comp/2_1_Collision_Depth': collision_depth.mean(),
             'Meta_Comp/3_Control': loss_meta_ctrl,
             'Meta_Comp/4_Height': loss_meta_height,
+            'Meta_Comp/6_Stuck': loss_meta_stuck,
+            'Meta_Comp/8_Smooth_Jerk': loss_meta_jerk,
+            'Meta_Comp/9_Smooth_Snap': loss_meta_snap,
+            'Meta_Comp/10_Smooth_V_Pred': loss_meta_v_pred,
 
             # === 全局规划引导损失分项 ===
             'Meta_Comp/5_Guidance': loss_meta_guidance,
@@ -2897,8 +3087,12 @@ for i in pbar:
             'Guidance/Depth': guidance_components['depth'],
             'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
             'Guidance/Valid_Ratio': guidance_components['valid_ratio'],
+            'Guidance/Valid_Guidance_Ratio': guidance_components.get('valid_guidance_ratio', 0.0),
             'Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
             'Guidance/Collision_Ratio': guidance_components['collision_ratio'],
+            'Guidance/Valid_Mean': guidance_components.get('guidance_valid_mean', 0.0),
+            'Guidance/Recovery_Mean': guidance_components.get('guidance_recovery_mean', 0.0),
+            'Guidance/Boost': guidance_components.get('guidance_boost', 1.0),
             'Guidance/Sample_Count': guidance_components['sample_count'],
             'Guidance/Avg_Curvature': guidance_components.get('avg_curvature', 0.0),
             'Guidance/Avg_Path_Progress': guidance_components.get('avg_path_progress', 0.0),
@@ -3097,7 +3291,15 @@ for i in pbar:
 
             interactive_html = os.path.join(video_dir, f'trajectory3d_iter_{i+1:06d}.html')
             R_cpu = R_history[:, idx].cpu()  # [T, 3, 3] 姿态矩阵
-            if save_interactive_3d_html(interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx):
+
+            # 直接复用本轮 guidance 中已经计算过的采样A*轨迹，不做额外A*计算
+            astar_paths_all = guidance_components.get('sampled_astar_paths', [])
+            astar_paths_sampled = astar_paths_all[idx] if (isinstance(astar_paths_all, list) and idx < len(astar_paths_all)) else []
+
+            if save_interactive_3d_html(
+                interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx,
+                astar_path=None, astar_paths_sampled=astar_paths_sampled,
+            ):
                 writer.add_text('Trajectory/Interactive3D_HTML', interactive_html, i + 1)
             
             # 3. [新增] 速度时序图 (Vx,Vy,Vz,Speed)

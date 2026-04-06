@@ -602,7 +602,7 @@ class Env(BaseEnv):
 
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
-        dyn_fn = differentiable_run_torch if self.use_meta_fallback else differentiable_run
+        dyn_fn = differentiable_run_torch if self.use_meta_differentiable_dynamics else differentiable_run
         self.act, p_free, v_free, a_free = dyn_fn(
             self.R,
             self.dg,
@@ -641,7 +641,7 @@ class Env(BaseEnv):
 
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        if self.use_meta_fallback:
+        if self.use_meta_differentiable_dynamics:
             self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
         else:
             self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)

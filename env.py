@@ -219,7 +219,8 @@ class Env:
                  scene_scale=1.0, random_rotation=False, cam_angle=10, obstacle_count_scale=1.0,
                  speed_limit_softness=0.05, max_speed_ceiling=5.0,
                  hard_vpred_clip=20.0, hard_speed_clip=30.0,
-                 start_goal_plane_y_abs=50.0) -> None:
+                 start_goal_plane_y_abs=50.0,
+                 wall_physical_feedback=False) -> None:
         self.device = device
         self.batch_size = batch_size
         self.width = width
@@ -284,6 +285,7 @@ class Env:
         self.hard_vpred_clip = max(0.1, float(hard_vpred_clip))
         self.hard_speed_clip = max(0.1, float(hard_speed_clip))
         self.start_goal_plane_y_abs = abs(float(start_goal_plane_y_abs))
+        self.wall_physical_feedback = bool(wall_physical_feedback)
         # LGN/meta phase should use the autograd-traceable dynamics path
         # (run_torch + update_state_vec_torch) so higher-order gradients can flow.
         self.use_meta_differentiable_dynamics = False
@@ -638,9 +640,10 @@ class Env:
         p_free = torch.nan_to_num(p_free, nan=0.0, posinf=100.0, neginf=-100.0)
         v_free = torch.nan_to_num(v_free, nan=0.0, posinf=self.hard_speed_clip, neginf=-self.hard_speed_clip).clamp(-self.hard_speed_clip, self.hard_speed_clip)
         a_free = torch.nan_to_num(a_free, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-        # 去掉碰撞物理反馈，直接使用自由运动结果
-        # self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
-        self.p, self.v, self.a = p_free, v_free, a_free
+        if self.wall_physical_feedback:
+            self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
+        else:
+            self.p, self.v, self.a = p_free, v_free, a_free
         self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(self.v, nan=0.0, posinf=self.hard_speed_clip, neginf=-self.hard_speed_clip).clamp(-self.hard_speed_clip, self.hard_speed_clip)
@@ -669,7 +672,10 @@ class Env:
         self.p_old = self.p
         p_free = g_decay(self.p, self.grad_decay ** ctl_dt) + self.v * ctl_dt + 0.5 * self.a * ctl_dt**2
         v_free = g_decay(self.v, self.grad_decay ** ctl_dt) + (self.a + a_next) / 2 * ctl_dt
-        self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_next, ctl_dt)
+        if self.wall_physical_feedback:
+            self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_next, ctl_dt)
+        else:
+            self.p, self.v, self.a = p_free, v_free, a_next
         self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
 
         # update attitude

@@ -32,13 +32,20 @@ class Env(BaseEnv):
         hard_vpred_clip=20.0,
         hard_speed_clip=30.0,
         start_goal_plane_y_abs=50.0,
+        include_u_local_optimum=True,
+        compact_two_zone_map=False,
+        wall_physical_feedback=False,
     ):
         self.map_x_max = 10.0
-        self.map_y_half = 12.0
+        self.compact_two_zone_map = bool(compact_two_zone_map)
+        self.map_y_half = 8.0 if self.compact_two_zone_map else 12.0
         self.map_y_min = -self.map_y_half
         self.map_y_max = self.map_y_half
         self.map_z_max = 5.0
-        self.region_length = 8.0
+        self.region_types = ("easy", "hard") if self.compact_two_zone_map else (
+            ("easy", "hard", "u-minimal") if bool(include_u_local_optimum) else ("hard", "easy", "easy")
+        )
+        self.region_length = (2.0 * self.map_y_half) / float(len(self.region_types))
         self.blank_length = 1.0
         self.spawn_x_center = 5.0
         self.spawn_z_center = 2.5
@@ -49,7 +56,12 @@ class Env(BaseEnv):
         self.boundary_half = 0.5 * self.boundary_thickness
         self.full_wall_hz = 2.45
         self.inner_wall_hz = 2.30
-        self.region_types = ("easy", "hard", "u-minimal")
+        self.include_u_local_optimum = bool(include_u_local_optimum)
+        # 起终点固定在上下边界内缩 0.5m 的平面上；紧凑地图时会自动变为 y=±7.5。
+        self.spawn_start_y = self.map_y_min + 0.5
+        self.spawn_goal_y = self.map_y_max - 0.5
+        self.precomputed_maps = []
+        self.current_map_idx = -1
 
         super().__init__(
             batch_size=batch_size,
@@ -72,6 +84,7 @@ class Env(BaseEnv):
             hard_vpred_clip=hard_vpred_clip,
             hard_speed_clip=hard_speed_clip,
             start_goal_plane_y_abs=start_goal_plane_y_abs,
+            wall_physical_feedback=wall_physical_feedback,
         )
 
         self.scene_x_half = self.map_x_max
@@ -445,7 +458,7 @@ class Env(BaseEnv):
         ).reshape(B, 3, 3)
 
         self.maze_cols = int(self.map_x_max)
-        self.maze_rows = int(self.region_length * 3)
+        self.maze_rows = int(self.region_length * len(self.region_types))
         self.maze_cell_size = 1.0
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
@@ -526,6 +539,67 @@ class Env(BaseEnv):
             # Keep start/goal constrained to the fixed y=-11 / y=11 planes.
             self._maze_rotation = None
 
+    def set_precomputed_maps(self, map_list):
+        self.precomputed_maps = list(map_list) if map_list is not None else []
+
+    def load_precomputed_map(self, map_data):
+        """Load obstacle/layout tensors from cached map data without regenerating geometry."""
+        B = self.batch_size
+        device = self.device
+
+        def _to_device_tensor(key, fallback_shape):
+            val = map_data.get(key, None)
+            if val is None:
+                return torch.zeros(fallback_shape, device=device, dtype=torch.float32)
+            if isinstance(val, torch.Tensor):
+                t = val.detach().to(device=device, dtype=torch.float32)
+            else:
+                t = torch.as_tensor(val, device=device, dtype=torch.float32)
+            if t.dim() == len(fallback_shape) - 1:
+                t = t.unsqueeze(0)
+            if t.shape[0] == 1 and B > 1:
+                t = t.repeat(B, *([1] * (t.dim() - 1)))
+            return t
+
+        self.balls = _to_device_tensor("balls", (B, 0, 4))
+        self.cyl = _to_device_tensor("cyl", (B, 0, 3))
+        self.voxels = _to_device_tensor("voxels", (B, 0, 6))
+        self.cyl_h = _to_device_tensor("cyl_h", (B, 0, 3))
+
+        start_bounds = map_data.get("spawn_start_bounds", torch.tensor([self.map_y_min, self.map_y_min + self.blank_length]))
+        goal_bounds = map_data.get("spawn_goal_bounds", torch.tensor([self.map_y_max - self.blank_length, self.map_y_max]))
+
+        start_bounds = torch.as_tensor(start_bounds, device=device, dtype=torch.float32).view(1, 2).repeat(B, 1)
+        goal_bounds = torch.as_tensor(goal_bounds, device=device, dtype=torch.float32).view(1, 2).repeat(B, 1)
+        self._spawn_start_bounds = start_bounds
+        self._spawn_goal_bounds = goal_bounds
+
+        region_order = map_data.get("region_order", tuple(self.region_types))
+        self.region_order = [tuple(region_order) for _ in range(B)]
+        u_meta = map_data.get("u_meta", {"open_left": None, "exit_side": "unknown"})
+        self.u_meta = [u_meta for _ in range(B)]
+
+        if "spawn_start_y" in map_data:
+            self.spawn_start_y = float(map_data["spawn_start_y"])
+        if "spawn_goal_y" in map_data:
+            self.spawn_goal_y = float(map_data["spawn_goal_y"])
+
+        self._obstacle_scale = torch.ones((B, 1), device=device)
+        self.scene_x_half = self.map_x_max
+        self.scene_y_half = self.map_y_half
+        self._maze_rotation = None
+
+    def reset_from_precomputed_map(self, map_data):
+        """Load cached map geometry and then reset only drone state."""
+        self.load_precomputed_map(map_data)
+        self.reset_drone_only()
+
+    def set_map_by_index(self, map_idx):
+        if len(self.precomputed_maps) == 0:
+            raise ValueError("No precomputed maps registered in env.precomputed_maps")
+        self.current_map_idx = int(map_idx) % len(self.precomputed_maps)
+        self.reset_from_precomputed_map(self.precomputed_maps[self.current_map_idx])
+
     def reset_drone_only(self):
         B = self.batch_size
         device = self.device
@@ -561,8 +635,8 @@ class Env(BaseEnv):
         x_goal = self.spawn_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
         z_goal = self.spawn_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
 
-        y = torch.full((B,), -11.5, device=device)
-        y_goal = torch.full((B,), 11.5, device=device)
+        y = torch.full((B,), float(self.spawn_start_y), device=device)
+        y_goal = torch.full((B,), float(self.spawn_goal_y), device=device)
 
         self.p = torch.stack([x, y, z], dim=-1)
         self.p_target = torch.stack([x_goal, y_goal, z_goal], dim=-1)
@@ -628,7 +702,10 @@ class Env(BaseEnv):
             neginf=-self.hard_speed_clip,
         ).clamp(-self.hard_speed_clip, self.hard_speed_clip)
         a_free = torch.nan_to_num(a_free, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-        self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
+        if self.wall_physical_feedback:
+            self.p, self.v, self.a = self._apply_soft_contacts(self.p_old, p_free, v_free, a_free, ctl_dt)
+        else:
+            self.p, self.v, self.a = p_free, v_free, a_free
         self.p, self.v, self.a = self._apply_speed_limit(self.p_old, self.p, self.v, self.a, ctl_dt)
         self.p = torch.nan_to_num(self.p, nan=0.0, posinf=100.0, neginf=-100.0)
         self.v = torch.nan_to_num(

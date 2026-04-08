@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class LossGenNet(nn.Module):
     """
@@ -105,9 +106,9 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成权重 logits（完全无约束，训练侧也不做裁剪/归一化）
+        # 5. 生成非负权重（不做归一化，仅约束 >= 0）
         raw = self.head(last_token)
-        weights = raw
+        weights = F.softplus(raw)
 
         # 返回 weights 和 新的记忆序列
         return weights, seq

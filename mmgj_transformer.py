@@ -50,6 +50,11 @@ except ModuleNotFoundError:
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
     from env_multi import Env
+try:
+    from potential_map_utils import PotentialMapCache, query_potential_guidance
+except ModuleNotFoundError:
+    PotentialMapCache = None
+    query_potential_guidance = None
 from env import probe_update_state_vec_common_upstream
 try:
     from WorkNet_transformer import WorkNet
@@ -161,6 +166,40 @@ parser.add_argument('--ground_voxels', default=False, action='store_true')
 parser.add_argument('--scaffold', default=False, action='store_true')
 parser.add_argument('--random_rotation', default=False, action='store_true')
 parser.add_argument('--no_odom', default=False, action='store_true')
+# [开关1] U 型局部最优陷阱地图开关（默认: 关闭）
+# - 默认行为：不传任何参数时 include_u_local_optimum=False。
+# - 显式开启：--include_u_local_optimum
+# - 关闭陷阱：--no_include_u_local_optimum（地图为 hard/easy/easy 三块随机重排，且不再包含 U 区）
+# - 说明：这两个参数写在同一行时，以最后一个为准（argparse store_true/store_false 同目标变量）。
+parser.add_argument('--include_u_local_optimum', dest='include_u_local_optimum', action='store_true',
+                    help='Include U-shaped local-optimum trap region in three-zone map')
+parser.add_argument('--no_include_u_local_optimum', dest='include_u_local_optimum', action='store_false',
+                    help='Disable U-shaped trap region and use shuffled hard/easy/easy region order')
+parser.set_defaults(include_u_local_optimum=False)
+# [开关1.1] 两分区紧凑地图开关（默认: 关闭）
+# - 默认行为：不传任何参数时 compact_two_zone_map=False，保持当前三分区地图逻辑不变。
+# - 显式开启：--compact_two_zone_map（仅保留 easy/hard 两种地图，Y 向尺寸缩小，起终点平面随之调整）
+# - 显式关闭：--no_compact_two_zone_map
+# - 说明：与 include_u_local_optimum 共存时，开启紧凑两分区会优先使用两分区布局（不再包含 U 区）。
+parser.add_argument('--compact_two_zone_map', dest='compact_two_zone_map', action='store_true',
+                    help='Use compact two-zone map (easy+hard only), with smaller map and adjusted start/goal planes')
+parser.add_argument('--no_compact_two_zone_map', dest='compact_two_zone_map', action='store_false',
+                    help='Use default map layout (current behavior)')
+parser.set_defaults(compact_two_zone_map=False)
+# [开关2] 墙壁物理反馈开关（默认: 关闭）
+# - 默认行为：不传任何参数时 wall_physical_feedback=False，采用自由运动结果（当前代码行为）。
+# - 开启反馈：--wall_physical_feedback（启用软接触反馈，修正穿墙/贴墙时的位置与速度）
+# - 显式关闭：--no_wall_physical_feedback
+# - 典型组合：
+#   1) 保持当前基线：不加这两个开关（或显式 --include_u_local_optimum --no_wall_physical_feedback）
+#   2) 仅去掉 U 陷阱：--no_include_u_local_optimum
+#   3) 仅加墙体反馈：--wall_physical_feedback
+#   4) 同时去陷阱+加反馈：--no_include_u_local_optimum --wall_physical_feedback
+parser.add_argument('--wall_physical_feedback', dest='wall_physical_feedback', action='store_true',
+                    help='Enable wall-contact physical feedback correction in env dynamics')
+parser.add_argument('--no_wall_physical_feedback', dest='wall_physical_feedback', action='store_false',
+                    help='Disable wall-contact physical feedback and use free-motion result')
+parser.set_defaults(wall_physical_feedback=False)
 
 # 学习率
 parser.add_argument('--lr', type=float, default=3e-5)
@@ -171,19 +210,15 @@ parser.add_argument('--inner_steps', type=int, default=1,
                     help='Number of differentiable inner SGD steps (unrolled bilevel)')
 parser.add_argument('--inner_grad_clip', type=float, default=10.0,
                     help='Global-norm cap for differentiable inner gradients to stabilize second-order chain')
-parser.add_argument('--lgn_proxy_aux_weight', type=float, default=0.02,
-                    help='Auxiliary proxy-loss weight for LGN update; also used as fallback update when meta gradients are unusable')
-parser.add_argument('--lgn_allow_proxy_fallback', default=False, action='store_true',
-                    help='Allow proxy-only fallback update when unrolled meta gradients to LGN are unusable')
 parser.add_argument('--exp_name', type=str, default="default", help="Extra tag for experiment")
 
 # 避障/碰撞超参
 parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
                     help='Proxy avoidance rises smoothly inside this clearance to walls')
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
-                    help='Compatibility arg (unused): LGN output is used as raw unconstrained weights')
+                    help='Compatibility arg (currently not used): LGN weights are constrained to be non-negative')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
-                    help='Compatibility arg (unused): no floor constraint is applied to LGN weights')
+                    help='Compatibility arg (unused): no extra floor is applied beyond non-negative constraint')
 parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
                     help='Compatibility arg (unused): no ceiling constraint is applied to LGN weights')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
@@ -256,12 +291,54 @@ parser.add_argument('--planner_workers', type=int, default=0,
                     help='Number of planner worker processes (<=0 means auto)')
 parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
                     help='maxtasksperchild for planner process pool to avoid long-run memory growth')
+# [引导后端切换开关]
+# - astar: 使用在线 A* 规划引导（原有方案）
+# - dijkstra_potential: 使用离线缓存 Dijkstra 势场引导（新方案）
+# 使用方法：
+# - 默认不写时为 astar（在线规划）。
+# - 切到势场模式：--guidance_backend dijkstra_potential
+#   需要配合预计算地图目录，例如：
+#   --precomputed_map_dir ../precomputed_maps --num_precomputed_maps 100
+# - 切回 A* 模式：--guidance_backend astar
+# 说明：这是统一开关，优先于旧的 use_precomputed_potential_maps/use_astar_guidance 组合语义。
+parser.add_argument('--guidance_backend', type=str, default='astar',
+                    choices=['astar', 'dijkstra_potential'],
+                    help='Switch guidance backend between online A* and cached Dijkstra potential field')
+parser.add_argument('--use_precomputed_potential_maps', default=False, action='store_true',
+                    help='Use precomputed Dijkstra potential-map guidance instead of online A* planning')
+parser.add_argument('--precomputed_map_dir', type=str, default='../precomputed_maps',
+                    help='Directory containing map_XXX.pt potential cache files')
+parser.add_argument('--num_precomputed_maps', type=int, default=100,
+                    help='Max number of precomputed maps to load from precomputed_map_dir')
+# [势场查询参数]
+# - trilinear: 三线性插值，点落在栅格内部时按8个角点加权，训练更平滑（推荐）
+# - nearest: 最近邻查询，调试方便但梯度更离散
+parser.add_argument('--potential_interpolation', type=str, default='trilinear',
+                    choices=['nearest', 'trilinear'],
+                    help='Interpolation mode for querying potential/vector field at continuous positions')
+# [势场下降约束参数]
+# ReLU(phi[t+1]-phi[t]+delta) 中的 delta。
+# 取负值(如 -0.01)表示“允许极小上升噪声，但整体应下降”。
+parser.add_argument('--potential_delta_margin', type=float, default=-0.01,
+                    help='Delta margin in potential decrease loss: ReLU(phi[t+1]-phi[t]+delta)')
+parser.add_argument('--use_astar_guidance', default=False, action='store_true',
+                    help='Force legacy online A* guidance even when precomputed maps are enabled')
 parser.add_argument('--diag_interval', type=int, default=1,
                     help='Print detailed DIAG logs every N iterations (<=0 disables)')
 parser.add_argument('--diag_second_order', default=True, action='store_true',
                     help='Enable heavy second-order diagnostic probes (can be noisy and slow)')
+parser.add_argument('--terminal_log_interval', type=int, default=500,
+                    help='Update terminal progress/log text every N iterations')
 
 args = parser.parse_args()
+
+# 统一 guidance 开关生效：根据 guidance_backend 映射为旧布尔参数，保持后续逻辑兼容。
+if args.guidance_backend == 'dijkstra_potential':
+    args.use_precomputed_potential_maps = True
+    args.use_astar_guidance = False
+else:
+    args.use_precomputed_potential_maps = False
+    args.use_astar_guidance = True
 
 # Planner parallel runtime config (used by guidance reference computation)
 PLANNER_PARALLEL_ENABLE = bool(args.planner_parallel)
@@ -269,6 +346,7 @@ PLANNER_NUM_WORKERS = int(args.planner_workers)
 PLANNER_POOL_MAXTASKS = max(1, int(args.planner_pool_maxtasks))
 _PLANNER_POOL = None
 _PLANNER_POOL_SIZE = 0
+POTENTIAL_MAP_CACHE = None
 
 ########## 2. 目录与日志初始化 ##########
 current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -300,7 +378,81 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           max_speed_ceiling=args.max_speed_ceiling,
           hard_vpred_clip=args.hard_vpred_clip,
           hard_speed_clip=args.hard_speed_clip,
-          start_goal_plane_y_abs=args.start_goal_plane_y_abs)
+          start_goal_plane_y_abs=args.start_goal_plane_y_abs,
+          include_u_local_optimum=args.include_u_local_optimum,
+          compact_two_zone_map=args.compact_two_zone_map,
+          wall_physical_feedback=args.wall_physical_feedback)
+
+
+def _align_env_goal_planes_to_precomputed_map(map_data, env_obj, map_idx_hint=None, tol=1e-3):
+    start_y_from_map = None
+    goal_y_from_map = None
+
+    if "spawn_start_y" in map_data:
+        start_y_from_map = float(map_data["spawn_start_y"])
+    elif "spawn_start_bounds" in map_data:
+        sb = map_data["spawn_start_bounds"]
+        if isinstance(sb, torch.Tensor):
+            sb = sb.detach().cpu().numpy()
+        sb = np.asarray(sb, dtype=np.float32).reshape(-1)
+        if sb.size >= 2:
+            start_y_from_map = 0.5 * float(sb[0] + sb[1])
+
+    if "spawn_goal_y" in map_data:
+        goal_y_from_map = float(map_data["spawn_goal_y"])
+    elif "goal_world" in map_data:
+        gw = map_data["goal_world"]
+        if isinstance(gw, torch.Tensor):
+            gw = gw.detach().cpu().numpy()
+        gw = np.asarray(gw, dtype=np.float32).reshape(-1)
+        if gw.size >= 2:
+            goal_y_from_map = float(gw[1])
+    elif "spawn_goal_bounds" in map_data:
+        gb = map_data["spawn_goal_bounds"]
+        if isinstance(gb, torch.Tensor):
+            gb = gb.detach().cpu().numpy()
+        gb = np.asarray(gb, dtype=np.float32).reshape(-1)
+        if gb.size >= 2:
+            goal_y_from_map = 0.5 * float(gb[0] + gb[1])
+
+    if start_y_from_map is None and goal_y_from_map is None:
+        return
+
+    old_start = float(getattr(env_obj, "spawn_start_y", -11.5))
+    old_goal = float(getattr(env_obj, "spawn_goal_y", 11.5))
+    new_start = old_start if start_y_from_map is None else float(start_y_from_map)
+    new_goal = old_goal if goal_y_from_map is None else float(goal_y_from_map)
+
+    env_obj.spawn_start_y = new_start
+    env_obj.spawn_goal_y = new_goal
+
+    if abs(new_start - old_start) > float(tol) or abs(new_goal - old_goal) > float(tol):
+        idx_msg = "unknown" if map_idx_hint is None else str(int(map_idx_hint))
+        print(
+            f"[PotentialMap] Align start/goal planes to map_idx={idx_msg}: "
+            f"start_y {old_start:.3f}->{new_start:.3f}, goal_y {old_goal:.3f}->{new_goal:.3f}"
+        )
+
+if args.use_precomputed_potential_maps:
+    if PotentialMapCache is None or query_potential_guidance is None:
+        raise RuntimeError("potential_map_utils.py is required for --use_precomputed_potential_maps")
+    POTENTIAL_MAP_CACHE = PotentialMapCache(
+        map_dir=args.precomputed_map_dir,
+        num_maps=args.num_precomputed_maps,
+    )
+    if len(POTENTIAL_MAP_CACHE) <= 0:
+        raise RuntimeError(
+            f"No precomputed maps found in {args.precomputed_map_dir}. "
+            f"Please run precompute_potential_maps.py first."
+        )
+    first_map = POTENTIAL_MAP_CACHE.get_map(0)
+    _align_env_goal_planes_to_precomputed_map(first_map, env, map_idx_hint=0)
+    env.reset_from_precomputed_map(first_map)
+    env.current_map_idx = 0
+    print(
+        f"[PotentialMap] Enabled. loaded={len(POTENTIAL_MAP_CACHE)} "
+        f"from {args.precomputed_map_dir}, current_map_idx=0"
+    )
 
 _upstream_probe = probe_update_state_vec_common_upstream(device)
 env.update_state_vec_in_meta_path = bool(_upstream_probe["is_common_upstream"])
@@ -1604,6 +1756,138 @@ def sample_guidance_points(p_history, v_history, dist_obj, sample_count, strateg
     return indices
 
 
+def _masked_mean(x, mask):
+    mask_f = mask.float()
+    denom = mask_f.sum().clamp_min(1.0)
+    return (x * mask_f).sum() / denom
+
+
+def compute_guidance_reference_from_potential_map(p_history, map_data, interpolation='trilinear'):
+    """Query dense potential value and descending direction from precomputed map field."""
+    potential_value, ref_dir, valid_mask = query_potential_guidance(
+        map_data=map_data,
+        points_world=p_history,
+        interpolation=interpolation,
+    )
+    ref_dir = safe_normalize(ref_dir, dim=-1)
+    return potential_value, ref_dir, valid_mask
+
+
+def compute_potential_guidance_meta_loss(env, p_history, v_history, vec_to_pt, dist_obj,
+                                         map_data,
+                                         max_speed=5.0,
+                                         dir_weight=0.5,
+                                         speed_weight=0.3,
+                                         lateral_weight=0.3,
+                                         escape_weight=1.0,
+                                         collision_threshold=-0.05,
+                                         accel_weight=0.2,
+                                         speed_diff_weight=0.2,
+                                         recovery_speed_weight=0.15):
+    """Dense guidance loss based on precomputed Dijkstra potential/vector field."""
+    T, B, _ = p_history.shape
+
+    potential_value, ref_dir, valid_mask = compute_guidance_reference_from_potential_map(
+        p_history=p_history,
+        map_data=map_data,
+        interpolation=args.potential_interpolation,
+    )
+
+    v_dir = safe_normalize(v_history, dim=-1)
+    v_speed = v_history.norm(dim=-1)
+
+    loss_dir_align = 1.0 - (v_dir * ref_dir).sum(dim=-1)
+
+    # Simple, stable speed reference: full speed in free/early areas, damp near walls and near low-potential zones.
+    finite_mask = torch.isfinite(potential_value)
+    valid_mask = valid_mask & finite_mask
+    safe_pot = torch.where(valid_mask, potential_value, torch.zeros_like(potential_value))
+    pot_max = safe_pot.max(dim=0, keepdim=True).values.clamp_min(1.0)
+    pot_ratio = torch.clamp(safe_pot / pot_max, 0.0, 1.0)
+    obstacle_factor = torch.sigmoid((dist_obj - 0.8) * 5.0)
+    ref_speed = max_speed * (0.25 + 0.75 * obstacle_factor) * (0.30 + 0.70 * pot_ratio)
+
+    loss_overspeed = F.relu(v_speed - ref_speed)
+    loss_underspeed = F.relu(ref_speed - v_speed) * 0.3
+    loss_speed_diff = loss_overspeed + loss_underspeed
+
+    # Potential descent constraint: penalize local potential increase.
+    loss_pot_step = torch.zeros_like(potential_value)
+    if T > 1:
+        step_valid = valid_mask[:-1] & valid_mask[1:]
+        step_term = F.relu(potential_value[1:] - potential_value[:-1] + float(args.potential_delta_margin))
+        loss_pot_step[:-1] = step_term * step_valid.float()
+    else:
+        step_valid = torch.zeros((0, B), dtype=torch.bool, device=p_history.device)
+
+    # Potential absolute term: normalized potential on valid field points.
+    loss_pot_abs = torch.where(valid_mask, safe_pot / (pot_max + 1e-6), torch.zeros_like(safe_pot))
+
+    collision_mask = dist_obj < collision_threshold
+    invalid_mask = (~valid_mask) & (~collision_mask)
+    recovery_mask = collision_mask | invalid_mask
+    valid_guidance_mask = valid_mask & (~collision_mask)
+
+    loss_escape, loss_depth = compute_escape_penalty(
+        v_history, vec_to_pt, dist_obj, recovery_mask
+    )
+    loss_recovery_speed = v_speed * invalid_mask.float()
+
+    guidance_for_valid = (
+        dir_weight * loss_dir_align
+        + speed_weight * loss_overspeed
+        + speed_diff_weight * loss_underspeed
+        + lateral_weight * loss_pot_abs
+        + accel_weight * loss_pot_step
+    )
+    guidance_for_recovery = (
+        escape_weight * (loss_escape + loss_depth)
+        + recovery_speed_weight * loss_recovery_speed
+    )
+
+    guidance_loss_per_point = torch.where(valid_guidance_mask, guidance_for_valid, guidance_for_recovery)
+    guidance_loss = guidance_loss_per_point.mean()
+
+    potential_decrease = torch.tensor(0.0, device=p_history.device, dtype=p_history.dtype)
+    if T > 1:
+        raw_dec = potential_value[:-1] - potential_value[1:]
+        potential_decrease = _masked_mean(raw_dec, step_valid)
+
+    field_dir_align = _masked_mean(1.0 - loss_dir_align, valid_guidance_mask)
+
+    loss_components = {
+        'dir_align': loss_dir_align.mean(),
+        'speed_diff': loss_speed_diff.mean(),
+        'overspeed': loss_overspeed.mean(),
+        'underspeed': loss_underspeed.mean(),
+        'potential_abs': loss_pot_abs.mean(),
+        'potential_step_penalty': loss_pot_step.mean(),
+        # compatibility aliases
+        'lateral_error': loss_pot_abs.mean(),
+        'accel_mismatch': loss_pot_step.mean(),
+        'escape': loss_escape.mean(),
+        'depth': loss_depth.mean(),
+        'recovery_speed': loss_recovery_speed.mean(),
+        'valid_ratio': valid_mask.float().mean(),
+        'invalid_ratio': invalid_mask.float().mean(),
+        'collision_ratio': collision_mask.float().mean(),
+        'sample_count': float(T),
+        'avg_curvature': 0.0,
+        'avg_path_progress': 0.0,
+        'avg_lateral_error': loss_pot_abs.mean().item(),
+        'max_lateral_error': loss_pot_abs.max().item(),
+        'potential_valid_ratio': valid_mask.float().mean(),
+        # compatibility alias
+        'planner_success_ratio': valid_mask.float().mean().item(),
+        'avg_ref_speed': ref_speed.mean().item(),
+        'sampled_astar_paths': [],
+        'potential_mean': _masked_mean(safe_pot, valid_mask),
+        'potential_decrease': potential_decrease,
+        'field_dir_align': field_dir_align,
+    }
+    return guidance_loss, loss_components
+
+
 def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_to_pt, dist_obj,
                                        a_history=None,
                                        sample_count=10, strategy='random',
@@ -1645,6 +1929,30 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
         guidance_loss: 标量损失
         loss_components: 各分项损失的字典
     """
+    # New default path: dense potential-field guidance from precomputed map cache.
+    if args.use_precomputed_potential_maps and not args.use_astar_guidance:
+        if POTENTIAL_MAP_CACHE is None:
+            raise RuntimeError("Precomputed potential map mode is enabled but POTENTIAL_MAP_CACHE is not initialized")
+        map_idx = int(getattr(env, 'current_map_idx', 0))
+        map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
+        return compute_potential_guidance_meta_loss(
+            env=env,
+            p_history=p_history,
+            v_history=v_history,
+            vec_to_pt=vec_to_pt,
+            dist_obj=dist_obj,
+            map_data=map_data,
+            max_speed=max_speed,
+            dir_weight=dir_weight,
+            speed_weight=speed_weight,
+            lateral_weight=lateral_weight,
+            escape_weight=escape_weight,
+            collision_threshold=collision_threshold,
+            accel_weight=accel_weight,
+            speed_diff_weight=speed_diff_weight,
+            recovery_speed_weight=recovery_speed_weight,
+        )
+
     T, B, _ = p_history.shape
 
     # 1. 采样关键点
@@ -1821,6 +2129,102 @@ def get_map_view_bounds(env, traj_xy, target_xy=None, pad=0.5):
     return x_min, x_max, y_min, y_max
 
 
+def build_potential_xy_debug_figure(map_data, z_world, stride=5):
+    """Build XY heatmap + vector field slice from cached potential map for quick debugging."""
+    if map_data is None:
+        return None
+
+    potential = map_data.get('potential', None)
+    occupancy = map_data.get('occupancy', None)
+    guide_dir = map_data.get('guide_dir', None)
+    origin = map_data.get('grid_origin', None)
+    resolution = float(map_data.get('resolution', 0.3))
+
+    if potential is None or occupancy is None or guide_dir is None or origin is None:
+        return None
+
+    if isinstance(potential, torch.Tensor):
+        potential = potential.detach().cpu().numpy()
+    if isinstance(occupancy, torch.Tensor):
+        occupancy = occupancy.detach().cpu().numpy()
+    if isinstance(guide_dir, torch.Tensor):
+        guide_dir = guide_dir.detach().cpu().numpy()
+    if isinstance(origin, torch.Tensor):
+        origin = origin.detach().cpu().numpy()
+
+    nx, ny, nz = potential.shape
+    zi = int(round((float(z_world) - float(origin[2])) / max(resolution, 1e-6)))
+    zi = max(0, min(nz - 1, zi))
+
+    pot_xy = potential[:, :, zi]
+    occ_xy = occupancy[:, :, zi] > 0
+    dir_xy = guide_dir[:, :, zi, :2]
+
+    finite_mask = np.isfinite(pot_xy)
+    valid_mask = finite_mask & (~occ_xy)
+    if valid_mask.sum() <= 0:
+        return None
+
+    # Keep image orientation intuitive: x-axis horizontal, y-axis vertical.
+    pot_show = pot_xy.T.copy()
+    pot_show[~np.isfinite(pot_show)] = np.nan
+
+    x_min = float(origin[0])
+    x_max = x_min + nx * resolution
+    y_min = float(origin[1])
+    y_max = y_min + ny * resolution
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(
+        pot_show,
+        origin='lower',
+        extent=[x_min, x_max, y_min, y_max],
+        cmap='viridis',
+        aspect='auto',
+    )
+    fig.colorbar(im, ax=ax, label='Potential')
+
+    # Overlay obstacle mask.
+    occ_show = np.where(occ_xy.T, 1.0, np.nan)
+    ax.imshow(
+        occ_show,
+        origin='lower',
+        extent=[x_min, x_max, y_min, y_max],
+        cmap='gray',
+        alpha=0.35,
+        aspect='auto',
+    )
+
+    # Sparse vector field arrows.
+    sx = max(1, int(stride))
+    xs = []
+    ys = []
+    us = []
+    vs = []
+    for ix in range(0, nx, sx):
+        for iy in range(0, ny, sx):
+            if not valid_mask[ix, iy]:
+                continue
+            dv = dir_xy[ix, iy]
+            dn = float(np.linalg.norm(dv))
+            if dn <= 1e-6:
+                continue
+            px = x_min + (ix + 0.5) * resolution
+            py = y_min + (iy + 0.5) * resolution
+            xs.append(px)
+            ys.append(py)
+            us.append(float(dv[0] / dn))
+            vs.append(float(dv[1] / dn))
+
+    if len(xs) > 0:
+        ax.quiver(xs, ys, us, vs, color='white', alpha=0.85, scale=28, width=0.002)
+
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title(f'Potential Field XY Slice (z={z_world:.2f} m, grid_z={zi})')
+    return fig
+
+
 def draw_sphere(ax, cx, cy, cz, r, color='royalblue', alpha=0.18, res=12):
     u = np.linspace(0.0, 2.0 * np.pi, res)
     v = np.linspace(0.0, np.pi, res)
@@ -1934,13 +2338,16 @@ def _is_ceiling_or_side_boundary_voxel(box_xyz_half, env):
 
 
 def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5,
-                             astar_path=None, astar_paths_sampled=None):
+                             astar_path=None, astar_paths_sampled=None,
+                             potential_map_data=None, show_potential_overlay=False):
     """保存交互式3D轨迹HTML，带有无人机姿态坐标系和A*全局引导轨迹
 
     Args:
         R_cpu: 姿态矩阵 [T, 3, 3]，如果提供则绘制坐标系
         axis_len: 坐标轴长度(米)
         axis_step: 每隔多少个时间步绘制一次坐标系
+        potential_map_data: 势场缓存数据（map_XXX.pt 反序列化对象）
+        show_potential_overlay: 是否在 HTML 中叠加势场切片
     """
     if go is None:
         return False
@@ -1963,6 +2370,144 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         line=dict(color='limegreen', width=5),
         name='Trajectory'
     ))
+
+    # 势场后端时，在 HTML 中叠加一个 XY 势场切片层。
+    potential_overlay_ok = False
+    potential_overlay_msg = ""
+    if show_potential_overlay and potential_map_data is not None:
+        try:
+            pot = potential_map_data.get('potential', None)
+            occ = potential_map_data.get('occupancy', None)
+            origin = potential_map_data.get('grid_origin', None)
+            resolution = float(potential_map_data.get('resolution', 0.3))
+
+            if isinstance(pot, torch.Tensor):
+                pot = pot.detach().cpu().numpy()
+            if isinstance(occ, torch.Tensor):
+                occ = occ.detach().cpu().numpy()
+            if isinstance(origin, torch.Tensor):
+                origin = origin.detach().cpu().numpy()
+
+            if pot is not None and occ is not None and origin is not None and pot.ndim == 3:
+                nx, ny, nz = pot.shape
+                # 先尝试轨迹中位高度对应切片；若切片无有效点，自动选择有效点最多的切片。
+                z_world = float(np.median(traj_xyz[:, 2]))
+                zi_guess = int(round((z_world - float(origin[2])) / max(resolution, 1e-6)))
+                zi_guess = max(0, min(nz - 1, zi_guess))
+
+                best_zi = zi_guess
+                best_valid_cnt = -1
+                for zi in range(nz):
+                    pot_xy_i = pot[:, :, zi]
+                    occ_xy_i = occ[:, :, zi] > 0
+                    valid_i = np.isfinite(pot_xy_i) & (~occ_xy_i)
+                    cnt_i = int(np.count_nonzero(valid_i))
+                    if cnt_i > best_valid_cnt:
+                        best_valid_cnt = cnt_i
+                        best_zi = zi
+
+                zi = zi_guess
+                pot_xy = pot[:, :, zi].copy()
+                occ_xy = occ[:, :, zi] > 0
+                finite = np.isfinite(pot_xy)
+                valid = finite & (~occ_xy)
+
+                if int(np.count_nonzero(valid)) <= 0 and best_valid_cnt > 0:
+                    zi = best_zi
+                    pot_xy = pot[:, :, zi].copy()
+                    occ_xy = occ[:, :, zi] > 0
+                    finite = np.isfinite(pot_xy)
+                    valid = finite & (~occ_xy)
+
+                if np.any(valid):
+                    pot_valid = pot_xy[valid]
+                    pmin = float(np.min(pot_valid))
+                    pmax = float(np.max(pot_valid))
+                    denom = max(1e-6, pmax - pmin)
+                    pot_norm = (pot_xy - pmin) / denom
+
+                    z_world_slice = float(origin[2]) + (float(zi) + 0.5) * resolution
+                    z_layer = np.full_like(pot_xy, z_world_slice - 0.08, dtype=np.float32)
+                    z_layer[~valid] = np.nan
+                    pot_norm[~valid] = np.nan
+
+                    x_vec = float(origin[0]) + (np.arange(nx, dtype=np.float32) + 0.5) * resolution
+                    y_vec = float(origin[1]) + (np.arange(ny, dtype=np.float32) + 0.5) * resolution
+                    X, Y = np.meshgrid(x_vec, y_vec, indexing='ij')
+
+                    fig.add_trace(go.Surface(
+                        x=X,
+                        y=Y,
+                        z=z_layer,
+                        surfacecolor=pot_norm,
+                        colorscale='Viridis',
+                        cmin=0.0,
+                        cmax=1.0,
+                        opacity=0.62,
+                        showscale=True,
+                        colorbar=dict(title='Potential (norm)'),
+                        name='Potential Slice',
+                        hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>Potential=%{surfacecolor:.3f}<extra></extra>'
+                    ))
+                    potential_overlay_ok = True
+                    if zi != zi_guess:
+                        potential_overlay_msg = (
+                            f"Potential overlay: switched z-slice {zi_guess} -> {zi} "
+                            f"(valid={int(np.count_nonzero(valid))})."
+                        )
+                else:
+                    # 兜底：当所有 XY 切片都难以直接显示时，渲染稀疏势场点云。
+                    finite_all = np.isfinite(pot) & (~(occ > 0))
+                    idxs = np.argwhere(finite_all)
+                    if idxs.shape[0] > 0:
+                        max_pts = 5000
+                        if idxs.shape[0] > max_pts:
+                            pick = np.random.choice(idxs.shape[0], size=max_pts, replace=False)
+                            idxs = idxs[pick]
+                        x_pts = float(origin[0]) + (idxs[:, 0].astype(np.float32) + 0.5) * resolution
+                        y_pts = float(origin[1]) + (idxs[:, 1].astype(np.float32) + 0.5) * resolution
+                        z_pts = float(origin[2]) + (idxs[:, 2].astype(np.float32) + 0.5) * resolution
+                        p_pts = pot[idxs[:, 0], idxs[:, 1], idxs[:, 2]].astype(np.float32)
+                        pmin = float(np.min(p_pts))
+                        pmax = float(np.max(p_pts))
+                        pnorm = (p_pts - pmin) / max(1e-6, pmax - pmin)
+                        fig.add_trace(go.Scatter3d(
+                            x=x_pts,
+                            y=y_pts,
+                            z=z_pts,
+                            mode='markers',
+                            marker=dict(
+                                size=2,
+                                color=pnorm,
+                                colorscale='Viridis',
+                                opacity=0.42,
+                                colorbar=dict(title='Potential (norm)')
+                            ),
+                            name='Potential Cloud',
+                            hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<extra></extra>'
+                        ))
+                        potential_overlay_ok = True
+                        potential_overlay_msg = "Potential overlay: XY slice empty, fallback to sparse 3D cloud."
+                    else:
+                        potential_overlay_msg = "Potential overlay: no finite free-space potential values."
+        except Exception as e:
+            potential_overlay_msg = f"Potential overlay error: {e}"
+            print(f"[HTML Potential Overlay] {potential_overlay_msg}")
+    elif show_potential_overlay and potential_map_data is None:
+        potential_overlay_msg = "Potential overlay requested but potential_map_data is None."
+
+    if show_potential_overlay and (not potential_overlay_ok) and potential_overlay_msg:
+        fig.add_trace(go.Scatter3d(
+            x=[traj_xyz[0, 0]],
+            y=[traj_xyz[0, 1]],
+            z=[traj_xyz[0, 2]],
+            mode='text',
+            text=[potential_overlay_msg],
+            textposition='top left',
+            textfont=dict(color='crimson', size=11),
+            showlegend=False,
+            name='Potential Overlay Status',
+        ))
 
     # 绘制全局A*引导轨迹（起点到终点）
     if astar_path is not None and len(astar_path) > 1:
@@ -2458,7 +3003,10 @@ global_planner = GlobalPlanner(
 )
 print(f"[GlobalPlanner] Initialized with resolution={args.planner_resolution}m, margin={args.planner_margin}m")
 
-pbar = tqdm(range(args.num_iters), ncols=120)
+current_precomputed_map_idx = -1
+
+terminal_log_interval = max(1, int(args.terminal_log_interval))
+pbar = tqdm(range(args.num_iters), ncols=120, miniters=terminal_log_interval)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
@@ -2467,15 +3015,26 @@ meta_lgn_grad_window = deque(maxlen=20)
 state_normalizer.train()
 
 for i in pbar:
+    term_log_now = ((i + 1) % terminal_log_interval == 0)
     cycle_pos = i % cycle_len
     train_lgn_phase = cycle_pos < args.lgn_steps
     phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
     env.set_meta_differentiable_mode(train_lgn_phase)
 
-    if maze_update_counter % args.maze_update_interval == 0:
-        env.reset()          # full reset: new maze + new drones
+    if args.use_precomputed_potential_maps:
+        if maze_update_counter % args.maze_update_interval == 0:
+            current_precomputed_map_idx = (current_precomputed_map_idx + 1) % len(POTENTIAL_MAP_CACHE)
+            env.current_map_idx = current_precomputed_map_idx
+            map_data_cur = POTENTIAL_MAP_CACHE.get_map(current_precomputed_map_idx)
+            _align_env_goal_planes_to_precomputed_map(map_data_cur, env, map_idx_hint=current_precomputed_map_idx)
+            env.reset_from_precomputed_map(map_data_cur)
+        else:
+            env.reset_drone_only()
     else:
-        env.reset_drone_only()  # keep maze, reset drones only
+        if maze_update_counter % args.maze_update_interval == 0:
+            env.reset()          # full reset: new maze + new drones
+        else:
+            env.reset_drone_only()  # keep maze, reset drones only
     maze_update_counter += 1
     worknet.reset()
 
@@ -2629,8 +3188,7 @@ for i in pbar:
                        + F.softplus((z_pos - z_max) * 20.0)
                        + F.softplus((z_min - z_pos) * 20.0))
 
-    # 有界负权重策略:
-    # speed/direction/exploration 允许轻微反向(-0.2及以上), avoidance 保持非负
+    # 非负权重策略：所有分量均不允许为负
     weights_seq_raw = weights_seq
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
@@ -2638,12 +3196,8 @@ for i in pbar:
             f"[DIAG iter={i}] loss_raw requires_grad: speed={loss_speed_seq.requires_grad}, "
             f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, expl={loss_exploration_seq.requires_grad}"
         )
-    effective_weights_seq = torch.stack([
-        weights_seq_raw[:, :, 0].clamp(min=-0.2),
-        weights_seq_raw[:, :, 1].clamp(min=-0.2),
-        weights_seq_raw[:, :, 2].clamp(min=0.0),
-        weights_seq_raw[:, :, 3].clamp(min=-0.2),
-    ], dim=-1)
+    # 非负且可导的平滑映射，避免 clamp 在负区零梯度。
+    effective_weights_seq = F.softplus(weights_seq_raw, beta=2.0)
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
@@ -2658,9 +3212,8 @@ for i in pbar:
         effective_weights_seq[:, :, 3] * loss_exploration_seq
     )
 
-    # 3. 最终 Proxy Loss + 权重幅值正则，抑制单项权重塌缩放大
-    weight_l2 = effective_weights_seq.pow(2).mean()
-    proxy_loss = weighted_loss_map.mean() + 0.001 * weight_l2
+    # 3. 最终 Proxy Loss
+    proxy_loss = weighted_loss_map.mean()
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
@@ -2670,8 +3223,6 @@ for i in pbar:
             f"[DIAG iter={i}] proxy_loss: requires_grad={proxy_loss.requires_grad}, "
             f"grad_fn={type(proxy_loss.grad_fn).__name__ if proxy_loss.grad_fn else 'None'}"
         )
-        print(f"[DIAG iter={i}] weight_l2={float(weight_l2.detach().item()):.6f}")
-
         _diag_tensor_finite("act_for_diag", act_for_diag, i)
         _diag_tensor_finite("real_act_history", real_act_history, i)
         _diag_tensor_finite("p_history", p_history, i)
@@ -2794,7 +3345,6 @@ for i in pbar:
     lgn_meta_probe_norm = 0.0
     lgn_meta_probe_nonfinite = 0.0
     lgn_meta_probe_elems = 0.0
-    lgn_used_proxy_fallback = 0.0
 
     rollout_is_finite = bool(
         torch.isfinite(proxy_loss).all()
@@ -2805,7 +3355,8 @@ for i in pbar:
     )
 
     if not rollout_is_finite:
-        pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
+        if term_log_now:
+            pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
         continue
 
     worker_params = tuple(worknet.parameters())
@@ -2891,7 +3442,8 @@ for i in pbar:
             }
 
         if not inner_update_is_finite:
-            pbar.set_description(f"[{phase_str}] non-finite inner-update skipped")
+            if term_log_now:
+                pbar.set_description(f"[{phase_str}] non-finite inner-update skipped")
             continue
 
         if _diag_should_log(i):
@@ -2904,7 +3456,8 @@ for i in pbar:
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
             unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
         if not torch.isfinite(meta_loss_unrolled):
-            pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
+            if term_log_now:
+                pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             continue
 
         if _diag_should_log(i):
@@ -2920,7 +3473,7 @@ for i in pbar:
 
         # Step 3: 反向传播贯穿整条链路
         #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # 当 meta->LGN 梯度不可用(非有限或全零)时, 回退到 proxy 辅助更新以避免 NaN 污染。
+        # LGN 更新仅使用 unrolled meta loss，不再混入 proxy aux 或 fallback。
         meta_probe_grads = torch.autograd.grad(
             meta_loss_unrolled,
             tuple(lgn.parameters()),
@@ -2936,27 +3489,18 @@ for i in pbar:
             and math.isfinite(lgn_meta_probe_norm)
         )
         scaled_meta = scale_scalar_objective(meta_loss_unrolled)
-        scaled_proxy = scale_scalar_objective(proxy_loss)
-        if meta_grad_usable:
-            lgn_total = scaled_meta + args.lgn_proxy_aux_weight * scaled_proxy
-        elif args.lgn_allow_proxy_fallback:
-            lgn_total = args.lgn_proxy_aux_weight * scaled_proxy
-            lgn_used_proxy_fallback = 1.0
+        if not meta_grad_usable:
             if _diag_should_log(i):
                 print(
-                    f"[DIAG iter={i}] fallback: use proxy_loss for LGN update "
+                    f"[DIAG iter={i}] skip LGN step: unusable meta gradients "
                     f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
                     f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
                 )
-        else:
-            if _diag_should_log(i):
-                print(
-                    f"[DIAG iter={i}] skip LGN step: unusable meta gradients and fallback disabled "
-                    f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
-                    f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
-                )
-            pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
+            if term_log_now:
+                pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
             continue
+
+        lgn_total = scaled_meta
 
         lgn_total.backward()
         lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
@@ -3004,10 +3548,11 @@ for i in pbar:
         sched.step()
 
     ###### D. Logging & Saving (Enhanced) ######
-    if train_lgn_phase:
-        pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Unroll: {lgn_update_loss:.3f}")
-    else:
-        pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
+    if term_log_now:
+        if train_lgn_phase:
+            pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Unroll: {lgn_update_loss:.3f}")
+        else:
+            pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
         success = torch.all(dist_obj > 0, 0)
@@ -3048,7 +3593,6 @@ for i in pbar:
             'Weight_Stats/Raw_Max': weights_seq.max(),
             'Weight_Stats/Raw_Mean': weights_seq.mean(),
             'Weight_Stats/Std': weight_std,
-            'Weight_Stats/L2_Reg': weight_l2,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
@@ -3081,8 +3625,6 @@ for i in pbar:
             'Guidance/Overspeed': guidance_components['overspeed'],
             'Guidance/Underspeed': guidance_components.get('underspeed', 0.0),
             'Guidance/Speed_Diff': guidance_components.get('speed_diff', 0.0),
-            'Guidance/Lateral_Error': guidance_components['lateral_error'],
-            'Guidance/Accel_Mismatch': guidance_components.get('accel_mismatch', 0.0),
             'Guidance/Escape': guidance_components['escape'],
             'Guidance/Depth': guidance_components['depth'],
             'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
@@ -3099,7 +3641,8 @@ for i in pbar:
             'Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
             'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
             'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
-            'Guidance/Planner_Success_Ratio': guidance_components.get('planner_success_ratio', 0.0),
+            'Guidance/Field_Dir_Align': guidance_components.get('field_dir_align', 0.0),
+            'Guidance/Applied_In_Current_Phase': 1.0 if train_lgn_phase else 0.0,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -3146,7 +3689,6 @@ for i in pbar:
             'Grad/LGN_MetaProbe_Norm': lgn_meta_probe_norm,
             'Grad/LGN_MetaProbe_NonFinite_Count': lgn_meta_probe_nonfinite,
             'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
-            'Train/LGN_UsedProxyFallback': lgn_used_proxy_fallback,
 
             # === [新增] 四个代理损失对 Worker 梯度的 norm ===
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
@@ -3296,12 +3838,22 @@ for i in pbar:
             astar_paths_all = guidance_components.get('sampled_astar_paths', [])
             astar_paths_sampled = astar_paths_all[idx] if (isinstance(astar_paths_all, list) and idx < len(astar_paths_all)) else []
 
+            use_potential_backend = bool(args.use_precomputed_potential_maps and not args.use_astar_guidance)
+            potential_map_for_html = None
+            if use_potential_backend and (POTENTIAL_MAP_CACHE is not None):
+                try:
+                    potential_map_for_html = POTENTIAL_MAP_CACHE.get_map(int(getattr(env, 'current_map_idx', 0)))
+                except Exception:
+                    potential_map_for_html = None
+
             if save_interactive_3d_html(
                 interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx,
                 astar_path=None, astar_paths_sampled=astar_paths_sampled,
+                potential_map_data=potential_map_for_html,
+                show_potential_overlay=use_potential_backend,
             ):
                 writer.add_text('Trajectory/Interactive3D_HTML', interactive_html, i + 1)
-            
+
             # 3. [新增] 速度时序图 (Vx,Vy,Vz,Speed)
             fig_v, ax = plt.subplots()
             v_cpu = v_history[:, idx].cpu()
@@ -3334,11 +3886,11 @@ for i in pbar:
 
             # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
             fig_w, ax = plt.subplots()
-            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际使用权重（无约束）
+            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际使用权重（非负）
             labels = ['Speed', 'Dir', 'Avoid', 'Expl']
             for wi in range(4):
                 ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Unconstrained)")
+            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Non-Negative)")
             writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
             plt.close(fig_w)
 

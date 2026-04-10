@@ -160,7 +160,7 @@ parser.add_argument('--worker_max_seq_len', type=int, default=32)
 parser.add_argument('--lgn_max_seq_len', type=int, default=32)
 
 # 环境Flag
-parser.add_argument('--single', default=False, action='store_true')
+parser.add_argument('--single', default=True, action='store_true')
 parser.add_argument('--gate', default=False, action='store_true')
 parser.add_argument('--ground_voxels', default=False, action='store_true')
 parser.add_argument('--scaffold', default=False, action='store_true')
@@ -521,7 +521,9 @@ def is_save_iter(i):
 
 
 def is_save_trajectory_iter(i):
-    return i == 0 or (i + 1) % 500 == 0
+    if i < 2000:
+        return i == 0 or (i + 1) % 100 == 0
+    return (i + 1) % 500 == 0
 
 
 def rotation_matrix_to_rpy_deg(R):
@@ -3838,19 +3840,11 @@ for i in pbar:
             astar_paths_all = guidance_components.get('sampled_astar_paths', [])
             astar_paths_sampled = astar_paths_all[idx] if (isinstance(astar_paths_all, list) and idx < len(astar_paths_all)) else []
 
-            use_potential_backend = bool(args.use_precomputed_potential_maps and not args.use_astar_guidance)
-            potential_map_for_html = None
-            if use_potential_backend and (POTENTIAL_MAP_CACHE is not None):
-                try:
-                    potential_map_for_html = POTENTIAL_MAP_CACHE.get_map(int(getattr(env, 'current_map_idx', 0)))
-                except Exception:
-                    potential_map_for_html = None
-
             if save_interactive_3d_html(
                 interactive_html, env, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx,
                 astar_path=None, astar_paths_sampled=astar_paths_sampled,
-                potential_map_data=potential_map_for_html,
-                show_potential_overlay=use_potential_backend,
+                potential_map_data=None,
+                show_potential_overlay=False,
             ):
                 writer.add_text('Trajectory/Interactive3D_HTML', interactive_html, i + 1)
 
@@ -3884,15 +3878,17 @@ for i in pbar:
             writer.add_figure('Trajectory/Control_Accel_Cmd_Series', fig_act, i + 1)
             plt.close(fig_act)
 
-            # 4. [新增] 权重时序变化图 - 验证 Step-wise 效果
-            fig_w, ax = plt.subplots()
+            # 4. 权重逐时间步变化图：按分量拆分保存
             w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际使用权重（非负）
-            labels = ['Speed', 'Dir', 'Avoid', 'Expl']
+            labels = ['Speed', 'Direction', 'Avoidance', 'Exploration']
+            tag_suffix = ['0_Speed', '1_Direction', '2_Avoidance', '3_Exploration']
             for wi in range(4):
+                fig_wi, ax = plt.subplots()
                 ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend(); ax.set_title(f"Iter {i} Weights Profile (Per Step, Non-Negative)")
-            writer.add_figure('Debug/Weights_StepWise', fig_w, i + 1)
-            plt.close(fig_w)
+                ax.legend()
+                ax.set_title(f"Iter {i} Weight Profile - {labels[wi]} (Per Step, Non-Negative)")
+                writer.add_figure(f'Debug/Weights_StepWise_{tag_suffix[wi]}', fig_wi, i + 1)
+                plt.close(fig_wi)
 
             # 4.1 [新增] 权重精确值记录（与轨迹同步，用于分析权重动态变化）
             writer.add_scalar('Weights_Snapshot/0_Speed', avg_weights[0], i + 1)

@@ -257,24 +257,341 @@ class Env(BaseEnv):
             return 0.5 * (usable_y0 + usable_y1)
         return random.uniform(lo, hi)
 
+    def _make_easy_forest_spec(self, kind):
+        if kind == "ball":
+            r = random.uniform(0.18, 0.34)
+            return {
+                "kind": "ball",
+                "r": r,
+                "z": self._sample_vertical_center(r, False),
+                "extent_x": r,
+                "extent_y": r,
+                "footprint_r": r,
+            }
+        if kind == "cyl":
+            r = random.uniform(0.16, 0.30)
+            return {
+                "kind": "cyl",
+                "r": r,
+                "extent_x": r,
+                "extent_y": r,
+                "footprint_r": r,
+            }
+        hx = random.uniform(0.22, 0.42)
+        hy = random.uniform(0.22, 0.48)
+        hz = random.uniform(0.45, 1.00)
+        return {
+            "kind": "box",
+            "hx": hx,
+            "hy": hy,
+            "hz": hz,
+            "z": self._sample_vertical_center(hz, False),
+            "extent_x": hx,
+            "extent_y": hy,
+            "footprint_r": max(hx, hy),
+        }
+
+    def _build_easy_forest_specs(self):
+        specs = []
+        for _ in range(self._scaled_region_count(7, min_count=3)):
+            specs.append(self._make_easy_forest_spec("ball"))
+        for _ in range(self._scaled_region_count(10, min_count=5)):
+            specs.append(self._make_easy_forest_spec("cyl"))
+        for _ in range(self._scaled_region_count(8, min_count=4)):
+            specs.append(self._make_easy_forest_spec("box"))
+        random.shuffle(specs)
+        return specs
+
+    def _try_place_forest_obstacle(self, spec, placed, bounds, pair_gap, max_tries=48, anchor=None, anchor_jitter=0.9):
+        x_min = bounds["x_lo"] + spec["extent_x"]
+        x_max = bounds["x_hi"] - spec["extent_x"]
+        y_min = bounds["y_lo"] + spec["extent_y"]
+        y_max = bounds["y_hi"] - spec["extent_y"]
+        if x_max <= x_min or y_max <= y_min:
+            return False
+
+        best_xy = None
+        best_score = None
+        for trial_idx in range(max_tries):
+            if anchor is not None and trial_idx < int(0.7 * max_tries):
+                x = min(max(anchor[0] + random.uniform(-anchor_jitter, anchor_jitter), x_min), x_max)
+                y = min(max(anchor[1] + random.uniform(-anchor_jitter, anchor_jitter), y_min), y_max)
+            else:
+                x = random.uniform(x_min, x_max)
+                y = random.uniform(y_min, y_max)
+
+            nearest_margin = 10.0
+            valid = True
+            for other in placed:
+                required = spec["footprint_r"] + other["footprint_r"] + pair_gap
+                dist = math.hypot(x - other["x"], y - other["y"])
+                if dist < required:
+                    valid = False
+                    break
+                nearest_margin = min(nearest_margin, dist - required)
+            if not valid:
+                continue
+
+            boundary_margin = min(x - x_min, x_max - x, y - y_min, y_max - y)
+            score = nearest_margin + 0.35 * boundary_margin + 0.01 * random.random()
+            if best_score is None or score > best_score:
+                best_score = score
+                best_xy = (x, y)
+
+        if best_xy is None:
+            return False
+
+        spec["x"], spec["y"] = best_xy
+        placed.append(spec)
+        return True
+
+    def _easy_obstacle_blocks_nav_band(self, obstacle):
+        z_ref = self.spawn_z_center
+        z_slack = 0.75
+        kind = obstacle["kind"]
+        if kind == "cyl":
+            return True
+        if kind == "ball":
+            return abs(obstacle["z"] - z_ref) <= obstacle["r"] + z_slack
+        return abs(obstacle["z"] - z_ref) <= obstacle["hz"] + z_slack
+
+    def _build_easy_nav_grid(self, obstacles, y0, y1, resolution=0.40, inflate=0.42):
+        x_lo = 0.35
+        x_hi = self.map_x_max - 0.35
+        y_lo = y0 + self.blank_length
+        y_hi = y1 - self.blank_length
+        nx = max(12, int(math.ceil((x_hi - x_lo) / resolution)))
+        ny = max(12, int(math.ceil((y_hi - y_lo) / resolution)))
+        occ = [[False for _ in range(nx)] for _ in range(ny)]
+        x_centers = [x_lo + (ix + 0.5) * resolution for ix in range(nx)]
+        y_centers = [y_lo + (iy + 0.5) * resolution for iy in range(ny)]
+
+        blockers = [obs for obs in obstacles if self._easy_obstacle_blocks_nav_band(obs)]
+        for iy, y_c in enumerate(y_centers):
+            row = occ[iy]
+            for ix, x_c in enumerate(x_centers):
+                blocked = False
+                for obs in blockers:
+                    dx = x_c - obs["x"]
+                    dy = y_c - obs["y"]
+                    if obs["kind"] == "box":
+                        if abs(dx) <= obs["hx"] + inflate and abs(dy) <= obs["hy"] + inflate:
+                            blocked = True
+                            break
+                    else:
+                        rr = obs["r"] + inflate
+                        if dx * dx + dy * dy <= rr * rr:
+                            blocked = True
+                            break
+                row[ix] = blocked
+        return occ, x_centers, y_centers, resolution
+
+    def _easy_nav_has_connection(self, occ):
+        ny = len(occ)
+        nx = len(occ[0]) if ny > 0 else 0
+        if nx == 0:
+            return True
+
+        queue = []
+        visited = [[False for _ in range(nx)] for _ in range(ny)]
+        for ix in range(nx):
+            if not occ[0][ix]:
+                visited[0][ix] = True
+                queue.append((0, ix))
+
+        head = 0
+        while head < len(queue):
+            iy, ix = queue[head]
+            head += 1
+            if iy == ny - 1:
+                return True
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nyi = iy + dy
+                nxi = ix + dx
+                if 0 <= nyi < ny and 0 <= nxi < nx and (not visited[nyi][nxi]) and (not occ[nyi][nxi]):
+                    visited[nyi][nxi] = True
+                    queue.append((nyi, nxi))
+        return False
+
+    def _find_easy_direct_band(self, occ, x_centers, y_centers, resolution):
+        ny = len(occ)
+        nx = len(occ[0]) if ny > 0 else 0
+        if nx == 0:
+            return None
+
+        min_run = max(6, int(round(0.82 * ny)))
+        min_width = max(3, int(math.ceil(1.6 / max(resolution, 1e-6))))
+
+        col_runs = [None for _ in range(nx)]
+        for ix in range(nx):
+            best_len = 0
+            best_center = 0.5 * (y_centers[0] + y_centers[-1])
+            run_start = None
+            for iy in range(ny):
+                is_open = not occ[iy][ix]
+                if is_open and run_start is None:
+                    run_start = iy
+                if (not is_open or iy == ny - 1) and run_start is not None:
+                    run_end = iy if is_open and iy == ny - 1 else iy - 1
+                    run_len = run_end - run_start + 1
+                    if run_len > best_len:
+                        best_len = run_len
+                        best_center = 0.5 * (y_centers[run_start] + y_centers[run_end])
+                    run_start = None
+            if best_len >= min_run:
+                col_runs[ix] = (best_len, best_center)
+
+        best_band = None
+        band_start = None
+        for ix in range(nx + 1):
+            active = ix < nx and col_runs[ix] is not None
+            if active and band_start is None:
+                band_start = ix
+            if (not active) and band_start is not None:
+                band_end = ix - 1
+                band_width = band_end - band_start + 1
+                if band_width >= min_width:
+                    x_anchor = 0.5 * (x_centers[band_start] + x_centers[band_end])
+                    y_anchor = sum(col_runs[j][1] for j in range(band_start, band_end + 1)) / float(band_width)
+                    score = band_width * sum(col_runs[j][0] for j in range(band_start, band_end + 1))
+                    candidate = (score, x_anchor, y_anchor)
+                    if best_band is None or candidate[0] > best_band[0]:
+                        best_band = candidate
+                band_start = None
+
+        if best_band is None:
+            return None
+        return best_band[1], best_band[2]
+
+    def _densest_easy_window_center(self, occ, x_centers, y_centers, resolution):
+        ny = len(occ)
+        nx = len(occ[0]) if ny > 0 else 0
+        if nx == 0:
+            return self.spawn_x_center, 0.0, 0.0
+
+        win_x = max(3, int(math.ceil(1.6 / max(resolution, 1e-6))))
+        win_y = max(3, int(math.ceil(1.4 / max(resolution, 1e-6))))
+        best_density = -1.0
+        best_center = (self.spawn_x_center, 0.5 * (y_centers[0] + y_centers[-1]), 0.0)
+
+        for iy0 in range(0, max(1, ny - win_y + 1)):
+            iy1 = min(ny, iy0 + win_y)
+            for ix0 in range(0, max(1, nx - win_x + 1)):
+                ix1 = min(nx, ix0 + win_x)
+                total = (iy1 - iy0) * (ix1 - ix0)
+                blocked = 0
+                for iy in range(iy0, iy1):
+                    for ix in range(ix0, ix1):
+                        blocked += 1 if occ[iy][ix] else 0
+                density = blocked / float(max(1, total))
+                if density > best_density:
+                    x_c = 0.5 * (x_centers[ix0] + x_centers[ix1 - 1])
+                    y_c = 0.5 * (y_centers[iy0] + y_centers[iy1 - 1])
+                    best_density = density
+                    best_center = (x_c, y_c, density)
+        return best_center
+
+    def _relax_easy_forest_obstacle(self, placed, target_xy=None, remove=False):
+        if not placed:
+            return False
+
+        best_idx = None
+        best_score = None
+        tx, ty = (target_xy if target_xy is not None else (self.spawn_x_center, 0.0))
+        for idx, obs in enumerate(placed):
+            size = obs["footprint_r"]
+            dist = math.hypot(obs["x"] - tx, obs["y"] - ty)
+            score = size - 0.20 * dist
+            if best_score is None or score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is None:
+            return False
+
+        obs = placed[best_idx]
+        if remove or obs["footprint_r"] < 0.22:
+            del placed[best_idx]
+            return True
+
+        if obs["kind"] == "box":
+            obs["hx"] *= 0.82
+            obs["hy"] *= 0.82
+            obs["hz"] *= 0.90
+            obs["extent_x"] = obs["hx"]
+            obs["extent_y"] = obs["hy"]
+            obs["footprint_r"] = max(obs["hx"], obs["hy"])
+            obs["z"] = min(max(obs["z"], obs["hz"] + 0.10), self.map_z_max - obs["hz"] - 0.10)
+        else:
+            obs["r"] *= 0.84
+            obs["extent_x"] = obs["r"]
+            obs["extent_y"] = obs["r"]
+            obs["footprint_r"] = obs["r"]
+            if obs["kind"] == "ball":
+                obs["z"] = min(max(obs["z"], obs["r"] + 0.10), self.map_z_max - obs["r"] - 0.10)
+        return True
+
+    def _make_easy_band_breaker(self):
+        if random.random() < 0.75:
+            return self._make_easy_forest_spec("cyl")
+        return self._make_easy_forest_spec("box")
+
+    def _generate_easy_forest_region(self, y0, y1):
+        bounds = {
+            "x_lo": 0.45,
+            "x_hi": self.map_x_max - 0.45,
+            "y_lo": y0 + self.blank_length + 0.25,
+            "y_hi": y1 - self.blank_length - 0.25,
+        }
+        pair_gap = 0.78
+        placed = []
+
+        for spec in self._build_easy_forest_specs():
+            if self._try_place_forest_obstacle(spec, placed, bounds, pair_gap, max_tries=56):
+                continue
+            self._try_place_forest_obstacle(spec, placed, bounds, pair_gap * 0.88, max_tries=32)
+
+        for _ in range(6):
+            occ, x_centers, y_centers, res = self._build_easy_nav_grid(placed, y0, y1)
+            total_cells = len(occ) * len(occ[0]) if occ and occ[0] else 1
+            blocked_cells = sum(1 for row in occ for cell in row if cell)
+            blocked_ratio = blocked_cells / float(total_cells)
+            connected = self._easy_nav_has_connection(occ)
+            band_anchor = self._find_easy_direct_band(occ, x_centers, y_centers, res)
+            dense_x, dense_y, dense_ratio = self._densest_easy_window_center(occ, x_centers, y_centers, res)
+
+            if band_anchor is not None and blocked_ratio < 0.32:
+                breaker = self._make_easy_band_breaker()
+                if self._try_place_forest_obstacle(
+                    breaker, placed, bounds, pair_gap * 0.82, max_tries=40, anchor=band_anchor, anchor_jitter=0.65
+                ):
+                    continue
+
+            if not connected:
+                if self._relax_easy_forest_obstacle(placed, target_xy=(dense_x, dense_y), remove=True):
+                    continue
+
+            if blocked_ratio > 0.34 or dense_ratio > 0.58:
+                if self._relax_easy_forest_obstacle(placed, target_xy=(dense_x, dense_y), remove=False):
+                    continue
+
+            break
+
+        balls = []
+        cyls = []
+        voxels = []
+        for obs in placed:
+            if obs["kind"] == "ball":
+                balls.append([obs["x"], obs["y"], obs["z"], obs["r"]])
+            elif obs["kind"] == "cyl":
+                cyls.append([obs["x"], obs["y"], obs["r"]])
+            else:
+                voxels.append([obs["x"], obs["y"], obs["z"], obs["hx"], obs["hy"], obs["hz"]])
+        return balls, cyls, voxels
+
     def _generate_random_region(self, difficulty, y0, y1):
         if difficulty == "easy":
-            segments = self._easy_corridor_segments(y0, y1)
-            # 增加 easy 区域的障碍物数量
-            ball_count = self._scaled_region_count(8, min_count=4)
-            cyl_count = self._scaled_region_count(8, min_count=4)
-            box_count = self._scaled_region_count(12, min_count=6)
-            cfg = {
-                "ball_r": (0.35, 0.60),
-                "cyl_r": (0.24, 0.45),
-                "box_hx": (0.35, 0.70),
-                "box_hy": (0.30, 0.80),
-                "box_hz": (0.40, 1.10),
-                "clearance": 0.28,
-                "hug_boundary": False,
-                "prefer_extremes": False,
-                "full_height_prob": 0.0,
-            }
+            return self._generate_easy_forest_region(y0, y1)
         else:
             segments = self._hard_corridor_segments(y0, y1)
             ball_count = self._scaled_region_count(6, min_count=3)

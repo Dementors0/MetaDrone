@@ -1,6 +1,5 @@
-#7.4
-#添加梯度链路日志增加路径修复二阶梯度
-
+#7.6
+#更改easy部分的障碍物生成逻辑 + 预览html脚本
 import argparse
 import atexit
 import math

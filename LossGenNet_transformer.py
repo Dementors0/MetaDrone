@@ -11,6 +11,8 @@ class LossGenNet(nn.Module):
     def __init__(
         self,
         state_dim,
+        geom_dim=19,
+        progress_dim=8,
         hidden_dim=128,
         nhead=4,
         num_layers=2,
@@ -47,6 +49,25 @@ class LossGenNet(nn.Module):
             nn.Tanh()
         )
 
+        # 2.1 显式几何/风险特征映射
+        self.geom_proj = nn.Sequential(
+            nn.Linear(geom_dim, hidden_dim),
+            nn.Tanh()
+        )
+
+        # 2.2 近期进展/卡住特征映射
+        self.progress_proj = nn.Sequential(
+            nn.Linear(progress_dim, hidden_dim),
+            nn.Tanh()
+        )
+
+        # 2.3 多模态融合：concat -> projection
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
         # 3. 时序编码器（因果 Mask，保证只看当前及历史）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -69,11 +90,13 @@ class LossGenNet(nn.Module):
             nn.Linear(hidden_dim, 4),  # [Vel, Dir, Obs, Expl]
         )
 
-    def forward(self, depth_feat, state, hx=None):
+    def forward(self, depth_feat, state, geom_feat, progress_feat, hx=None):
         """
         参数:
             depth_feat: [B, 1, 12, 16] 深度图
             state: [B, state_dim] 物理状态
+            geom_feat: [B, geom_dim] 深度图几何/风险统计特征
+            progress_feat: [B, progress_dim] 近期进展/卡住统计特征
             hx: [B, T_mem, hidden_dim] 历史记忆 token (如果是第一步则为 None)
         返回:
             weights: [B, 4]
@@ -85,11 +108,16 @@ class LossGenNet(nn.Module):
         
         # 2. 提取状态特征
         s_emb = self.state_proj(state)
-        
-        # 3. 生成当前 token
-        current_token = self.pre_norm(v_emb + s_emb)
 
-        # 4. 时序记忆更新
+        # 3. 提取显式几何与进展特征
+        g_emb = self.geom_proj(geom_feat)
+        p_emb = self.progress_proj(progress_feat)
+        
+        # 4. 生成当前 token（多模态拼接后再融合）
+        fused = torch.cat([v_emb, s_emb, g_emb, p_emb], dim=-1)
+        current_token = self.pre_norm(self.fusion_proj(fused))
+
+        # 5. 时序记忆更新
         if hx is None:
             seq = current_token.unsqueeze(1)
         else:
@@ -106,9 +134,9 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 5. 生成非负权重（不做归一化，仅约束 >= 0）
+        # 6. 生成非负权重（不做归一化，仅约束 >= 0）
         raw = self.head(last_token)
         weights = F.softplus(raw)
 
-        # 返回 weights 和 新的记忆序列
-        return weights, seq
+        # 返回 weights 和 Transformer 编码后的记忆序列
+        return weights, x_out

@@ -43,6 +43,8 @@ parser.add_argument('--coef_bias', type=float, default=0.0, help='legacy')
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
+parser.add_argument('--obstacle_count_scale', type=float, default=0.5,
+                    help='global multiplier for obstacle counts')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--maze_update_interval', type=int, default=50,
@@ -85,6 +87,7 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           gate=args.gate, ground_voxels=args.ground_voxels,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle,
+          obstacle_count_scale=args.obstacle_count_scale,
           include_u_local_optimum=args.include_u_local_optimum,
           compact_two_zone_map=args.compact_two_zone_map,
           wall_physical_feedback=args.wall_physical_feedback)

@@ -38,7 +38,7 @@ def _make_env(include_u_local_optimum: bool, compact_two_zone_map: bool):
         scene_scale=1.0,
         random_rotation=False,
         cam_angle=10,
-        obstacle_count_scale=1.0,
+        obstacle_count_scale=0.5,
         speed_limit_softness=0.05,
         max_speed_ceiling=10.0,
         hard_vpred_clip=20.0,

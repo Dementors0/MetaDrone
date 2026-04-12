@@ -1,5 +1,5 @@
-#7.4
-#添加梯度链路日志增加路径修复二阶梯度
+#7.7
+#加入感知，修改地图障碍物平均分布
 
 import argparse
 import atexit
@@ -107,6 +107,158 @@ def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
     return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
 
 
+def extract_depth_geometry_features(depth, near_threshold=1.5):
+    """
+    从原始深度图提取显式几何/风险统计特征。
+
+    输入:
+        depth: [B, H, W]
+    输出:
+        geom_feat: [B, 19]
+    """
+    d = depth.clamp(0.3, 24.0)
+    B, H, W = d.shape
+
+    w1 = max(1, W // 3)
+    w2 = max(w1 + 1, (2 * W) // 3)
+    w2 = min(w2, W - 1) if W > 2 else w2
+
+    h1 = max(1, H // 3)
+    h2 = max(h1 + 1, (2 * H) // 3)
+    h2 = min(h2, H - 1) if H > 2 else h2
+
+    left = d[:, :, :w1]
+    center = d[:, :, w1:w2]
+    right = d[:, :, w2:]
+
+    upper = d[:, :h1, :]
+    middle = d[:, h1:h2, :]
+    lower = d[:, h2:, :]
+
+    def _mean_min_ratio(region):
+        flat = region.reshape(B, -1)
+        mean_v = flat.mean(dim=-1)
+        min_v = flat.min(dim=-1).values
+        near_ratio = (flat < near_threshold).float().mean(dim=-1)
+        return mean_v, min_v, near_ratio
+
+    def _mean_ratio(region):
+        flat = region.reshape(B, -1)
+        mean_v = flat.mean(dim=-1)
+        near_ratio = (flat < near_threshold).float().mean(dim=-1)
+        return mean_v, near_ratio
+
+    l_mean, l_min, l_ratio = _mean_min_ratio(left)
+    c_mean, c_min, c_ratio = _mean_min_ratio(center)
+    r_mean, r_min, r_ratio = _mean_min_ratio(right)
+
+    u_mean, u_ratio = _mean_ratio(upper)
+    m_mean, m_ratio = _mean_ratio(middle)
+    lo_mean, lo_ratio = _mean_ratio(lower)
+
+    flat_all = d.reshape(B, -1)
+    g_mean = flat_all.mean(dim=-1)
+    g_std = flat_all.std(dim=-1, unbiased=False)
+    lr_diff = l_mean - r_mean
+    center_vs_side = c_mean - 0.5 * (l_mean + r_mean)
+
+    geom_feat = torch.stack([
+        l_mean, l_min, l_ratio,
+        c_mean, c_min, c_ratio,
+        r_mean, r_min, r_ratio,
+        u_mean, u_ratio,
+        m_mean, m_ratio,
+        lo_mean, lo_ratio,
+        g_mean, g_std, lr_diff, center_vs_side,
+    ], dim=-1)
+    return sanitize_tensor(geom_feat, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
+
+
+def extract_progress_features(p_history_list, v_history_list, dist_obj_history_list, p_target, window=8):
+    """
+    构造近期进展/卡住摘要特征。
+
+    输出维度: [B, 8]
+    - progress_to_goal
+    - disp_k
+    - speed_mean_k
+    - collision_depth_mean_k
+    - stuck_score
+    - progress_efficiency
+    - tortuosity
+    - heading_align_improvement
+    """
+    if len(p_history_list) == 0:
+        B = p_target.shape[0]
+        return torch.zeros((B, 8), device=p_target.device, dtype=p_target.dtype)
+
+    p_now = p_history_list[-1]
+    device = p_now.device
+    dtype = p_now.dtype
+
+    k = max(1, min(int(window), len(p_history_list)))
+    p_prev = p_history_list[-k]
+
+    dist_now = safe_l2_norm(p_target - p_now, dim=-1)
+    dist_prev = safe_l2_norm(p_target - p_prev, dim=-1)
+    progress_to_goal = dist_prev - dist_now
+
+    disp_k = safe_l2_norm(p_now - p_prev, dim=-1)
+
+    v_tail = torch.stack(v_history_list[-k:], dim=0)
+    speed_mean_k = safe_l2_norm(v_tail, dim=-1).mean(dim=0)
+
+    if len(dist_obj_history_list) > 0:
+        dist_tail = torch.stack(dist_obj_history_list[-k:], dim=0)
+        depth_tail = F.relu(-dist_tail)
+        # dist_tail 可能是 [k, B] 或 [k, sub_div, B]，统一压缩到 [B]
+        while depth_tail.dim() > 1:
+            depth_tail = depth_tail.mean(dim=0)
+        collision_depth_mean_k = depth_tail
+    else:
+        collision_depth_mean_k = torch.zeros_like(progress_to_goal)
+
+    stuck_score = F.softplus((0.3 - disp_k) * 10.0)
+    # 效率比: 跑了多少净位移是否真正转化为接近目标
+    progress_efficiency = progress_to_goal / (disp_k + 1e-6)
+
+    # 曲折度: 窗口路径长度 / 窗口净位移，越大表示越绕/打转
+    p_tail = torch.stack(p_history_list[-k:], dim=0)  # [k, B, 3]
+    if k > 1:
+        path_len_k = safe_l2_norm(p_tail[1:] - p_tail[:-1], dim=-1).sum(dim=0)
+    else:
+        path_len_k = torch.zeros_like(disp_k)
+    tortuosity = path_len_k / (disp_k + 1e-6)
+
+    v_now = v_history_list[-1]
+    target_dir_now = safe_normalize(p_target - p_now, dim=-1)
+    v_dir_now = safe_normalize(v_now, dim=-1)
+    heading_align_now = (v_dir_now * target_dir_now).sum(dim=-1)
+
+    if len(v_history_list) >= k:
+        v_prev = v_history_list[-k]
+        target_dir_prev = safe_normalize(p_target - p_prev, dim=-1)
+        v_dir_prev = safe_normalize(v_prev, dim=-1)
+        heading_align_prev = (v_dir_prev * target_dir_prev).sum(dim=-1)
+        heading_align_improvement = heading_align_now - heading_align_prev
+    else:
+        heading_align_improvement = torch.zeros_like(heading_align_now)
+
+    progress_feat = torch.stack([
+        progress_to_goal,
+        disp_k,
+        speed_mean_k,
+        collision_depth_mean_k,
+        stuck_score,
+        progress_efficiency,
+        tortuosity,
+        heading_align_improvement,
+    ], dim=-1)
+
+    progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
+    return progress_feat.to(device=device, dtype=dtype)
+
+
 @torch.no_grad()
 def sanitize_module_(module, clamp_value=10.0):
     for p in module.parameters():
@@ -142,7 +294,7 @@ parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v
 parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
-parser.add_argument('--timesteps', type=int, default=300)
+parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--lgn_timesteps', type=int, default=40,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--exploration_time_window', type=int, default=50,
@@ -185,7 +337,7 @@ parser.add_argument('--compact_two_zone_map', dest='compact_two_zone_map', actio
                     help='Use compact two-zone map (easy+hard only), with smaller map and adjusted start/goal planes')
 parser.add_argument('--no_compact_two_zone_map', dest='compact_two_zone_map', action='store_false',
                     help='Use default map layout (current behavior)')
-parser.set_defaults(compact_two_zone_map=False)
+parser.set_defaults(compact_two_zone_map=True)
 # [开关2] 墙壁物理反馈开关（默认: 关闭）
 # - 默认行为：不传任何参数时 wall_physical_feedback=False，采用自由运动结果（当前代码行为）。
 # - 开启反馈：--wall_physical_feedback（启用软接触反馈，修正穿墙/贴墙时的位置与速度）
@@ -323,7 +475,7 @@ parser.add_argument('--potential_delta_margin', type=float, default=-0.01,
                     help='Delta margin in potential decrease loss: ReLU(phi[t+1]-phi[t]+delta)')
 parser.add_argument('--use_astar_guidance', default=False, action='store_true',
                     help='Force legacy online A* guidance even when precomputed maps are enabled')
-parser.add_argument('--diag_interval', type=int, default=1,
+parser.add_argument('--diag_interval', type=int, default=100,
                     help='Print detailed DIAG logs every N iterations (<=0 disables)')
 parser.add_argument('--diag_second_order', default=True, action='store_true',
                     help='Enable heavy second-order diagnostic probes (can be noisy and slow)')
@@ -462,6 +614,8 @@ print(
 )
 
 state_dim = 7 if args.no_odom else 10
+geom_dim = 19
+progress_dim = 8
 
 if args.no_odom:
     try:
@@ -478,6 +632,8 @@ worknet = worknet.to(device)
 try:
     lgn = LossGenNet(
         state_dim=state_dim,
+        geom_dim=geom_dim,
+        progress_dim=progress_dim,
         max_seq_len=args.lgn_max_seq_len,
         output_temperature=args.lgn_output_temperature,
         weight_floor=args.lgn_weight_floor,
@@ -485,6 +641,8 @@ try:
 except TypeError:
     lgn = LossGenNet(state_dim=state_dim).to(device)
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
+geom_normalizer = RunningMeanStd(shape=(geom_dim,)).to(device)
+progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
 
 ########## 4. 加载预训练模型 ##########
 # def load_checkpoint(model, path, name):
@@ -517,7 +675,7 @@ def smooth_dict(ori_dict):
         scaler_q[k].append(float(v))
 
 def is_save_iter(i):
-    return (i + 1) % 10000 == 0 if i >= 2000 else (i + 1) % 500 == 0
+    return (i + 1) % 1000 == 0 if i >= 2000 else (i + 1) % 500 == 0
 
 
 def is_save_trajectory_iter(i):
@@ -2655,7 +2813,7 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
             y_vals.extend([[by - br], [by + br]])
             z_vals.extend([[bz - br], [bz + br]])
 
-    z0_vis, z1_vis = -0.2, 2.2
+    z0_vis, z1_vis = 0.0, 5.0
     if hasattr(env, 'cyl') and env.cyl.numel() > 0:
         cyl = env.cyl[idx].detach().cpu().numpy()
         for cx, cy, cr in cyl[:100]:
@@ -3049,6 +3207,9 @@ for i in pbar:
     trajectory_lgn_weights = []
     v_preds = []
     act_for_diag = None
+    dist_obj_history = []
+    geom_feat_last = None
+    progress_feat_last = None
 
     h = None
     lgn_hx = None
@@ -3067,7 +3228,10 @@ for i in pbar:
         p_history.append(env.p)
         v_history.append(env.v)
         a_history.append(env.a)
-        vec_to_pt_history.append(env.find_vec_to_nearest_pt())
+        vec_curr = env.find_vec_to_nearest_pt()
+        vec_to_pt_history.append(vec_curr)
+        dist_obj_curr = safe_l2_norm(vec_curr, dim=-1) - env.margin
+        dist_obj_history.append(dist_obj_curr)
         rpy_history.append(rotation_matrix_to_rpy_deg(env.R))
         R_history.append(env.R.detach().clone())  # 保存姿态矩阵
 
@@ -3089,8 +3253,24 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
+        geom_feat_raw = extract_depth_geometry_features(depth)
+        geom_feat = geom_normalizer(geom_feat_raw, update=True)
+        geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+        progress_feat_raw = extract_progress_features(
+            p_history_list=p_history,
+            v_history_list=v_history,
+            dist_obj_history_list=dist_obj_history,
+            p_target=env.p_target,
+            window=8,
+        )
+        progress_feat = progress_normalizer(progress_feat_raw, update=True)
+        progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        geom_feat_last = geom_feat
+        progress_feat_last = progress_feat
+
         # LGN Forward (训练侧执行正值非归一化约束)
-        current_weights, lgn_hx = lgn(x_pooled, state_tensor, lgn_hx)
+        current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
 
         if t == 0 and _diag_should_log(i):
             first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
@@ -3198,8 +3378,8 @@ for i in pbar:
             f"[DIAG iter={i}] loss_raw requires_grad: speed={loss_speed_seq.requires_grad}, "
             f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, expl={loss_exploration_seq.requires_grad}"
         )
-    # 非负且可导的平滑映射，避免 clamp 在负区零梯度。
-    effective_weights_seq = F.softplus(weights_seq_raw, beta=2.0)
+    # LGN 输出已做非负约束，这里直接使用，避免双重 softplus 压缩动态范围。
+    effective_weights_seq = weights_seq_raw
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
@@ -3666,6 +3846,10 @@ for i in pbar:
             'Norm/State_Mean': state_normalizer.mean[0],
             'Norm/State_Var': state_normalizer.var[0],
             'Norm/Update_Count': state_normalizer.count,
+            'Norm/Geom_Mean': geom_normalizer.mean[0],
+            'Norm/Geom_Var': geom_normalizer.var[0],
+            'Norm/Progress_Mean': progress_normalizer.mean[0],
+            'Norm/Progress_Var': progress_normalizer.var[0],
 
             # === [兼容] 保留旧命名 ===
             'Stats/Norm_Mean': state_normalizer.mean[0],
@@ -3712,6 +3896,18 @@ for i in pbar:
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
             log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur
+
+        if geom_feat_last is not None and progress_feat_last is not None:
+            log_data['LGN_Input/Geom_Mean'] = geom_feat_last.mean()
+            log_data['LGN_Input/Geom_Std'] = geom_feat_last.std(unbiased=False)
+            log_data['LGN_Input/Geom_Norm'] = geom_feat_last.norm(dim=-1).mean()
+            log_data['LGN_Input/Progress_Mean'] = progress_feat_last.mean()
+            log_data['LGN_Input/Progress_Std'] = progress_feat_last.std(unbiased=False)
+            log_data['LGN_Input/Progress_Norm'] = progress_feat_last.norm(dim=-1).mean()
+            for feat_idx in range(min(4, geom_feat_last.shape[-1])):
+                log_data[f'LGN_Input/Geom_{feat_idx}'] = geom_feat_last[:, feat_idx].mean()
+            for feat_idx in range(min(4, progress_feat_last.shape[-1])):
+                log_data[f'LGN_Input/Progress_{feat_idx}'] = progress_feat_last[:, feat_idx].mean()
 
         smooth_dict(log_data)
 
@@ -3782,7 +3978,7 @@ for i in pbar:
                     z_all.extend([torch.tensor([bz - br]), torch.tensor([bz + br])])
 
             # cyl: 竖直圆柱障碍物 (cx, cy, r), 沿 z 方向
-            z0_vis, z1_vis = -0.2, 2.2
+            z0_vis, z1_vis = 0.0, 5.0
             if len(z_all) > 0:
                 z_stack = torch.cat(z_all)
                 z0_vis = min(z0_vis, float(z_stack.min().item()) - 0.1)

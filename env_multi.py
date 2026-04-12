@@ -42,6 +42,12 @@ class Env(BaseEnv):
         self.map_y_min = -self.map_y_half
         self.map_y_max = self.map_y_half
         self.map_z_max = 5.0
+        self.ground_z = 0.0
+        self.ceiling_z = self.map_z_max
+        self.cyl_tree_radius = 0.15  # ~30 cm diameter
+        self.object_height = self.map_z_max / 3.0
+        self.object_half_height = 0.5 * self.object_height
+        self.two_drone_passage_width = 0.60
         self.region_types = ("easy", "hard") if self.compact_two_zone_map else (
             ("easy", "hard", "u-minimal") if bool(include_u_local_optimum) else ("hard", "easy", "easy")
         )
@@ -256,6 +262,160 @@ class Env(BaseEnv):
         if hi <= lo:
             return 0.5 * (usable_y0 + usable_y1)
         return random.uniform(lo, hi)
+
+    def _sample_embedded_center_z(self, half_h):
+        # Allow partial embedding into floor/ceiling, but keep at least a small part inside.
+        eps_inside = 0.02
+        lo = self.ground_z - half_h + eps_inside
+        hi = self.ceiling_z + half_h - eps_inside
+        if hi <= lo:
+            return 0.5 * (self.ground_z + self.ceiling_z)
+        return random.uniform(lo, hi)
+
+    def _make_scatter_spec(self, kind):
+        if kind == "ball":
+            r = self.object_half_height
+            return {
+                "kind": "ball",
+                "r": r,
+                "z": self._sample_embedded_center_z(r),
+                "extent_x": r,
+                "extent_y": r,
+                "footprint_r": r,
+            }
+        if kind == "cyl":
+            r = self.cyl_tree_radius
+            return {
+                "kind": "cyl",
+                "r": r,
+                "extent_x": r,
+                "extent_y": r,
+                "footprint_r": r,
+            }
+        hx = random.uniform(0.26, 0.62)
+        hy = random.uniform(0.26, 0.72)
+        hz = self.object_half_height
+        return {
+            "kind": "box",
+            "hx": hx,
+            "hy": hy,
+            "hz": hz,
+            "z": self._sample_embedded_center_z(hz),
+            "extent_x": hx,
+            "extent_y": hy,
+            "footprint_r": max(hx, hy),
+        }
+
+    def _build_scatter_specs(self, difficulty):
+        density = 0.55 if difficulty == "easy" else 1.0
+        base_counts = {
+            "ball": 3,
+            "cyl": 18,
+            "box": 6,
+        }
+        min_counts = {
+            "easy": {"ball": 1, "cyl": 4, "box": 2},
+            "hard": {"ball": 2, "cyl": 8, "box": 3},
+        }
+
+        counts = {}
+        for kind, base in base_counts.items():
+            scaled_base = max(1, int(round(base * density)))
+            counts[kind] = self._scaled_region_count(scaled_base, min_count=min_counts[difficulty][kind])
+
+        specs = []
+        for _ in range(counts["ball"]):
+            specs.append(self._make_scatter_spec("ball"))
+        for _ in range(counts["cyl"]):
+            specs.append(self._make_scatter_spec("cyl"))
+        for _ in range(counts["box"]):
+            specs.append(self._make_scatter_spec("box"))
+        random.shuffle(specs)
+        return specs
+
+    def _place_scatter_specs(self, specs, bounds, pair_gap):
+        placed = []
+        for spec in specs:
+            obs = dict(spec)
+            if self._try_place_forest_obstacle(obs, placed, bounds, pair_gap, max_tries=56):
+                continue
+            if self._try_place_forest_obstacle(obs, placed, bounds, pair_gap * 0.75, max_tries=28):
+                continue
+
+            # Fallback: still place uniformly to keep per-batch obstacle tensor shape stable.
+            x_min = bounds["x_lo"] + obs["extent_x"]
+            x_max = bounds["x_hi"] - obs["extent_x"]
+            y_min = bounds["y_lo"] + obs["extent_y"]
+            y_max = bounds["y_hi"] - obs["extent_y"]
+            if x_max <= x_min:
+                obs["x"] = 0.5 * (bounds["x_lo"] + bounds["x_hi"])
+            else:
+                obs["x"] = random.uniform(x_min, x_max)
+            if y_max <= y_min:
+                obs["y"] = 0.5 * (bounds["y_lo"] + bounds["y_hi"])
+            else:
+                obs["y"] = random.uniform(y_min, y_max)
+            placed.append(obs)
+        return placed
+
+    def _obstacle_blocks_nav_slice(self, obstacle, nav_z):
+        kind = obstacle["kind"]
+        if kind == "cyl":
+            return True
+        if kind == "ball":
+            return abs(obstacle["z"] - nav_z) <= obstacle["r"]
+        return abs(obstacle["z"] - nav_z) <= obstacle["hz"]
+
+    def _build_scatter_nav_grid(self, obstacles, y0, y1, resolution=0.35, inflate=0.30):
+        x_lo = 0.35
+        x_hi = self.map_x_max - 0.35
+        y_lo = y0 + self.blank_length
+        y_hi = y1 - self.blank_length
+        nx = max(12, int(math.ceil((x_hi - x_lo) / resolution)))
+        ny = max(12, int(math.ceil((y_hi - y_lo) / resolution)))
+        occ = [[False for _ in range(nx)] for _ in range(ny)]
+        x_centers = [x_lo + (ix + 0.5) * resolution for ix in range(nx)]
+        y_centers = [y_lo + (iy + 0.5) * resolution for iy in range(ny)]
+
+        blockers = [obs for obs in obstacles if self._obstacle_blocks_nav_slice(obs, self.spawn_z_center)]
+        for iy, y_c in enumerate(y_centers):
+            row = occ[iy]
+            for ix, x_c in enumerate(x_centers):
+                blocked = False
+                for obs in blockers:
+                    dx = x_c - obs["x"]
+                    dy = y_c - obs["y"]
+                    if obs["kind"] == "box":
+                        if abs(dx) <= obs["hx"] + inflate and abs(dy) <= obs["hy"] + inflate:
+                            blocked = True
+                            break
+                    else:
+                        rr = obs["r"] + inflate
+                        if dx * dx + dy * dy <= rr * rr:
+                            blocked = True
+                            break
+                row[ix] = blocked
+        return occ
+
+    @staticmethod
+    def _blocked_ratio(occ):
+        total = len(occ) * len(occ[0]) if occ and occ[0] else 1
+        blocked = sum(1 for row in occ for cell in row if cell)
+        return blocked / float(total)
+
+    @staticmethod
+    def _packed_obstacle_lists(placed):
+        balls = []
+        cyls = []
+        voxels = []
+        for obs in placed:
+            if obs["kind"] == "ball":
+                balls.append([obs["x"], obs["y"], obs["z"], obs["r"]])
+            elif obs["kind"] == "cyl":
+                cyls.append([obs["x"], obs["y"], obs["r"]])
+            else:
+                voxels.append([obs["x"], obs["y"], obs["z"], obs["hx"], obs["hy"], obs["hz"]])
+        return balls, cyls, voxels
 
     def _make_easy_forest_spec(self, kind):
         if kind == "ball":
@@ -590,65 +750,43 @@ class Env(BaseEnv):
         return balls, cyls, voxels
 
     def _generate_random_region(self, difficulty, y0, y1):
-        if difficulty == "easy":
-            return self._generate_easy_forest_region(y0, y1)
-        else:
-            segments = self._hard_corridor_segments(y0, y1)
-            ball_count = self._scaled_region_count(6, min_count=3)
-            cyl_count = self._scaled_region_count(6, min_count=3)
-            box_count = self._scaled_region_count(10, min_count=6)
-            cfg = {
-                "ball_r": (0.45, 0.90),
-                "cyl_r": (0.35, 0.70),
-                "box_hx": (0.45, 1.20),
-                "box_hy": (0.45, 1.45),
-                "box_hz": (0.60, 1.80),
-                "clearance": 0.22,
-                "hug_boundary": True,
-                "prefer_extremes": True,
-                "full_height_prob": 0.55,
-            }
+        if difficulty not in ("easy", "hard"):
+            return [], [], []
 
-        balls = []
-        cyls = []
-        voxels = []
+        bounds = {
+            "x_lo": 0.45,
+            "x_hi": self.map_x_max - 0.45,
+            "y_lo": y0 + self.blank_length + 0.20,
+            "y_hi": y1 - self.blank_length - 0.20,
+        }
+        pair_gap = 0.24
+        nav_inflate = 0.5 * self.two_drone_passage_width
+        # easy/hard only differ in density target.
+        blocked_lo = 0.06 if difficulty == "easy" else 0.18
+        blocked_hi = 0.22 if difficulty == "easy" else 0.38
 
-        for _ in range(ball_count):
-            radius = random.uniform(*cfg["ball_r"])
-            half_y = radius
-            # 使用新的均匀采样方法，确保在中间6米区域内且不侵入留白区
-            y_center = self._sample_y_uniform_in_usable(y0, y1, half_y)
-            x_center = self._sample_x_outside_corridor(
-                radius, y_center, half_y, segments, cfg["clearance"], cfg["hug_boundary"]
-            )
-            z_center = self._sample_vertical_center(radius, cfg["prefer_extremes"])
-            balls.append([x_center, y_center, z_center, radius])
+        best_placed = None
+        best_score = -1e9
+        for _ in range(18):
+            specs = self._build_scatter_specs(difficulty)
+            placed = self._place_scatter_specs(specs, bounds, pair_gap)
+            occ = self._build_scatter_nav_grid(placed, y0, y1, resolution=0.35, inflate=nav_inflate)
+            connected = self._easy_nav_has_connection(occ)
+            blocked_ratio = self._blocked_ratio(occ)
 
-        for _ in range(cyl_count):
-            radius = random.uniform(*cfg["cyl_r"])
-            half_y = max(radius, random.uniform(0.20, 0.55))
-            y_center = self._sample_y_uniform_in_usable(y0, y1, half_y)
-            x_center = self._sample_x_outside_corridor(
-                radius, y_center, half_y, segments, cfg["clearance"], cfg["hug_boundary"]
-            )
-            cyls.append([x_center, y_center, radius])
+            penalty_dense = max(0.0, blocked_ratio - blocked_hi)
+            penalty_sparse = max(0.0, blocked_lo - blocked_ratio)
+            score = (1.0 if connected else 0.0) - 2.0 * penalty_dense - 1.2 * penalty_sparse
+            if score > best_score:
+                best_score = score
+                best_placed = placed
 
-        for _ in range(box_count):
-            hx = random.uniform(*cfg["box_hx"])
-            hy = random.uniform(*cfg["box_hy"])
-            if random.random() < cfg["full_height_prob"]:
-                hz = self.inner_wall_hz
-                cz = self.spawn_z_center
-            else:
-                hz = random.uniform(*cfg["box_hz"])
-                cz = self._sample_vertical_center(hz, cfg["prefer_extremes"])
-            y_center = self._sample_y_uniform_in_usable(y0, y1, hy)
-            x_center = self._sample_x_outside_corridor(
-                hx, y_center, hy, segments, cfg["clearance"], cfg["hug_boundary"]
-            )
-            voxels.append([x_center, y_center, cz, hx, hy, hz])
+            if connected and blocked_lo <= blocked_ratio <= blocked_hi:
+                return self._packed_obstacle_lists(placed)
 
-        return balls, cyls, voxels
+        if best_placed is None:
+            return [], [], []
+        return self._packed_obstacle_lists(best_placed)
 
     def _append_wall_box(self, walls, x_center, y_center, hx, hy, hz=None):
         if hx <= 1e-4 or hy <= 1e-4:

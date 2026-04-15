@@ -1,5 +1,5 @@
-#7.7
-#加入感知，修改地图障碍物平均分布
+#7.8
+#加入转向损失
 
 import argparse
 import atexit
@@ -281,11 +281,11 @@ parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
 parser.add_argument('--scene_scale', type=float, default=0.5,#調節環境大小
                     help='Global scene size scale for obstacle field extent and spawn area')
-parser.add_argument('--obstacle_count_scale', type=float, default=0.5,#調節障礙物數量
+parser.add_argument('--obstacle_count_scale', type=float, default=0.3,#調節障礙物數量
                     help='Global multiplier for obstacle counts (balls/voxels/cylinders)')
 parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,#物理軟限速的平滑度（越小越接近硬截斷，越大越平滑）。
                     help='Softness for physical speed cap in env._apply_speed_limit (smaller = harder cap)')
-parser.add_argument('--max_speed_ceiling', type=float, default=10.0,#env.max_speed 的上限值（軟限速的速度天花板）。
+parser.add_argument('--max_speed_ceiling', type=float, default=15.0,#env.max_speed 的上限值（軟限速的速度天花板）。
                     help='Upper bound of env max_speed used by soft speed limiter')
 parser.add_argument('--hard_vpred_clip', type=float, default=20.0,#env.run 中 v_pred 的硬截斷閾值（原本固定 20）。
                     help='Hard clip magnitude for v_pred in env.run')
@@ -295,9 +295,9 @@ parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節�
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
-parser.add_argument('--lgn_timesteps', type=int, default=40,
+parser.add_argument('--lgn_timesteps', type=int, default=80,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
-parser.add_argument('--exploration_time_window', type=int, default=50,
+parser.add_argument('--exploration_time_window', type=int, default=150,
                     help='Look-back gap for exploration overlap loss; effective window is auto-clipped to keep valid long-range pairs')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
@@ -2984,6 +2984,42 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     return loss_per_step
 
 
+def compute_turn_preference_loss(v_history, speed_threshold=0.2):
+    """
+    转弯偏好损失：
+    仅在水平面 (x-y) 上惩罚“需要改变航向时仍持续保持原方向不变”的行为。
+    竖直方向 (z) 机动不计入转弯语义，避免把爬升/下降误判为转弯。
+
+    输入:
+        v_history: [T, B, 3]
+    输出:
+        loss_turn_seq: [T, B]
+    """
+    T, B, _ = v_history.shape
+    device = v_history.device
+    dtype = v_history.dtype
+
+    loss_turn_seq = torch.zeros((T, B), device=device, dtype=dtype)
+    if T <= 1:
+        return loss_turn_seq
+
+    # 仅使用水平速度分量，转弯定义为水平航向变化
+    v_xy = v_history[..., :2]  # [T, B, 2]
+    v_dir_xy = safe_normalize(v_xy, dim=-1)
+    dir_consistency = (v_dir_xy[1:] * v_dir_xy[:-1]).sum(dim=-1).clamp(-1.0, 1.0)
+
+    # 归一化到 [0,1]，水平航向越不变惩罚越大
+    loss_core = 0.5 * (dir_consistency + 1.0)
+
+    # 低水平速度时航向不稳定，不施加转弯偏好损失
+    speed_now = safe_l2_norm(v_xy[1:], dim=-1)
+    speed_prev = safe_l2_norm(v_xy[:-1], dim=-1)
+    valid_mask = ((speed_now > speed_threshold) & (speed_prev > speed_threshold)).to(dtype)
+
+    loss_turn_seq[1:] = loss_core * valid_mask
+    return loss_turn_seq
+
+
 def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement_threshold=0.3):
     """
     计算卡住惩罚损失
@@ -3312,7 +3348,7 @@ for i in pbar:
     v_history = torch.stack(v_history)     # [T, B, 3]
     a_history = torch.stack(a_history)     # [T, B, 3]
     act_buffer = torch.stack(act_buffer)   # [T+2, B, 3]
-    weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 4]
+    weights_seq = torch.stack(trajectory_lgn_weights) # [T, B, 5]
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
     rpy_history = torch.stack(rpy_history) # [T, B, 3]
@@ -3353,6 +3389,7 @@ for i in pbar:
     loss_exploration_seq = compute_overlap_loss_per_step(
         p_history, sigma=1.0, time_window=int(args.exploration_time_window)
     ).permute(1, 0)
+    loss_turn_seq = compute_turn_preference_loss(v_history, speed_threshold=0.2)
 
     loss_stuck_seq, loss_collision_duration_seq, stuck_ratio = compute_stuck_loss(
         p_history, collision_depth,
@@ -3376,7 +3413,8 @@ for i in pbar:
         print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
         print(
             f"[DIAG iter={i}] loss_raw requires_grad: speed={loss_speed_seq.requires_grad}, "
-            f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, expl={loss_exploration_seq.requires_grad}"
+            f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, "
+            f"expl={loss_exploration_seq.requires_grad}, turn={loss_turn_seq.requires_grad}"
         )
     # LGN 输出已做非负约束，这里直接使用，避免双重 softplus 压缩动态范围。
     effective_weights_seq = weights_seq_raw
@@ -3391,7 +3429,8 @@ for i in pbar:
         effective_weights_seq[:, :, 0] * loss_speed_seq +
         effective_weights_seq[:, :, 1] * loss_direction_seq +
         effective_weights_seq[:, :, 2] * loss_avoidance_seq +
-        effective_weights_seq[:, :, 3] * loss_exploration_seq
+        effective_weights_seq[:, :, 3] * loss_exploration_seq +
+        effective_weights_seq[:, :, 4] * loss_turn_seq
     )
 
     # 3. 最终 Proxy Loss
@@ -3416,6 +3455,7 @@ for i in pbar:
         _diag_tensor_finite("loss_direction_seq", loss_direction_seq, i)
         _diag_tensor_finite("loss_avoidance_seq", loss_avoidance_seq, i)
         _diag_tensor_finite("loss_exploration_seq", loss_exploration_seq, i)
+        _diag_tensor_finite("loss_turn_seq", loss_turn_seq, i)
         _diag_tensor_finite("weights_seq_raw", weights_seq_raw, i)
         _diag_tensor_finite("weighted_loss_map", weighted_loss_map, i)
         _diag_tensor_finite("proxy_loss", proxy_loss, i)
@@ -3506,14 +3546,17 @@ for i in pbar:
     proxy_grad_dir = 0.0
     proxy_grad_avoid = 0.0
     proxy_grad_expl = 0.0
+    proxy_grad_turn = 0.0
     proxy_grad_speed_nonfinite = 0.0
     proxy_grad_dir_nonfinite = 0.0
     proxy_grad_avoid_nonfinite = 0.0
     proxy_grad_expl_nonfinite = 0.0
+    proxy_grad_turn_nonfinite = 0.0
     proxy_grad_speed_elems = 0.0
     proxy_grad_dir_elems = 0.0
     proxy_grad_avoid_elems = 0.0
     proxy_grad_expl_elems = 0.0
+    proxy_grad_turn_elems = 0.0
     lgn_grad_norm = 0.0
     lgn_grad_max = 0.0
     lgn_grad_nonfinite = 0.0
@@ -3550,13 +3593,16 @@ for i in pbar:
         get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
     proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
         get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
+    proxy_grad_turn, proxy_grad_turn_nonfinite, proxy_grad_turn_elems = \
+        get_loss_to_worker_grad_norm(loss_turn_seq.mean(), worker_params)
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] loss_to_worker: "
             f"speed={proxy_grad_speed:.6f} (NonFinite={proxy_grad_speed_nonfinite}/{proxy_grad_speed_elems}), "
             f"dir={proxy_grad_dir:.6f} (NonFinite={proxy_grad_dir_nonfinite}/{proxy_grad_dir_elems}), "
             f"avoid={proxy_grad_avoid:.6f} (NonFinite={proxy_grad_avoid_nonfinite}/{proxy_grad_avoid_elems}), "
-            f"expl={proxy_grad_expl:.6f} (NonFinite={proxy_grad_expl_nonfinite}/{proxy_grad_expl_elems})"
+            f"expl={proxy_grad_expl:.6f} (NonFinite={proxy_grad_expl_nonfinite}/{proxy_grad_expl_elems}), "
+            f"turn={proxy_grad_turn:.6f} (NonFinite={proxy_grad_turn_nonfinite}/{proxy_grad_turn_elems})"
         )
 
     if train_lgn_phase:
@@ -3589,17 +3635,20 @@ for i in pbar:
                     weighted_dir = (effective_weights_seq[:, :, 1] * loss_direction_seq).mean()
                     weighted_avoid = (effective_weights_seq[:, :, 2] * loss_avoidance_seq).mean()
                     weighted_expl = (effective_weights_seq[:, :, 3] * loss_exploration_seq).mean()
+                    weighted_turn = (effective_weights_seq[:, :, 4] * loss_turn_seq).mean()
 
                     g_speed = _grad_or_none_tuple(weighted_speed, fast_param_values)
                     g_dir = _grad_or_none_tuple(weighted_dir, fast_param_values)
                     g_avoid = _grad_or_none_tuple(weighted_avoid, fast_param_values)
                     g_expl = _grad_or_none_tuple(weighted_expl, fast_param_values)
+                    g_turn = _grad_or_none_tuple(weighted_turn, fast_param_values)
 
                     lgn_param_list = list(lgn.parameters())
                     _diag_grad_tuple_to_params("speed(weighted) second_order(worker_grad)->lgn", g_speed, lgn_param_list, i)
                     _diag_grad_tuple_to_params("direction(weighted) second_order(worker_grad)->lgn", g_dir, lgn_param_list, i)
                     _diag_grad_tuple_to_params("avoidance(weighted) second_order(worker_grad)->lgn", g_avoid, lgn_param_list, i)
                     _diag_grad_tuple_to_params("exploration(weighted) second_order(worker_grad)->lgn", g_expl, lgn_param_list, i)
+                    _diag_grad_tuple_to_params("turn(weighted) second_order(worker_grad)->lgn", g_turn, lgn_param_list, i)
                     _diag_grad_tuple_to_params("proxy_total second_order(worker_grad)->lgn", inner_grads, lgn_param_list, i)
 
                     act_only_loss = (act_for_diag.pow(2).mean() if act_for_diag is not None else torch.tensor(0.0, device=device))
@@ -3755,20 +3804,23 @@ for i in pbar:
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
 
-            # === [增强] 4个权重均值 (实际使用) ===
+            # === [增强] 5个权重均值 (实际使用) ===
             'Weights/0_Speed': avg_weights[0],
             'Weights/1_Direction': avg_weights[1],
             'Weights/2_Avoidance': avg_weights[2],
             'Weights/3_Exploration': avg_weights[3],
+            'Weights/4_Turn': avg_weights[4],
             # === 原始输出权重 ===
             'Weights_Raw/0_Speed': avg_weights_raw[0],
             'Weights_Raw/1_Direction': avg_weights_raw[1],
             'Weights_Raw/2_Avoidance': avg_weights_raw[2],
             'Weights_Raw/3_Exploration': avg_weights_raw[3],
+            'Weights_Raw/4_Turn': avg_weights_raw[4],
             'Weights_Effective/0_Speed': avg_effective_weights[0],
             'Weights_Effective/1_Direction': avg_effective_weights[1],
             'Weights_Effective/2_Avoidance': avg_effective_weights[2],
             'Weights_Effective/3_Exploration': avg_effective_weights[3],
+            'Weights_Effective/4_Turn': avg_effective_weights[4],
 
             # === [新增] 权重分布监控 ===
             'Weight_Stats/Raw_Min': weights_seq.min(),
@@ -3782,7 +3834,8 @@ for i in pbar:
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
-            'Proxy_Comp/4_Height': loss_height_seq.mean(),
+            'Proxy_Comp/4_Turn': loss_turn_seq.mean(),
+            'Proxy_Comp/5_Height': loss_height_seq.mean(),
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
             'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
@@ -3876,19 +3929,22 @@ for i in pbar:
             'Grad/LGN_MetaProbe_NonFinite_Count': lgn_meta_probe_nonfinite,
             'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
 
-            # === [新增] 四个代理损失对 Worker 梯度的 norm ===
+            # === [新增] 五个代理损失对 Worker 梯度的 norm ===
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
             'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
             'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
             'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
+            'Grad_ProxyWorker/4_Turn_Norm': proxy_grad_turn,
             'Grad_ProxyWorker/0_Speed_NonFinite': proxy_grad_speed_nonfinite,
             'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
             'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
             'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
+            'Grad_ProxyWorker/4_Turn_NonFinite': proxy_grad_turn_nonfinite,
             'Grad_ProxyWorker/0_Speed_GradElem': proxy_grad_speed_elems,
             'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
             'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
-            'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems
+            'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
+            'Grad_ProxyWorker/4_Turn_GradElem': proxy_grad_turn_elems
         }
 
         if train_lgn_phase:
@@ -4075,10 +4131,10 @@ for i in pbar:
             plt.close(fig_act)
 
             # 4. 权重逐时间步变化图：按分量拆分保存
-            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 4] 实际使用权重（非负）
-            labels = ['Speed', 'Direction', 'Avoidance', 'Exploration']
-            tag_suffix = ['0_Speed', '1_Direction', '2_Avoidance', '3_Exploration']
-            for wi in range(4):
+            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 5] 实际使用权重（非负）
+            labels = ['Speed', 'Direction', 'Avoidance', 'Exploration', 'Turn']
+            tag_suffix = ['0_Speed', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn']
+            for wi in range(5):
                 fig_wi, ax = plt.subplots()
                 ax.plot(w_cpu[:, wi], label=labels[wi])
                 ax.legend()
@@ -4091,6 +4147,7 @@ for i in pbar:
             writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
             writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
             writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)
+            writer.add_scalar('Weights_Snapshot/4_Turn', avg_weights[4], i + 1)
             writer.add_scalar('Weights_Snapshot/Std', weight_std, i + 1)
             # 权重统计
             writer.add_scalar('Weights_Snapshot/Raw_Min', weights_seq.min(), i + 1)

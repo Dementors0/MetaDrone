@@ -87,7 +87,7 @@ class LossGenNet(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, 4),  # [Vel, Dir, Obs, Expl]
+            nn.Linear(hidden_dim, 5),  # [Vel, Dir, Obs, Expl, Turn]
         )
 
     def forward(self, depth_feat, state, geom_feat, progress_feat, hx=None):
@@ -99,7 +99,7 @@ class LossGenNet(nn.Module):
             progress_feat: [B, progress_dim] 近期进展/卡住统计特征
             hx: [B, T_mem, hidden_dim] 历史记忆 token (如果是第一步则为 None)
         返回:
-            weights: [B, 4]
+            weights: [B, 5]
             hx: [B, T_mem, hidden_dim] 更新后的记忆序列
         """
         # 1. 提取视觉特征

@@ -368,9 +368,9 @@ parser.add_argument('--exp_name', type=str, default="default", help="Extra tag f
 parser.add_argument('--avoid_safe_margin', type=float, default=0.35,
                     help='Proxy avoidance rises smoothly inside this clearance to walls')
 parser.add_argument('--lgn_output_temperature', type=float, default=1.0,
-                    help='Compatibility arg (currently not used): LGN weights are constrained to be non-negative')
+                    help='Compatibility arg (currently not used): only non-speed LGN weights are constrained non-negative')
 parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
-                    help='Compatibility arg (unused): no extra floor is applied beyond non-negative constraint')
+                    help='Compatibility arg (unused): no extra floor is applied beyond non-speed non-negative constraints')
 parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
                     help='Compatibility arg (unused): no ceiling constraint is applied to LGN weights')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
@@ -2516,6 +2516,8 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
     speed_cpu = v_cpu.norm(dim=-1).numpy()
     fig = go.Figure()
 
+    traj_hover_data = np.column_stack((np.arange(traj_xyz.shape[0], dtype=np.float32), speed_cpu.astype(np.float32)))
+
     fig.add_trace(go.Scatter3d(
         x=traj_xyz[:, 0], y=traj_xyz[:, 1], z=traj_xyz[:, 2],
         mode='lines+markers',
@@ -2528,7 +2530,16 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
             colorbar=dict(title='Speed (m/s)')
         ),
         line=dict(color='limegreen', width=5),
-        name='Trajectory'
+        name='Trajectory',
+        customdata=traj_hover_data,
+        hovertemplate=(
+            't=%{customdata[0]:.0f}<br>'
+            'x=%{x:.2f}<br>'
+            'y=%{y:.2f}<br>'
+            'z=%{z:.2f}<br>'
+            'speed=%{customdata[1]:.2f} m/s'
+            '<extra></extra>'
+        )
     ))
 
     # 势场后端时，在 HTML 中叠加一个 XY 势场切片层。
@@ -2967,9 +2978,15 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     if n_points < time_window + 1:
         return torch.zeros((n_batch, n_points), device=p_history.device)
 
-    # 计算距离矩阵
-    dist_matrix = torch.cdist(p_history, p_history, p=2)
-    overlap_energy = torch.exp(- (dist_matrix ** 2) / (2 * sigma ** 2))
+    # 二阶梯度稳定性：
+    # 避免使用 cdist 的 sqrt 链路（在高阶导下更容易出现数值尖峰），
+    # 直接构造平方距离并代入高斯核，语义与 exp(-||x-y||^2 / (2*sigma^2)) 等价。
+    sigma_safe = max(float(sigma), 1e-4)
+    inv_two_sigma2 = 1.0 / (2.0 * sigma_safe * sigma_safe)
+    diff = p_history[:, :, None, :] - p_history[:, None, :, :]  # [B, T, T, 3]
+    sq_dist = (diff * diff).sum(dim=-1)  # [B, T, T]
+    exponent = (-sq_dist * inv_two_sigma2).clamp(min=-60.0, max=0.0)
+    overlap_energy = torch.exp(exponent)
 
     indices = torch.arange(n_points, device=p_history.device)
     time_diff = torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1))
@@ -3305,7 +3322,7 @@ for i in pbar:
         geom_feat_last = geom_feat
         progress_feat_last = progress_feat
 
-        # LGN Forward (训练侧执行正值非归一化约束)
+        # LGN Forward（第0维 speed trend 偏好允许有符号，其余维度保持非负）
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
 
         if t == 0 and _diag_should_log(i):
@@ -3360,17 +3377,16 @@ for i in pbar:
     
     # 1. 计算各项 Raw Loss (保留 [T, B] 维度用于 Step-wise 加权)
 
-    # 碰撞距离 (先计算, 后续速度目标依赖它)
+    # 碰撞距离
     dist_obj = safe_l2_norm(vec_to_pt, dim=-1) - env.margin  # [T, B]
 
-    # 自适应速度目标: 近障碍物/近终点时自动减速
+    # 纯速度变化趋势项（有符号）:
+    # speed_delta > 0 表示加速, speed_delta < 0 表示减速
     speed_actual = safe_l2_norm(v_history, dim=-1)  # [T, B]
-    dist_to_goal = safe_l2_norm(env.p_target - p_history, dim=-1)  # [T, B]
-    v_max = float(env.max_speed)
-    speed_factor_obs = torch.sigmoid((dist_obj - 0.8) * 5.0)   # ~0 near wall, ~1 far
-    speed_factor_goal = torch.clamp(dist_to_goal / args.speed_goal_slow_dist, 0.0, 1.0)
-    v_target_adaptive = v_max * (args.speed_near_obs_floor + (1.0 - args.speed_near_obs_floor) * speed_factor_obs) * speed_factor_goal
-    loss_speed_seq = F.smooth_l1_loss(speed_actual, v_target_adaptive.detach(), reduction='none')
+    loss_speed_seq = torch.zeros_like(speed_actual)
+    if speed_actual.shape[0] > 1:
+        speed_delta = speed_actual[1:] - speed_actual[:-1]  # [T-1, B]
+        loss_speed_seq[1:] = speed_delta
 
     target_dir = safe_normalize(env.p_target - p_history, dim=-1)
     v_dir = safe_normalize(v_history, dim=-1)
@@ -3407,7 +3423,7 @@ for i in pbar:
                        + F.softplus((z_pos - z_max) * 20.0)
                        + F.softplus((z_min - z_pos) * 20.0))
 
-    # 非负权重策略：所有分量均不允许为负
+    # 权重策略：speed trend 分量保留符号，其余分量保持非负（由 LGN 输出层约束）
     weights_seq_raw = weights_seq
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
@@ -3416,8 +3432,15 @@ for i in pbar:
             f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, "
             f"expl={loss_exploration_seq.requires_grad}, turn={loss_turn_seq.requires_grad}"
         )
-    # LGN 输出已做非负约束，这里直接使用，避免双重 softplus 压缩动态范围。
-    effective_weights_seq = weights_seq_raw
+    speed_coeff = weights_seq_raw[:, :, 0]  # signed
+    dir_coeff = weights_seq_raw[:, :, 1]    # non-negative
+    avoid_coeff = weights_seq_raw[:, :, 2]  # non-negative
+    expl_coeff = weights_seq_raw[:, :, 3]   # non-negative
+    turn_coeff = weights_seq_raw[:, :, 4]   # non-negative
+    effective_weights_seq = torch.stack(
+        [speed_coeff, dir_coeff, avoid_coeff, expl_coeff, turn_coeff],
+        dim=-1
+    )
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
@@ -3426,11 +3449,11 @@ for i in pbar:
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
-        effective_weights_seq[:, :, 0] * loss_speed_seq +
-        effective_weights_seq[:, :, 1] * loss_direction_seq +
-        effective_weights_seq[:, :, 2] * loss_avoidance_seq +
-        effective_weights_seq[:, :, 3] * loss_exploration_seq +
-        effective_weights_seq[:, :, 4] * loss_turn_seq
+        speed_coeff * loss_speed_seq +
+        dir_coeff * loss_direction_seq +
+        avoid_coeff * loss_avoidance_seq +
+        expl_coeff * loss_exploration_seq +
+        turn_coeff * loss_turn_seq
     )
 
     # 3. 最终 Proxy Loss
@@ -3805,18 +3828,18 @@ for i in pbar:
             'Loss/2_Meta_Total': meta_loss,
 
             # === [增强] 5个权重均值 (实际使用) ===
-            'Weights/0_Speed': avg_weights[0],
+            'Weights/0_SpeedTrend': avg_weights[0],
             'Weights/1_Direction': avg_weights[1],
             'Weights/2_Avoidance': avg_weights[2],
             'Weights/3_Exploration': avg_weights[3],
             'Weights/4_Turn': avg_weights[4],
             # === 原始输出权重 ===
-            'Weights_Raw/0_Speed': avg_weights_raw[0],
+            'Weights_Raw/0_SpeedTrend': avg_weights_raw[0],
             'Weights_Raw/1_Direction': avg_weights_raw[1],
             'Weights_Raw/2_Avoidance': avg_weights_raw[2],
             'Weights_Raw/3_Exploration': avg_weights_raw[3],
             'Weights_Raw/4_Turn': avg_weights_raw[4],
-            'Weights_Effective/0_Speed': avg_effective_weights[0],
+            'Weights_Effective/0_SpeedTrend': avg_effective_weights[0],
             'Weights_Effective/1_Direction': avg_effective_weights[1],
             'Weights_Effective/2_Avoidance': avg_effective_weights[2],
             'Weights_Effective/3_Exploration': avg_effective_weights[3],
@@ -3829,7 +3852,7 @@ for i in pbar:
             'Weight_Stats/Std': weight_std,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
-            'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
+            'Proxy_Comp/0_SpeedTrend': loss_speed_seq.mean(),
             'Proxy_Comp/1_Direction': loss_direction_seq.mean(),
             'Proxy_Comp/2_Avoidance': loss_avoidance_seq.mean(),
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
@@ -3886,7 +3909,7 @@ for i in pbar:
             'Metrics/Min_Speed': v_norm.min(),
             'Metrics/Max_Speed': v_norm.max(),
             'Metrics/Episode_Length': actual_T,
-            'Metrics/Adaptive_Speed_Target': v_target_adaptive.mean(),
+            'Metrics/Speed_Delta_Mean': loss_speed_seq.mean(),
             'Control/Accel_Cmd_Norm_Mean': act_cmd_norm_mean,
             'Control/Accel_Cmd_X_Mean': act_cmd_mean[0],
             'Control/Accel_Cmd_Y_Mean': act_cmd_mean[1],
@@ -3930,17 +3953,17 @@ for i in pbar:
             'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
 
             # === [新增] 五个代理损失对 Worker 梯度的 norm ===
-            'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
+            'Grad_ProxyWorker/0_SpeedTrend_Norm': proxy_grad_speed,
             'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
             'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
             'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
             'Grad_ProxyWorker/4_Turn_Norm': proxy_grad_turn,
-            'Grad_ProxyWorker/0_Speed_NonFinite': proxy_grad_speed_nonfinite,
+            'Grad_ProxyWorker/0_SpeedTrend_NonFinite': proxy_grad_speed_nonfinite,
             'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
             'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
             'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
             'Grad_ProxyWorker/4_Turn_NonFinite': proxy_grad_turn_nonfinite,
-            'Grad_ProxyWorker/0_Speed_GradElem': proxy_grad_speed_elems,
+            'Grad_ProxyWorker/0_SpeedTrend_GradElem': proxy_grad_speed_elems,
             'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
             'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
             'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
@@ -4131,19 +4154,19 @@ for i in pbar:
             plt.close(fig_act)
 
             # 4. 权重逐时间步变化图：按分量拆分保存
-            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 5] 实际使用权重（非负）
-            labels = ['Speed', 'Direction', 'Avoidance', 'Exploration', 'Turn']
-            tag_suffix = ['0_Speed', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn']
+            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 5] 实际使用权重（第0维有符号，其余非负）
+            labels = ['SpeedTrend', 'Direction', 'Avoidance', 'Exploration', 'Turn']
+            tag_suffix = ['0_SpeedTrend', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn']
             for wi in range(5):
                 fig_wi, ax = plt.subplots()
                 ax.plot(w_cpu[:, wi], label=labels[wi])
                 ax.legend()
-                ax.set_title(f"Iter {i} Weight Profile - {labels[wi]} (Per Step, Non-Negative)")
+                ax.set_title(f"Iter {i} Weight Profile - {labels[wi]} (Per Step)")
                 writer.add_figure(f'Debug/Weights_StepWise_{tag_suffix[wi]}', fig_wi, i + 1)
                 plt.close(fig_wi)
 
             # 4.1 [新增] 权重精确值记录（与轨迹同步，用于分析权重动态变化）
-            writer.add_scalar('Weights_Snapshot/0_Speed', avg_weights[0], i + 1)
+            writer.add_scalar('Weights_Snapshot/0_SpeedTrend', avg_weights[0], i + 1)
             writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
             writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
             writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)

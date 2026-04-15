@@ -134,9 +134,13 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 6. 生成非负权重（不做归一化，仅约束 >= 0）
+        # 6. 生成权重：
+        #    - 第0维 speed trend 偏好保留符号（可正可负）
+        #    - 其余维度保持非负（原语义不变）
         raw = self.head(last_token)
-        weights = F.softplus(raw)
+        speed_pref = 2.0 * torch.tanh(raw[:, :1])
+        other_weights = F.softplus(raw[:, 1:])
+        weights = torch.cat([speed_pref, other_weights], dim=-1)
 
         # 返回 weights 和 Transformer 编码后的记忆序列
         return weights, x_out

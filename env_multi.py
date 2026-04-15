@@ -58,6 +58,14 @@ class Env(BaseEnv):
         self.spawn_x_half_span = 2.0
         self.spawn_z_half_span = 2.0
         self.fixed_spawn_half_span = 1.0
+        self.spawn_start_x = self.spawn_x_center
+        self.spawn_goal_x = self.spawn_x_center
+        self.spawn_start_z = self.spawn_z_center
+        self.spawn_goal_z = self.spawn_z_center
+        self.spawn_start_x_half_span = self.fixed_spawn_half_span
+        self.spawn_goal_x_half_span = self.fixed_spawn_half_span
+        self.spawn_start_z_half_span = self.fixed_spawn_half_span
+        self.spawn_goal_z_half_span = self.fixed_spawn_half_span
         self.boundary_thickness = 0.10
         self.boundary_half = 0.5 * self.boundary_thickness
         self.full_wall_hz = 2.45
@@ -1038,6 +1046,16 @@ class Env(BaseEnv):
         self._spawn_goal_bounds = torch.tensor(goal_bounds, device=device, dtype=torch.float32)
         self.u_meta = u_meta_batch
 
+        # Randomly generated maps use default x/z spawn planes around the scene center.
+        self.spawn_start_x = self.spawn_x_center
+        self.spawn_goal_x = self.spawn_x_center
+        self.spawn_start_z = self.spawn_z_center
+        self.spawn_goal_z = self.spawn_z_center
+        self.spawn_start_x_half_span = self.fixed_spawn_half_span
+        self.spawn_goal_x_half_span = self.fixed_spawn_half_span
+        self.spawn_start_z_half_span = self.fixed_spawn_half_span
+        self.spawn_goal_z_half_span = self.fixed_spawn_half_span
+
         self._maze_rotation = None
         self._reset_drone_state(self._obstacle_scale)
 
@@ -1090,6 +1108,15 @@ class Env(BaseEnv):
         if "spawn_goal_y" in map_data:
             self.spawn_goal_y = float(map_data["spawn_goal_y"])
 
+        self.spawn_start_x = float(map_data.get("spawn_start_x", self.spawn_x_center))
+        self.spawn_goal_x = float(map_data.get("spawn_goal_x", self.spawn_x_center))
+        self.spawn_start_z = float(map_data.get("spawn_start_z", self.spawn_z_center))
+        self.spawn_goal_z = float(map_data.get("spawn_goal_z", self.spawn_z_center))
+        self.spawn_start_x_half_span = float(map_data.get("spawn_start_x_half_span", self.fixed_spawn_half_span))
+        self.spawn_goal_x_half_span = float(map_data.get("spawn_goal_x_half_span", self.fixed_spawn_half_span))
+        self.spawn_start_z_half_span = float(map_data.get("spawn_start_z_half_span", self.fixed_spawn_half_span))
+        self.spawn_goal_z_half_span = float(map_data.get("spawn_goal_z_half_span", self.fixed_spawn_half_span))
+
         self._obstacle_scale = torch.ones((B, 1), device=device)
         self.scene_x_half = self.map_x_max
         self.scene_y_half = self.map_y_half
@@ -1136,10 +1163,19 @@ class Env(BaseEnv):
 
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
-        x = self.spawn_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
-        z = self.spawn_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
-        x_goal = self.spawn_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
-        z_goal = self.spawn_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * self.fixed_spawn_half_span
+        start_x_center = float(getattr(self, "spawn_start_x", self.spawn_x_center))
+        goal_x_center = float(getattr(self, "spawn_goal_x", self.spawn_x_center))
+        start_z_center = float(getattr(self, "spawn_start_z", self.spawn_z_center))
+        goal_z_center = float(getattr(self, "spawn_goal_z", self.spawn_z_center))
+        start_x_half = max(0.0, float(getattr(self, "spawn_start_x_half_span", self.fixed_spawn_half_span)))
+        goal_x_half = max(0.0, float(getattr(self, "spawn_goal_x_half_span", self.fixed_spawn_half_span)))
+        start_z_half = max(0.0, float(getattr(self, "spawn_start_z_half_span", self.fixed_spawn_half_span)))
+        goal_z_half = max(0.0, float(getattr(self, "spawn_goal_z_half_span", self.fixed_spawn_half_span)))
+
+        x = start_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * start_x_half
+        z = start_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * start_z_half
+        x_goal = goal_x_center + (torch.rand(B, device=device) * 2.0 - 1.0) * goal_x_half
+        z_goal = goal_z_center + (torch.rand(B, device=device) * 2.0 - 1.0) * goal_z_half
 
         y = torch.full((B,), float(self.spawn_start_y), device=device)
         y_goal = torch.full((B,), float(self.spawn_goal_y), device=device)

@@ -345,8 +345,37 @@ class PotentialMapCache:
         if not os.path.isdir(map_dir):
             return []
         files = []
-        for name in sorted(os.listdir(map_dir)):
-            if name.startswith("map_") and name.endswith(".pt"):
+
+        type_order = {
+            "hard": 0,
+            "easy": 1,
+            "u_min": 2,
+            "hairpin": 3,
+        }
+
+        def sort_key(name: str):
+            if not name.endswith(".pt"):
+                return (9, name)
+            stem = name[:-3]
+
+            # Unified dataset naming: <type_prefix>_<idx>.pt
+            if "_" in stem:
+                prefix, idx_str = stem.rsplit("_", 1)
+                if prefix in type_order and idx_str.isdigit():
+                    return (0, type_order[prefix], int(idx_str), name)
+
+            # Legacy naming: map_<idx>.pt
+            if stem.startswith("map_"):
+                idx_str = stem[4:]
+                if idx_str.isdigit():
+                    return (1, int(idx_str), name)
+                return (1, 10**9, name)
+
+            # Fallback for any other .pt maps.
+            return (9, name)
+
+        for name in sorted(os.listdir(map_dir), key=sort_key):
+            if sort_key(name)[0] < 9:
                 files.append(os.path.join(map_dir, name))
         if num_maps > 0:
             files = files[:num_maps]

@@ -64,9 +64,30 @@ def resolve_precomputed_map(args):
     if not map_dir.is_dir():
         raise FileNotFoundError(f"precomputed map dir not found: {map_dir}")
 
-    files = sorted(p for p in map_dir.iterdir() if p.name.startswith("map_") and p.suffix == ".pt")
+    type_order = {
+        "hard": 0,
+        "easy": 1,
+        "u_min": 2,
+        "hairpin": 3,
+    }
+
+    def _sort_key(path: Path):
+        name = path.name
+        stem = path.stem
+        if "_" in stem:
+            prefix, idx_str = stem.rsplit("_", 1)
+            if prefix in type_order and idx_str.isdigit():
+                return (0, type_order[prefix], int(idx_str), name)
+        if stem.startswith("map_"):
+            idx_str = stem[4:]
+            if idx_str.isdigit():
+                return (1, int(idx_str), name)
+            return (1, 10**9, name)
+        return (9, name)
+
+    files = sorted((p for p in map_dir.iterdir() if p.suffix == ".pt" and _sort_key(p)[0] < 9), key=_sort_key)
     if not files:
-        raise FileNotFoundError(f"no map_*.pt found in: {map_dir}")
+        raise FileNotFoundError(f"no .pt map files found in: {map_dir}")
 
     idx = int(args.map_index) % len(files)
     return files[idx], f"dir[{idx}]"
@@ -417,8 +438,8 @@ def parse_args():
     parser.add_argument("--output-html", type=str, default="preview_map.html", help="Output HTML path; overwritten on each run")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Env device for preview generation")
     parser.add_argument("--no-open-browser", action="store_true", help="Write HTML only, do not open a browser tab")
-    parser.add_argument("--precomputed-map", type=str, default="", help="Optional path to a single map_XXX.pt to preview")
-    parser.add_argument("--precomputed-map-dir", type=str, default="", help="Optional directory containing map_XXX.pt files")
+    parser.add_argument("--precomputed-map", type=str, default="", help="Optional path to a single precomputed .pt map to preview")
+    parser.add_argument("--precomputed-map-dir", type=str, default="", help="Optional directory containing precomputed .pt map files")
     parser.add_argument("--map-index", type=int, default=0, help="Index in sorted precomputed map dir when --precomputed-map-dir is used")
     return parser.parse_args()
 

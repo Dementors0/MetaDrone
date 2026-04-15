@@ -14,8 +14,30 @@ def _collect_map_files(map_dir):
     files = []
     if not os.path.isdir(map_dir):
         return files
-    for name in sorted(os.listdir(map_dir)):
-        if name.startswith("map_") and name.endswith(".pt"):
+    type_order = {
+        "hard": 0,
+        "easy": 1,
+        "u_min": 2,
+        "hairpin": 3,
+    }
+
+    def _sort_key(name):
+        if not name.endswith(".pt"):
+            return (9, name)
+        stem = name[:-3]
+        if "_" in stem:
+            prefix, idx_str = stem.rsplit("_", 1)
+            if prefix in type_order and idx_str.isdigit():
+                return (0, type_order[prefix], int(idx_str), name)
+        if stem.startswith("map_"):
+            idx_str = stem[4:]
+            if idx_str.isdigit():
+                return (1, int(idx_str), name)
+            return (1, 10**9, name)
+        return (9, name)
+
+    for name in sorted(os.listdir(map_dir), key=_sort_key):
+        if _sort_key(name)[0] < 9:
             files.append(os.path.join(map_dir, name))
     return files
 
@@ -396,19 +418,19 @@ def _build_3d_figure(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize 3D potential field from precomputed map_XXX.pt"
+        description="Visualize 3D potential field from precomputed map files (.pt)"
     )
     parser.add_argument(
         "--map_dir",
         type=str,
         default="/home/robot/transformer/precomputed_maps",
-        help="Directory containing map_XXX.pt",
+        help="Directory containing precomputed .pt map files",
     )
     parser.add_argument(
         "--map_index",
         type=int,
         default=0,
-        help="Index in sorted map_XXX.pt list",
+        help="Index in sorted map file list",
     )
     parser.add_argument(
         "--z_world",
@@ -476,7 +498,7 @@ def main():
 
     files = _collect_map_files(args.map_dir)
     if len(files) == 0:
-        raise FileNotFoundError(f"No map_XXX.pt found in: {args.map_dir}")
+        raise FileNotFoundError(f"No .pt map files found in: {args.map_dir}")
 
     idx = int(args.map_index) % len(files)
     path = files[idx]

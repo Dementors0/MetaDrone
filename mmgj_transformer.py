@@ -62,6 +62,7 @@ try:
 except ModuleNotFoundError:
     from WorkNet import WorkNet
     from LossGenNet import LossGenNet
+from turn_loss_utils import compute_turn_preference_loss_xy_unit
 
 ########### 0. 工具类：动态归一化 ##########
 class RunningMeanStd(nn.Module):
@@ -2987,37 +2988,18 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
 def compute_turn_preference_loss(v_history, speed_threshold=0.2):
     """
     转弯偏好损失：
-    仅在水平面 (x-y) 上惩罚“需要改变航向时仍持续保持原方向不变”的行为。
-    竖直方向 (z) 机动不计入转弯语义，避免把爬升/下降误判为转弯。
+    仅在水平面 (x-y) 上定义航向变化，不把 z 方向速度变化计入“转弯”。
+    使用水平速度单位向量点积衡量方向一致性，避免速度幅值直接主导损失。
 
     输入:
         v_history: [T, B, 3]
     输出:
         loss_turn_seq: [T, B]
     """
-    T, B, _ = v_history.shape
-    device = v_history.device
-    dtype = v_history.dtype
-
-    loss_turn_seq = torch.zeros((T, B), device=device, dtype=dtype)
-    if T <= 1:
-        return loss_turn_seq
-
-    # 仅使用水平速度分量，转弯定义为水平航向变化
-    v_xy = v_history[..., :2]  # [T, B, 2]
-    v_dir_xy = safe_normalize(v_xy, dim=-1)
-    dir_consistency = (v_dir_xy[1:] * v_dir_xy[:-1]).sum(dim=-1).clamp(-1.0, 1.0)
-
-    # 归一化到 [0,1]，水平航向越不变惩罚越大
-    loss_core = 0.5 * (dir_consistency + 1.0)
-
-    # 低水平速度时航向不稳定，不施加转弯偏好损失
-    speed_now = safe_l2_norm(v_xy[1:], dim=-1)
-    speed_prev = safe_l2_norm(v_xy[:-1], dim=-1)
-    valid_mask = ((speed_now > speed_threshold) & (speed_prev > speed_threshold)).to(dtype)
-
-    loss_turn_seq[1:] = loss_core * valid_mask
-    return loss_turn_seq
+    return compute_turn_preference_loss_xy_unit(
+        v_history=v_history,
+        speed_threshold=speed_threshold,
+    )
 
 
 def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement_threshold=0.3):

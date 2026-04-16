@@ -1,5 +1,5 @@
-#7.8
-#加入转向损失
+#7.10
+#转向损失在二维平面投影，加入探索损失
 
 import argparse
 import atexit
@@ -271,7 +271,7 @@ parser.add_argument('--resume_worker', default="", help='Path to pretrained work
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--num_iters', type=int, default=5000000)
+parser.add_argument('--num_iters', type=int, default=2000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)
@@ -296,7 +296,7 @@ parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節�
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
-parser.add_argument('--lgn_timesteps', type=int, default=80,
+parser.add_argument('--lgn_timesteps', type=int, default=50,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--exploration_time_window', type=int, default=150,
                     help='Look-back gap for exploration overlap loss; effective window is auto-clipped to keep valid long-range pairs')
@@ -2962,27 +2962,35 @@ def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
     Step-wise 重叠损失计算
     返回: [Batch, Time] (注意: 调用处需要permute)
     """
-    p_history = p_history.permute(1, 0, 2) # [B, T, 3]
-    n_batch, n_points, n_dims = p_history.shape
+    # Use squared-distance RBF directly (without sqrt/cdist) so 2nd-order gradients
+    # stay well-behaved when trajectory points overlap exactly.
+    p_history = p_history.permute(1, 0, 2)  # [B, T, 3]
+    n_batch, n_points, _ = p_history.shape
+    device = p_history.device
+    dtype = p_history.dtype
 
-    if n_points < time_window + 1:
-        return torch.zeros((n_batch, n_points), device=p_history.device)
+    time_window = max(0, int(time_window))
+    sigma = max(float(sigma), 1e-4)
 
-    # 计算距离矩阵
-    dist_matrix = torch.cdist(p_history, p_history, p=2)
-    overlap_energy = torch.exp(- (dist_matrix ** 2) / (2 * sigma ** 2))
+    if n_points <= time_window:
+        return torch.zeros((n_batch, n_points), device=device, dtype=dtype)
 
-    indices = torch.arange(n_points, device=p_history.device)
+    # Pairwise squared distances: [B, T, T]
+    pair_delta = p_history[:, :, None, :] - p_history[:, None, :, :]
+    sq_dist = (pair_delta * pair_delta).sum(dim=-1)
+    sq_dist = sanitize_tensor(sq_dist, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
+    inv_two_sigma2 = 0.5 / (sigma * sigma)
+    overlap_energy = torch.exp(-sq_dist * inv_two_sigma2)
+
+    indices = torch.arange(n_points, device=device)
     time_diff = torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1))
-    mask = (time_diff > time_window).float()
+    mask = (time_diff > time_window).to(dtype=dtype)  # [T, T]
 
-    # 计算每个时间步的能量总和
-    energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2) 
-    mask_sum = mask.sum(dim=1).unsqueeze(0) + 1e-6
+    # Step-wise mean overlap energy with temporal exclusion mask.
+    energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2)  # [B, T]
+    mask_sum = mask.sum(dim=1).unsqueeze(0).clamp_min(1.0)  # [1, T]
 
-    # 返回 [Batch, Time]
-    loss_per_step = energy_sum / mask_sum
-    return loss_per_step
+    return energy_sum / mask_sum
 
 
 def compute_turn_preference_loss(v_history, speed_threshold=0.2):

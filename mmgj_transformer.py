@@ -1,5 +1,5 @@
-#7.8
-#加入转向损失
+#8.1
+#制作四种独立地图
 
 import argparse
 import atexit
@@ -283,6 +283,10 @@ parser.add_argument('--scene_scale', type=float, default=0.5,#調節環境大小
                     help='Global scene size scale for obstacle field extent and spawn area')
 parser.add_argument('--obstacle_count_scale', type=float, default=0.3,#調節障礙物數量
                     help='Global multiplier for obstacle counts (balls/voxels/cylinders)')
+parser.add_argument('--easy_density_scale', type=float, default=2.0,
+                    help='Density multiplier for easy-region obstacle generation')
+parser.add_argument('--hard_density_scale', type=float, default=1.0,
+                    help='Density multiplier for hard-region obstacle generation')
 parser.add_argument('--soft_speed_limit_softness', type=float, default=0.05,#物理軟限速的平滑度（越小越接近硬截斷，越大越平滑）。
                     help='Softness for physical speed cap in env._apply_speed_limit (smaller = harder cap)')
 parser.add_argument('--max_speed_ceiling', type=float, default=15.0,#env.max_speed 的上限值（軟限速的速度天花板）。
@@ -338,6 +342,14 @@ parser.add_argument('--compact_two_zone_map', dest='compact_two_zone_map', actio
 parser.add_argument('--no_compact_two_zone_map', dest='compact_two_zone_map', action='store_false',
                     help='Use default map layout (current behavior)')
 parser.set_defaults(compact_two_zone_map=True)
+parser.add_argument('--unified_four_maps', dest='unified_four_maps', action='store_true',
+                    help='Use unified single-type map generation cycling through easy/hard/u-min/hairpin')
+parser.add_argument('--no_unified_four_maps', dest='unified_four_maps', action='store_false',
+                    help='Disable unified four-map generation and use legacy multi-region layout')
+parser.set_defaults(unified_four_maps=True)
+parser.add_argument('--map_type', type=str, default='cycle',
+                    choices=['cycle', 'easy', 'hard', 'u-min', 'u_min', 'hairpin'],
+                    help='Force a single unified map type; cycle rotates through all four types')
 # [开关2] 墙壁物理反馈开关（默认: 关闭）
 # - 默认行为：不传任何参数时 wall_physical_feedback=False，采用自由运动结果（当前代码行为）。
 # - 开启反馈：--wall_physical_feedback（启用软接触反馈，修正穿墙/贴墙时的位置与速度）
@@ -484,6 +496,24 @@ parser.add_argument('--terminal_log_interval', type=int, default=500,
 
 args = parser.parse_args()
 
+
+def _write_density_sync_file(parsed_args):
+    sync_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mmgj_density_defaults.json")
+    payload = {
+        "easy_density_scale": float(parsed_args.easy_density_scale),
+        "hard_density_scale": float(parsed_args.hard_density_scale),
+        "source": "mmgj_runtime_args",
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        with open(sync_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[density-sync] warning: failed to write {sync_path}: {exc}")
+
+
+_write_density_sync_file(args)
+
 # 统一 guidance 开关生效：根据 guidance_backend 映射为旧布尔参数，保持后续逻辑兼容。
 if args.guidance_backend == 'dijkstra_potential':
     args.use_precomputed_potential_maps = True
@@ -526,6 +556,8 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           scene_scale=args.scene_scale,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle,
           obstacle_count_scale=args.obstacle_count_scale,
+          easy_density_scale=args.easy_density_scale,
+          hard_density_scale=args.hard_density_scale,
           speed_limit_softness=args.soft_speed_limit_softness,
           max_speed_ceiling=args.max_speed_ceiling,
           hard_vpred_clip=args.hard_vpred_clip,
@@ -533,6 +565,8 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           start_goal_plane_y_abs=args.start_goal_plane_y_abs,
           include_u_local_optimum=args.include_u_local_optimum,
           compact_two_zone_map=args.compact_two_zone_map,
+          unified_four_maps=args.unified_four_maps,
+          forced_map_type=("" if args.map_type == "cycle" else args.map_type),
           wall_physical_feedback=args.wall_physical_feedback)
 
 

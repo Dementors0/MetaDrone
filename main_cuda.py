@@ -6,7 +6,7 @@ from random import normalvariate
 import numpy as np
 import matplotlib
 from matplotlib import pyplot as plt
-from env_multi import Env
+from env_multi import Env, DEFAULT_EASY_DENSITY_SCALE, DEFAULT_HARD_DENSITY_SCALE
 import torch
 from torch.nn import functional as F
 from torch.optim import AdamW
@@ -45,6 +45,10 @@ parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
 parser.add_argument('--obstacle_count_scale', type=float, default=0.5,
                     help='global multiplier for obstacle counts')
+parser.add_argument('--easy_density_scale', type=float, default=float(DEFAULT_EASY_DENSITY_SCALE),
+                    help='density multiplier for easy-region obstacle generation')
+parser.add_argument('--hard_density_scale', type=float, default=float(DEFAULT_HARD_DENSITY_SCALE),
+                    help='density multiplier for hard-region obstacle generation')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--maze_update_interval', type=int, default=50,
@@ -65,6 +69,14 @@ parser.set_defaults(include_u_local_optimum=False)
 parser.add_argument('--compact_two_zone_map', dest='compact_two_zone_map', action='store_true')
 parser.add_argument('--no_compact_two_zone_map', dest='compact_two_zone_map', action='store_false')
 parser.set_defaults(compact_two_zone_map=False)
+parser.add_argument('--unified_four_maps', dest='unified_four_maps', action='store_true',
+                    help='Use unified single-type map generation cycling through easy/hard/u-min/hairpin')
+parser.add_argument('--no_unified_four_maps', dest='unified_four_maps', action='store_false',
+                    help='Disable unified four-map generation and use legacy multi-region layout')
+parser.set_defaults(unified_four_maps=True)
+parser.add_argument('--map_type', type=str, default='cycle',
+                    choices=['cycle', 'easy', 'hard', 'u-min', 'u_min', 'hairpin'],
+                    help='Force a single unified map type; cycle rotates through all four types')
 parser.add_argument('--wall_physical_feedback', dest='wall_physical_feedback', action='store_true')
 parser.add_argument('--no_wall_physical_feedback', dest='wall_physical_feedback', action='store_false')
 parser.set_defaults(wall_physical_feedback=False)
@@ -88,8 +100,12 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           scaffold=args.scaffold, speed_mtp=args.speed_mtp,
           random_rotation=args.random_rotation, cam_angle=args.cam_angle,
           obstacle_count_scale=args.obstacle_count_scale,
+          easy_density_scale=args.easy_density_scale,
+          hard_density_scale=args.hard_density_scale,
           include_u_local_optimum=args.include_u_local_optimum,
           compact_two_zone_map=args.compact_two_zone_map,
+          unified_four_maps=args.unified_four_maps,
+          forced_map_type=("" if args.map_type == "cycle" else args.map_type),
           wall_physical_feedback=args.wall_physical_feedback)
 
 ##########初始化神经网络##########

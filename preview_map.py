@@ -13,7 +13,7 @@ try:
 except Exception:
     go = None
 
-from env_multi import Env
+from env_multi import Env, DEFAULT_EASY_DENSITY_SCALE, DEFAULT_HARD_DENSITY_SCALE
 
 
 REGION_COLORS = {
@@ -96,6 +96,8 @@ def resolve_precomputed_map(args):
 def build_env(args):
     device = choose_device(args.device)
     batch_size = max(1, int(args.batch_index) + 1)
+    include_u_local_optimum = not bool(args.disable_u_local_optimum)
+    forced_map_type = "" if args.map_type == "cycle" else args.map_type
     env = Env(
         batch_size=batch_size,
         width=320,
@@ -105,8 +107,12 @@ def build_env(args):
         single=True,
         random_rotation=False,
         obstacle_count_scale=float(args.obstacle_count_scale),
-        include_u_local_optimum=False,
-        compact_two_zone_map=True,
+        easy_density_scale=float(args.easy_density_scale),
+        hard_density_scale=float(args.hard_density_scale),
+        include_u_local_optimum=include_u_local_optimum,
+        compact_two_zone_map=bool(args.compact_two_zone_map),
+        unified_four_maps=bool(args.unified_four_maps),
+        forced_map_type=forced_map_type,
     )
     return env, device
 
@@ -114,11 +120,13 @@ def build_env(args):
 def extract_scene_geometry(env, batch_index: int = 0, source_label: str = "generated", seed: int | None = None):
     batch_index = int(batch_index) % max(1, int(env.batch_size))
     order = list(env.region_order[batch_index])
+    region_count = max(1, len(order))
+    region_span = (float(env.map_y_max) - float(env.map_y_min)) / float(region_count)
 
     region_zones = []
     for idx, region_type in enumerate(order):
-        y0 = float(env.map_y_min + idx * env.region_length)
-        y1 = float(y0 + env.region_length)
+        y0 = float(env.map_y_min + idx * region_span)
+        y1 = float(y0 + region_span)
         region_zones.append({
             "type": region_type,
             "y0": y0,
@@ -408,8 +416,8 @@ def render_scene_html(scene, output_html: Path):
             xaxis=dict(title="X", range=[-0.2, cfg["mapXMax"] + 0.2], backgroundcolor="rgba(0,0,0,0)"),
             yaxis=dict(title="Y", range=[cfg["mapYMin"] - 0.4, cfg["mapYMax"] + 0.4], backgroundcolor="rgba(0,0,0,0)"),
             zaxis=dict(title="Z", range=[-0.1, cfg["mapZMax"] + 0.3], backgroundcolor="rgba(0,0,0,0)"),
-            aspectmode="manual",
-            aspectratio=dict(x=max(1.0, cfg["mapXMax"] / cfg["mapZMax"]), y=max(1.0, (cfg["mapYMax"] - cfg["mapYMin"]) / cfg["mapZMax"]), z=0.75),
+            # Keep true world-scale proportions so cubes do not look stretched.
+            aspectmode="data",
             camera=dict(eye=dict(x=1.45, y=-1.65, z=1.15)),
         ),
         margin=dict(l=10, r=10, b=10, t=50),
@@ -434,10 +442,29 @@ def parse_args():
     parser.add_argument("--batch-index", type=int, default=0, help="Which batch sample to preview")
     parser.add_argument("--compact-two-zone-map", action="store_true", help="Use compact easy/hard two-zone layout")
     parser.add_argument("--disable-u-local-optimum", action="store_true", help="Disable the u-minimal region when not using compact layout")
+    parser.add_argument("--unified-four-maps", dest="unified_four_maps", action="store_true",
+                        help="Enable unified four-map mode (easy/hard/u-min/hairpin)")
+    parser.add_argument("--no-unified-four-maps", dest="unified_four_maps", action="store_false",
+                        help="Disable unified four-map mode and use legacy multi-region layout")
+    parser.set_defaults(unified_four_maps=True)
+    parser.add_argument("--map-type", type=str, default="cycle",
+                        choices=["cycle", "easy", "hard", "u-min", "u_min", "hairpin"],
+                        help="Force one map type when unified four-map mode is enabled; cycle rotates each reset")
     parser.add_argument("--obstacle-count-scale", type=float, default=0.5, help="Obstacle count scale; 0.5 matches mmgj_transformer default")
+    parser.add_argument("--easy-density-scale", type=float, default=float(DEFAULT_EASY_DENSITY_SCALE), help="Density multiplier for easy-region obstacle generation (default follows mmgj_transformer.py)")
+    parser.add_argument("--hard-density-scale", type=float, default=float(DEFAULT_HARD_DENSITY_SCALE), help="Density multiplier for hard-region obstacle generation (default follows mmgj_transformer.py)")
     parser.add_argument("--output-html", type=str, default="preview_map.html", help="Output HTML path; overwritten on each run")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Env device for preview generation")
     parser.add_argument("--no-open-browser", action="store_true", help="Write HTML only, do not open a browser tab")
+    parser.add_argument(
+        "--source-mode",
+        choices=["generated", "precomputed", "auto"],
+        default="generated",
+        help=(
+            "Map source mode: generated=always env.reset() (default), "
+            "precomputed=always load .pt, auto=load .pt if provided else generate"
+        ),
+    )
     parser.add_argument("--precomputed-map", type=str, default="", help="Optional path to a single precomputed .pt map to preview")
     parser.add_argument("--precomputed-map-dir", type=str, default="", help="Optional directory containing precomputed .pt map files")
     parser.add_argument("--map-index", type=int, default=0, help="Index in sorted precomputed map dir when --precomputed-map-dir is used")
@@ -449,16 +476,32 @@ def main():
     set_random_seed(int(args.seed))
     env, device = build_env(args)
 
-    source_label = "generated"
-    map_path, map_mode = resolve_precomputed_map(args)
-    if map_path is not None:
-        map_data = torch.load(str(map_path), map_location=device)
-        env.reset_from_precomputed_map(map_data)
-        source_label = f"precomputed:{map_path.name}" if map_mode == "file" else f"precomputed:{map_path.parent.name}/{map_path.name}"
-        seed_used = None
-    else:
+    source_label = "generated:env.reset"
+    seed_used = int(args.seed)
+
+    if args.source_mode == "generated":
+        if args.precomputed_map or args.precomputed_map_dir:
+            print(
+                "[preview_map] source-mode=generated: ignore --precomputed-map/--precomputed-map-dir",
+                file=sys.stderr,
+            )
         env.reset()
-        seed_used = int(args.seed)
+    else:
+        map_path, map_mode = resolve_precomputed_map(args)
+        if args.source_mode == "precomputed" and map_path is None:
+            raise ValueError("source-mode=precomputed requires --precomputed-map or --precomputed-map-dir")
+
+        if map_path is not None:
+            map_data = torch.load(str(map_path), map_location=device)
+            env.reset_from_precomputed_map(map_data)
+            source_label = (
+                f"precomputed:{map_path.name}"
+                if map_mode == "file"
+                else f"precomputed:{map_path.parent.name}/{map_path.name}"
+            )
+            seed_used = None
+        else:
+            env.reset()
 
     scene = extract_scene_geometry(
         env=env,
@@ -474,6 +517,10 @@ def main():
     print(f"[preview_map] wrote: {output_html}")
     print(f"[preview_map] source: {scene['source']}")
     print(f"[preview_map] order: {scene['order']}")
+    print(
+        "[preview_map] density_scales: "
+        f"easy={float(args.easy_density_scale):.3f}, hard={float(args.hard_density_scale):.3f}"
+    )
     print(f"[preview_map] device: {device}")
 
 

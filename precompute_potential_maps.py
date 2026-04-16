@@ -10,7 +10,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 
-from env_multi import Env
+from env_multi import Env, DEFAULT_EASY_DENSITY_SCALE, DEFAULT_HARD_DENSITY_SCALE
 from potential_map_utils import (
     build_occupancy_grid_from_obstacles,
     compute_descending_vector_field,
@@ -75,7 +75,12 @@ def _has_reachable_free_near_index(
     return bool(np.any(np.isfinite(local_p) & (local_occ == 0)))
 
 
-def _make_env(include_u_local_optimum: bool, compact_two_zone_map: bool):
+def _make_env(
+    include_u_local_optimum: bool,
+    compact_two_zone_map: bool,
+    easy_density_scale: float = DEFAULT_EASY_DENSITY_SCALE,
+    hard_density_scale: float = DEFAULT_HARD_DENSITY_SCALE,
+):
     return Env(
         batch_size=1,
         width=64,
@@ -92,6 +97,8 @@ def _make_env(include_u_local_optimum: bool, compact_two_zone_map: bool):
         random_rotation=False,
         cam_angle=10,
         obstacle_count_scale=0.5,
+        easy_density_scale=float(easy_density_scale),
+        hard_density_scale=float(hard_density_scale),
         speed_limit_softness=0.05,
         max_speed_ceiling=10.0,
         hard_vpred_clip=20.0,
@@ -209,6 +216,362 @@ def _carve_path_from_obstacles(
     return kept
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _append_voxel_box(
+    env: Env,
+    voxels: List[List[float]],
+    x_center: float,
+    y_center: float,
+    hx: float,
+    hy: float,
+    hz: float = None,
+    z_center: float = None,
+):
+    if hx <= 1e-4 or hy <= 1e-4:
+        return
+    voxels.append([
+        float(x_center),
+        float(y_center),
+        float(env.spawn_z_center if z_center is None else z_center),
+        float(hx),
+        float(hy),
+        float(env.inner_wall_hz if hz is None else hz),
+    ])
+
+
+def _append_vertical_wall_from_boundary(
+    env: Env,
+    voxels: List[List[float]],
+    x_boundary: float,
+    outward_sign: float,
+    y0: float,
+    y1: float,
+    wall_thickness: float,
+):
+    y_lo = min(y0, y1)
+    y_hi = max(y0, y1)
+    if y_hi <= y_lo:
+        return
+    wall_half = 0.5 * float(wall_thickness)
+    _append_voxel_box(
+        env=env,
+        voxels=voxels,
+        x_center=float(x_boundary) + float(outward_sign) * wall_half,
+        y_center=0.5 * (y_lo + y_hi),
+        hx=wall_half,
+        hy=0.5 * (y_hi - y_lo),
+    )
+
+
+def _append_horizontal_wall_from_boundary(
+    env: Env,
+    voxels: List[List[float]],
+    y_boundary: float,
+    outward_sign: float,
+    x0: float,
+    x1: float,
+    wall_thickness: float,
+):
+    x_lo = min(x0, x1)
+    x_hi = max(x0, x1)
+    if x_hi <= x_lo:
+        return
+    wall_half = 0.5 * float(wall_thickness)
+    _append_voxel_box(
+        env=env,
+        voxels=voxels,
+        x_center=0.5 * (x_lo + x_hi),
+        y_center=float(y_boundary) + float(outward_sign) * wall_half,
+        hx=0.5 * (x_hi - x_lo),
+        hy=wall_half,
+    )
+
+
+def _design_corridor_params(env: Env):
+    # Use conservative max training radius so every map honors the minimum-clearance rule.
+    drone_radius_ref = 0.15
+    drone_width = 2.0 * drone_radius_ref
+    corridor_width = max(float(env.two_drone_passage_width), 3.0 * drone_width)
+    corridor_width = _clamp(corridor_width, 0.65, float(env.map_x_max) - 1.40)
+    min_clear_width = 1.5 * drone_radius_ref
+    return drone_radius_ref, corridor_width, min_clear_width
+
+
+def _add_embedded_narrowings_vertical(
+    env: Env,
+    voxels: List[List[float]],
+    balls: List[List[float]],
+    x_center: float,
+    y0: float,
+    y1: float,
+    corridor_width: float,
+    min_clear_width: float,
+) -> float:
+    if y1 - y0 <= 1.2:
+        return corridor_width
+
+    half_w = 0.5 * corridor_width
+    left_inner_x = x_center - half_w
+    right_inner_x = x_center + half_w
+    min_gap_seen = corridor_width
+
+    for frac in (0.24, 0.50, 0.76):
+        y_mid = y0 + frac * (y1 - y0) + random.uniform(-0.16, 0.16)
+        y_mid = _clamp(y_mid, y0 + 0.45, y1 - 0.45)
+
+        gap_lo = min(corridor_width - 0.10, min_clear_width + 0.14)
+        gap_hi = max(gap_lo, corridor_width - 0.16)
+        gap = random.uniform(gap_lo, gap_hi) if gap_hi > gap_lo + 1e-6 else gap_lo
+        gap = _clamp(gap, min_clear_width + 0.10, corridor_width - 0.08)
+
+        removable = max(0.0, corridor_width - gap)
+        if removable <= 1e-6:
+            continue
+
+        if random.random() < 0.55:
+            split = random.uniform(0.30, 0.70)
+            left_depth = removable * split
+            right_depth = removable - left_depth
+        elif random.random() < 0.5:
+            left_depth, right_depth = removable, 0.0
+        else:
+            left_depth, right_depth = 0.0, removable
+
+        local_hy = random.uniform(0.22, 0.36)
+        if left_depth > 0.06:
+            _append_voxel_box(
+                env=env,
+                voxels=voxels,
+                x_center=left_inner_x + 0.5 * left_depth,
+                y_center=y_mid,
+                hx=0.5 * left_depth,
+                hy=local_hy,
+            )
+        if right_depth > 0.06:
+            _append_voxel_box(
+                env=env,
+                voxels=voxels,
+                x_center=right_inner_x - 0.5 * right_depth,
+                y_center=y_mid,
+                hx=0.5 * right_depth,
+                hy=local_hy,
+            )
+        min_gap_seen = min(min_gap_seen, corridor_width - left_depth - right_depth)
+
+    for frac in (0.36, 0.68):
+        y_mid = y0 + frac * (y1 - y0) + random.uniform(-0.14, 0.14)
+        y_mid = _clamp(y_mid, y0 + 0.35, y1 - 0.35)
+        r = random.uniform(0.10, 0.14)
+        intrusion = min(0.05, 0.42 * r)
+        if random.random() < 0.5:
+            cx = left_inner_x - (r - intrusion)
+        else:
+            cx = right_inner_x + (r - intrusion)
+        balls.append([float(cx), float(y_mid), float(env.spawn_z_center), float(r)])
+
+    return max(min_clear_width, min_gap_seen - 0.02)
+
+
+def _add_embedded_narrowings_horizontal(
+    env: Env,
+    voxels: List[List[float]],
+    balls: List[List[float]],
+    x0: float,
+    x1: float,
+    y_center: float,
+    corridor_width: float,
+    min_clear_width: float,
+) -> float:
+    x_lo = min(x0, x1)
+    x_hi = max(x0, x1)
+    if x_hi - x_lo <= 1.2:
+        return corridor_width
+
+    half_w = 0.5 * corridor_width
+    bottom_inner_y = y_center - half_w
+    top_inner_y = y_center + half_w
+    min_gap_seen = corridor_width
+
+    for frac in (0.30, 0.58, 0.82):
+        x_mid = x_lo + frac * (x_hi - x_lo) + random.uniform(-0.12, 0.12)
+        x_mid = _clamp(x_mid, x_lo + 0.30, x_hi - 0.30)
+
+        gap_lo = min(corridor_width - 0.10, min_clear_width + 0.14)
+        gap_hi = max(gap_lo, corridor_width - 0.16)
+        gap = random.uniform(gap_lo, gap_hi) if gap_hi > gap_lo + 1e-6 else gap_lo
+        gap = _clamp(gap, min_clear_width + 0.10, corridor_width - 0.08)
+
+        removable = max(0.0, corridor_width - gap)
+        if removable <= 1e-6:
+            continue
+
+        if random.random() < 0.55:
+            split = random.uniform(0.30, 0.70)
+            top_depth = removable * split
+            bottom_depth = removable - top_depth
+        elif random.random() < 0.5:
+            top_depth, bottom_depth = removable, 0.0
+        else:
+            top_depth, bottom_depth = 0.0, removable
+
+        local_hx = random.uniform(0.24, 0.38)
+        if top_depth > 0.06:
+            _append_voxel_box(
+                env=env,
+                voxels=voxels,
+                x_center=x_mid,
+                y_center=top_inner_y - 0.5 * top_depth,
+                hx=local_hx,
+                hy=0.5 * top_depth,
+            )
+        if bottom_depth > 0.06:
+            _append_voxel_box(
+                env=env,
+                voxels=voxels,
+                x_center=x_mid,
+                y_center=bottom_inner_y + 0.5 * bottom_depth,
+                hx=local_hx,
+                hy=0.5 * bottom_depth,
+            )
+        min_gap_seen = min(min_gap_seen, corridor_width - top_depth - bottom_depth)
+
+    for frac in (0.42, 0.74):
+        x_mid = x_lo + frac * (x_hi - x_lo) + random.uniform(-0.10, 0.10)
+        x_mid = _clamp(x_mid, x_lo + 0.25, x_hi - 0.25)
+        r = random.uniform(0.10, 0.14)
+        intrusion = min(0.05, 0.42 * r)
+        if random.random() < 0.5:
+            cy = top_inner_y + (r - intrusion)
+        else:
+            cy = bottom_inner_y - (r - intrusion)
+        balls.append([float(x_mid), float(cy), float(env.spawn_z_center), float(r)])
+
+    return max(min_clear_width, min_gap_seen - 0.02)
+
+
+def _build_tight_semicircle_cylinders(
+    center_x: float,
+    center_y: float,
+    bend_radius: float,
+    cyl_radius: float,
+    upward: bool = True,
+) -> List[List[float]]:
+    if bend_radius <= 1e-4 or cyl_radius <= 1e-4:
+        return []
+    arc_len = math.pi * bend_radius
+    step = max(1e-4, 2.0 * cyl_radius * 0.98)
+    steps = max(10, int(math.ceil(arc_len / step)))
+    angle_offset = 0.0 if upward else math.pi
+
+    cyl = []
+    for i in range(steps + 1):
+        theta = angle_offset + (math.pi * i / float(steps))
+        x = center_x + bend_radius * math.cos(theta)
+        y = center_y + bend_radius * math.sin(theta)
+        cyl.append([float(x), float(y), float(cyl_radius)])
+    return cyl
+
+
+def _embed_small_obstacles_on_u_inner_side(
+    env: Env,
+    voxels: List[List[float]],
+    balls: List[List[float]],
+    center_x: float,
+    center_y: float,
+    bend_radius: float,
+    wall_cyl_radius: float,
+    y_min: float,
+    y_max: float,
+):
+    """Embed small boxes/balls on the concave (inner) side of U-bend wall."""
+    if bend_radius <= 1e-4 or wall_cyl_radius <= 1e-4:
+        return
+
+    placed_xy: List[Tuple[float, float]] = []
+    # Dense textured surface: push obstacle count up aggressively.
+    target_count = random.randint(16, 24)
+    placed_count = 0
+    attempts = 0
+    max_attempts = target_count * 22
+    while placed_count < target_count and attempts < max_attempts:
+        attempts += 1
+        theta = random.uniform(0.14 * math.pi, 0.86 * math.pi)
+        wall_x = center_x + bend_radius * math.cos(theta)
+        wall_y = center_y + bend_radius * math.sin(theta)
+
+        # Concave side points toward the semicircle center.
+        nx = (center_x - wall_x) / max(1e-6, bend_radius)
+        ny = (center_y - wall_y) / max(1e-6, bend_radius)
+
+        is_ball = (random.random() < 0.50)
+        if is_ball:
+            r = random.uniform(0.15, 0.27)
+            intrusion = random.uniform(0.02, 0.05)
+            cx = wall_x + nx * (wall_cyl_radius - intrusion + r)
+            cy = wall_y + ny * (wall_cyl_radius - intrusion + r)
+            min_sep = 0.225
+            if any(math.hypot(cx - px, cy - py) < min_sep for px, py in placed_xy):
+                continue
+            cx = _clamp(cx, 0.35 + r, float(env.map_x_max) - 0.35 - r)
+            cy = _clamp(cy, y_min + 0.35 + r, y_max - 0.35 - r)
+            z_lo = float(env.ground_z) + r + 0.04
+            z_hi = float(env.ceiling_z) - r - 0.04
+            if z_hi <= z_lo:
+                cz = float(env.spawn_z_center)
+            else:
+                # 上下分布：让障碍在墙面上有高度层次，不是一排。
+                band = random.random()
+                if band < 0.34:
+                    cz = random.uniform(z_lo, z_lo + 0.35 * (z_hi - z_lo))
+                elif band < 0.68:
+                    cz = random.uniform(z_lo + 0.30 * (z_hi - z_lo), z_lo + 0.70 * (z_hi - z_lo))
+                else:
+                    cz = random.uniform(z_lo + 0.65 * (z_hi - z_lo), z_hi)
+            balls.append([float(cx), float(cy), float(cz), float(r)])
+            placed_xy.append((cx, cy))
+            placed_count += 1
+            continue
+
+        # True cube: hx == hy == hz, and size close to ball diameter scale.
+        half_side = random.uniform(0.15, 0.27)
+        intrusion = random.uniform(0.02, 0.05)
+        radial_extent = half_side
+        cx = wall_x + nx * (wall_cyl_radius - intrusion + radial_extent)
+        cy = wall_y + ny * (wall_cyl_radius - intrusion + radial_extent)
+        min_sep = 0.225
+        if any(math.hypot(cx - px, cy - py) < min_sep for px, py in placed_xy):
+            continue
+        cx = _clamp(cx, 0.35 + half_side, float(env.map_x_max) - 0.35 - half_side)
+        cy = _clamp(cy, y_min + 0.35 + half_side, y_max - 0.35 - half_side)
+        z_lo = float(env.ground_z) + half_side + 0.04
+        z_hi = float(env.ceiling_z) - half_side - 0.04
+        if z_hi <= z_lo:
+            cz = float(env.spawn_z_center)
+        else:
+            band = random.random()
+            if band < 0.34:
+                cz = random.uniform(z_lo, z_lo + 0.35 * (z_hi - z_lo))
+            elif band < 0.68:
+                cz = random.uniform(z_lo + 0.30 * (z_hi - z_lo), z_lo + 0.70 * (z_hi - z_lo))
+            else:
+                cz = random.uniform(z_lo + 0.65 * (z_hi - z_lo), z_hi)
+        _append_voxel_box(
+            env=env,
+            voxels=voxels,
+            x_center=cx,
+            y_center=cy,
+            hx=half_side,
+            hy=half_side,
+            hz=half_side,
+            z_center=cz,
+        )
+        placed_xy.append((cx, cy))
+        placed_count += 1
+
+
 def _build_easy_or_hard_geometry(env: Env, map_type: str) -> Dict:
     if map_type not in ("easy", "hard"):
         raise ValueError(f"invalid map_type for random geometry: {map_type}")
@@ -265,89 +628,109 @@ def _build_u_min_geometry(env: Env) -> Dict:
     y_min = -y_half
     y_max = y_half
 
-    placed = _build_dense_fill_region(env, y_min, y_max, map_length)
+    _, corridor_width, min_clear_width = _design_corridor_params(env)
+    wall_thickness = 0.24
+    straight_length = min(10.0, map_length - 5.0)
 
-    side = 1.0 if random.random() < 0.5 else -1.0
-    side_label = "right" if side > 0 else "left"
-
-    start_x = env.spawn_x_center + random.uniform(-0.15, 0.15)
+    start_x = float(env.spawn_x_center)
     start_y = y_min + 0.60
+    straight_end_y = _clamp(start_y + straight_length, y_min + 5.50, y_max - 3.20)
+    wall_entry_y0 = y_min - float(env.boundary_half)
 
-    y_straight = y_max - 2.55
-    y_u_top = y_max - 1.35
-    y_u_bottom = y_max - 3.45
+    voxels: List[List[float]] = []
+    balls: List[List[float]] = []
 
-    x_inner = env.spawn_x_center + side * random.uniform(1.05, 1.45)
-    # Keep U bend clearly away from outer boundary walls.
-    outer_wall_clearance = 1.60
-    x_outer = env.map_x_max - outer_wall_clearance if side > 0 else outer_wall_clearance
-    x_hidden = x_outer + side * random.uniform(0.85, 1.05)
-    x_hidden = max(0.70, min(env.map_x_max - 0.70, x_hidden))
-
-    goal_y = y_u_bottom - random.uniform(0.18, 0.38)
-    goal_y = max(y_min + 2.60, min(y_max - 1.00, goal_y))
-
-    centerline = [
-        (start_x, start_y),
-        (start_x, y_straight),
-        (x_inner, y_straight + 0.55),
-        (x_inner, y_u_top),
-        (x_outer, y_u_top),
-        (x_outer, y_u_bottom),
-        (x_hidden, goal_y + 0.32),
-        (x_hidden, goal_y),
-    ]
-
-    path_width = float(env.two_drone_passage_width)
-    goal_xy = (x_hidden, goal_y)
-    start_xy = (start_x, start_y)
-    kept = _carve_path_from_obstacles(
-        placed=placed,
-        centerline_xy=centerline,
-        path_width=path_width,
-        start_xy=start_xy,
-        goal_xy=goal_xy,
+    corridor_half = 0.5 * corridor_width
+    _append_vertical_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        x_boundary=start_x - corridor_half,
+        outward_sign=-1.0,
+        y0=wall_entry_y0,
+        y1=straight_end_y,
+        wall_thickness=wall_thickness,
+    )
+    _append_vertical_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        x_boundary=start_x + corridor_half,
+        outward_sign=1.0,
+        y0=wall_entry_y0,
+        y1=straight_end_y,
+        wall_thickness=wall_thickness,
     )
 
-    balls, cyls, vox = env._packed_obstacle_lists(kept)
-    boundary_voxels = _build_boundary_voxels_for_length(env, map_length)
+    min_gap_straight = _add_embedded_narrowings_vertical(
+        env=env,
+        voxels=voxels,
+        balls=balls,
+        x_center=start_x,
+        y0=start_y + 0.85,
+        y1=straight_end_y - 0.45,
+        corridor_width=corridor_width,
+        min_clear_width=min_clear_width,
+    )
 
-    # Structural U outer wall to create the hidden pocket zone near map boundary.
-    wall_x = x_outer - side * 0.55
-    wall_half_thickness = 0.12
-    u_struct_voxels = [
-        [
-            wall_x,
-            0.5 * (y_u_top + y_u_bottom),
-            env.spawn_z_center,
-            wall_half_thickness,
-            0.5 * (y_u_top - y_u_bottom),
-            env.inner_wall_hz,
-        ],
-        [
-            0.5 * (x_inner + wall_x),
-            y_u_bottom,
-            env.spawn_z_center,
-            0.5 * abs(x_inner - wall_x),
-            wall_half_thickness,
-            env.inner_wall_hz,
-        ],
-    ]
+    u_diameter = 4.0
+    u_radius = 0.5 * u_diameter
+    u_center_x = start_x
+    u_center_y = straight_end_y
+    cyls = _build_tight_semicircle_cylinders(
+        center_x=u_center_x,
+        center_y=u_center_y,
+        bend_radius=u_radius,
+        cyl_radius=float(env.cyl_tree_radius),
+        upward=True,
+    )
+    _embed_small_obstacles_on_u_inner_side(
+        env=env,
+        voxels=voxels,
+        balls=balls,
+        center_x=u_center_x,
+        center_y=u_center_y,
+        bend_radius=u_radius,
+        wall_cyl_radius=float(env.cyl_tree_radius),
+        y_min=y_min,
+        y_max=y_max,
+    )
 
+    goal_y = _clamp(u_center_y + u_radius + 1.35, y_min + 2.20, y_max - 0.85)
+    goal_xy = (start_x, goal_y)
     spawn_start = (start_x, start_y, env.spawn_z_center)
     spawn_goal = (goal_xy[0], goal_xy[1], env.spawn_z_center)
 
-    width_profile = [path_width for _ in centerline]
+    side = 1.0 if random.random() < 0.5 else -1.0
+    side_label = "right" if side > 0 else "left"
+    route_side_x = _clamp(start_x + side * (u_radius + 0.75), 0.80, env.map_x_max - 0.80)
+    centerline = [
+        (start_x, start_y),
+        (start_x, straight_end_y),
+        (route_side_x, u_center_y + 0.26),
+        (route_side_x, u_center_y + u_radius + 0.36),
+        (goal_xy[0], goal_xy[1]),
+    ]
+    width_profile = [corridor_width for _ in centerline]
+
+    boundary_voxels = _build_boundary_voxels_for_length(env, map_length)
+    min_gap_design = max(min_clear_width, min_gap_straight)
     u_meta = {
         "map_type": map_type,
+        "style": "structured_corridor_u",
         "centerline": [(float(x), float(y)) for x, y in centerline],
         "width_profile": [float(w) for w in width_profile],
         "u_meta": {
-            "open_side": side_label,
-            "exit_span": [float(y_u_bottom), float(y_u_top)],
-            "u_span": [float(y_u_bottom), float(y_u_top)],
+            "corridor_width": float(corridor_width),
+            "straight_length": float(straight_end_y - start_y),
+            "wall_entry_y0": float(wall_entry_y0),
+            "minimum_clearance_constraint": float(min_clear_width),
+            "minimum_clearance_design": float(min_gap_design),
+            "u_diameter": float(u_diameter),
+            "u_radius": float(u_radius),
+            "u_center": [float(u_center_x), float(u_center_y)],
+            "u_open_direction": "toward_start",
+            "reference_route_side": side_label,
             "goal_xy": [float(goal_xy[0]), float(goal_xy[1])],
-            "entry_xy": [float(x_inner), float(y_straight + 0.55)],
+            "corridor_exit_xy": [float(start_x), float(straight_end_y)],
         },
     }
 
@@ -360,7 +743,7 @@ def _build_u_min_geometry(env: Env) -> Dict:
         "map_z_max": float(env.map_z_max),
         "balls": _ensure_np(balls, 4),
         "cyl": _ensure_np(cyls, 3),
-        "voxels": _ensure_np(boundary_voxels + vox + u_struct_voxels, 6),
+        "voxels": _ensure_np(boundary_voxels + voxels, 6),
         "cyl_h": _ensure_np([], 3),
         "region_order": (map_type,),
         "u_meta": u_meta,
@@ -381,69 +764,143 @@ def _build_hairpin_geometry(env: Env) -> Dict:
     y_min = -y_half
     y_max = y_half
 
-    placed = _build_dense_fill_region(env, y_min, y_max, map_length)
+    _, corridor_width, min_clear_width = _design_corridor_params(env)
+    wall_thickness = 0.24
+    post_turn_length = 3.0
 
-    side = 1.0 if random.random() < 0.5 else -1.0
-    start_x = env.spawn_x_center + random.uniform(-0.18, 0.18)
-    start_y = y_min + 0.55
+    start_x = float(env.spawn_x_center)
+    start_y = y_min + 0.60
+    turn_distance_from_map_start = 15.0
+    turn_y = y_min + turn_distance_from_map_start
+    turn_dir = 1.0 if random.random() < 0.5 else -1.0
+    turn_label = "right" if turn_dir > 0 else "left"
+    wall_entry_y0 = y_min - float(env.boundary_half)
 
-    y1 = y_min + 3.40
-    y2 = y_min + 6.80
-    y3 = y_min + 9.30
-    y4 = y_min + 10.70
-    y5 = y_min + 11.50
+    x_turn_end = _clamp(start_x + turn_dir * post_turn_length, 0.90, env.map_x_max - 0.90)
+    goal_x = _clamp(start_x + turn_dir * (post_turn_length - 0.45), 0.90, env.map_x_max - 0.90)
+    goal_y = turn_y
 
-    x1 = start_x + random.uniform(-0.24, 0.24)
-    x2 = x1 + side * random.uniform(0.25, 0.55)
-    x3 = env.spawn_x_center + side * random.uniform(1.90, 2.45)
-    x4 = x3 - side * random.uniform(0.45, 0.75)
-    x5 = env.spawn_x_center - side * random.uniform(0.55, 0.95)
+    corridor_half = 0.5 * corridor_width
+    x_left = start_x - corridor_half
+    x_right = start_x + corridor_half
+    y_bot = turn_y - corridor_half
+    y_top = turn_y + corridor_half
+    x_turn_side = x_right if turn_dir > 0 else x_left
+    x_far_side = x_left if turn_dir > 0 else x_right
+    outward_turn = 1.0 if turn_dir > 0 else -1.0
+    outward_far = -outward_turn
+
+    voxels: List[List[float]] = []
+    balls: List[List[float]] = []
+    cyls: List[List[float]] = []
+
+    far_extra = 0.65
+    near_retract = 0.14
+
+    # 远端墙：更长，封死直行出口；近端墙：更短，给拐弯留入口。
+    _append_vertical_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        x_boundary=x_far_side,
+        outward_sign=outward_far,
+        y0=wall_entry_y0,
+        y1=min(y_top + far_extra, y_max + float(env.boundary_half)),
+        wall_thickness=wall_thickness,
+    )
+    _append_vertical_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        x_boundary=x_turn_side,
+        outward_sign=outward_turn,
+        y0=wall_entry_y0,
+        y1=y_bot - near_retract,
+        wall_thickness=wall_thickness,
+    )
+
+    far_x0 = min(x_far_side, x_turn_end) - wall_thickness
+    far_x1 = max(x_far_side, x_turn_end) + wall_thickness
+    _append_horizontal_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        y_boundary=y_top,
+        outward_sign=1.0,
+        x0=far_x0,
+        x1=far_x1,
+        wall_thickness=wall_thickness,
+    )
+
+    near_release = max(0.26, 1.10 * wall_thickness)
+    if turn_dir > 0:
+        near_x0 = x_turn_side + near_release
+        near_x1 = x_turn_end + wall_thickness
+    else:
+        near_x0 = x_turn_end - wall_thickness
+        near_x1 = x_turn_side - near_release
+    _append_horizontal_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        y_boundary=y_bot,
+        outward_sign=-1.0,
+        x0=near_x0,
+        x1=near_x1,
+        wall_thickness=wall_thickness,
+    )
+
+    # 弯后 3m 通道端部封口，避免从远端直接漏出。
+    _append_vertical_wall_from_boundary(
+        env=env,
+        voxels=voxels,
+        x_boundary=x_turn_end,
+        outward_sign=turn_dir,
+        y0=y_bot,
+        y1=y_top,
+        wall_thickness=wall_thickness,
+    )
+
+    min_gap_straight = _add_embedded_narrowings_vertical(
+        env=env,
+        voxels=voxels,
+        balls=balls,
+        x_center=start_x,
+        y0=start_y + 0.85,
+        y1=turn_y - 0.50,
+        corridor_width=corridor_width,
+        min_clear_width=min_clear_width,
+    )
+    # Do not embed extra obstacles in the hairpin turning segment.
+    min_gap_turn = corridor_width
 
     centerline = [
         (start_x, start_y),
-        (x1, y1),
-        (x2, y2),
-        (x3, y3),
-        (x4, y4),
-        (x5, y5),
+        (start_x, turn_y),
+        (goal_x, goal_y),
     ]
-
-    path_width = float(env.two_drone_passage_width)
-    start_xy = (start_x, start_y)
-    goal_xy = (x5, y5)
-    kept = _carve_path_from_obstacles(
-        placed=placed,
-        centerline_xy=centerline,
-        path_width=path_width,
-        start_xy=start_xy,
-        goal_xy=goal_xy,
-    )
-
-    balls, cyls, vox = env._packed_obstacle_lists(kept)
     boundary_voxels = _build_boundary_voxels_for_length(env, map_length)
-
-    # Mid-wall strengthens the sharp-turn + short-turnback hairpin behavior.
-    wall_half_thickness = 0.12
-    mid_wall_x = env.spawn_x_center + side * 1.05
-    mid_wall = [
-        [
-            mid_wall_x,
-            0.5 * (y2 + y4),
-            env.spawn_z_center,
-            wall_half_thickness,
-            0.5 * (y4 - y2),
-            env.inner_wall_hz,
-        ]
-    ]
-
     spawn_start = (start_x, start_y, env.spawn_z_center)
-    spawn_goal = (goal_xy[0], goal_xy[1], env.spawn_z_center)
-    width_profile = [path_width for _ in centerline]
+    spawn_goal = (goal_x, goal_y, env.spawn_z_center)
+    width_profile = [corridor_width for _ in centerline]
+    min_gap_design = max(min_clear_width, min(min_gap_straight, min_gap_turn))
 
     hairpin_meta = {
         "map_type": map_type,
+        "style": "structured_corridor_hairpin",
         "centerline": [(float(x), float(y)) for x, y in centerline],
         "width_profile": [float(w) for w in width_profile],
+        "turn_meta": {
+            "turn_direction": turn_label,
+            "corridor_width": float(corridor_width),
+            "straight_length": float(turn_y - start_y),
+            "turn_distance_from_map_start": float(turn_distance_from_map_start),
+            "post_turn_length": float(abs(x_turn_end - start_x)),
+            "wall_entry_y0": float(wall_entry_y0),
+            "near_release": float(near_release),
+            "far_extra": float(far_extra),
+            "near_retract": float(near_retract),
+            "minimum_clearance_constraint": float(min_clear_width),
+            "minimum_clearance_design": float(min_gap_design),
+            "turn_point_xy": [float(start_x), float(turn_y)],
+            "goal_xy": [float(goal_x), float(goal_y)],
+        },
     }
 
     return {
@@ -455,7 +912,7 @@ def _build_hairpin_geometry(env: Env) -> Dict:
         "map_z_max": float(env.map_z_max),
         "balls": _ensure_np(balls, 4),
         "cyl": _ensure_np(cyls, 3),
-        "voxels": _ensure_np(boundary_voxels + vox + mid_wall, 6),
+        "voxels": _ensure_np(boundary_voxels + voxels, 6),
         "cyl_h": _ensure_np([], 3),
         "region_order": (map_type,),
         "u_meta": hairpin_meta,
@@ -485,13 +942,20 @@ def _build_single_map_legacy(task: Dict):
     seed = int(task["seed"])
     include_u = bool(task["include_u_local_optimum"])
     compact_two_zone = bool(task.get("compact_two_zone_map", False))
+    easy_density_scale = float(task.get("easy_density_scale", 1.0))
+    hard_density_scale = float(task.get("hard_density_scale", 1.0))
 
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
 
     try:
-        env = _make_env(include_u_local_optimum=include_u, compact_two_zone_map=compact_two_zone)
+        env = _make_env(
+            include_u_local_optimum=include_u,
+            compact_two_zone_map=compact_two_zone,
+            easy_density_scale=easy_density_scale,
+            hard_density_scale=hard_density_scale,
+        )
 
         bounds = {
             "x_min": -0.5,
@@ -584,13 +1048,20 @@ def _build_single_map_unified(task: Dict):
     map_type = str(task["map_type"])
     save_dir = task["save_dir"]
     seed = int(task["seed"])
+    easy_density_scale = float(task.get("easy_density_scale", 1.0))
+    hard_density_scale = float(task.get("hard_density_scale", 1.0))
 
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
 
     try:
-        env = _make_env(include_u_local_optimum=False, compact_two_zone_map=True)
+        env = _make_env(
+            include_u_local_optimum=False,
+            compact_two_zone_map=True,
+            easy_density_scale=easy_density_scale,
+            hard_density_scale=hard_density_scale,
+        )
         geom = _build_unified_geometry(env, map_type=map_type)
 
         bounds = {
@@ -764,6 +1235,8 @@ def _build_legacy_tasks(args) -> List[Dict]:
             "margin": float(args.margin),
             "z_min": float(args.z_min),
             "z_max": float(args.z_max),
+            "easy_density_scale": float(args.easy_density_scale),
+            "hard_density_scale": float(args.hard_density_scale),
             "include_u_local_optimum": bool(args.include_u_local_optimum),
             "compact_two_zone_map": bool(args.compact_two_zone_map),
             "unified_dataset_mode": False,
@@ -794,6 +1267,8 @@ def _build_unified_tasks(args) -> List[Dict]:
                 "margin": float(args.margin),
                 "z_min": float(args.z_min),
                 "z_max": float(args.z_max),
+                "easy_density_scale": float(args.easy_density_scale),
+                "hard_density_scale": float(args.hard_density_scale),
                 "unified_dataset_mode": True,
             })
             global_index += 1
@@ -809,6 +1284,18 @@ def main():
     parser.add_argument("--margin", type=float, default=0.15)
     parser.add_argument("--z_min", type=float, default=0.0)
     parser.add_argument("--z_max", type=float, default=5.0)
+    parser.add_argument(
+        "--easy_density_scale",
+        type=float,
+        default=float(DEFAULT_EASY_DENSITY_SCALE),
+        help="Density multiplier for easy-region obstacle generation (default follows mmgj_transformer.py)",
+    )
+    parser.add_argument(
+        "--hard_density_scale",
+        type=float,
+        default=float(DEFAULT_HARD_DENSITY_SCALE),
+        help="Density multiplier for hard-region obstacle generation (default follows mmgj_transformer.py)",
+    )
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -870,6 +1357,10 @@ def main():
     print(
         f"[Precompute] mode={mode_name}, total={total_tasks}, workers={num_workers}, "
         f"chunksize={chunksize}, max_retries={args.max_retries}, save_dir={args.save_dir}"
+    )
+    print(
+        "[Precompute] density_scales: "
+        f"easy={float(args.easy_density_scale):.3f}, hard={float(args.hard_density_scale):.3f}"
     )
     if bool(args.unified_dataset_mode):
         print(

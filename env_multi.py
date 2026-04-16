@@ -1,10 +1,68 @@
+import json
 import math
 import random
+import re
+from pathlib import Path
 
 import torch
 import quadsim_cuda
 
 from env import Env as BaseEnv, run as differentiable_run, run_torch as differentiable_run_torch, safe_normalize, update_state_vec_torch
+
+
+def _extract_float_default_from_mmgj(src_text: str, arg_name: str):
+    pat = (
+        r"parser\.add_argument\(\s*['\"]--"
+        + re.escape(arg_name)
+        + r"['\"].*?default\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    )
+    m = re.search(pat, src_text, flags=re.S)
+    if m is None:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def load_density_defaults_from_mmgj(
+    fallback_easy: float = 1.0,
+    fallback_hard: float = 1.0,
+):
+    """Read easy/hard density defaults from mmgj_transformer.py.
+
+    This keeps map preview/precompute defaults synchronized with mmgj defaults
+    without importing mmgj (which has heavy side effects at import time).
+    """
+    easy = float(fallback_easy)
+    hard = float(fallback_hard)
+
+    sync_path = Path(__file__).resolve().with_name(".mmgj_density_defaults.json")
+    if sync_path.exists():
+        try:
+            payload = json.loads(sync_path.read_text(encoding="utf-8"))
+            easy_sync = float(payload.get("easy_density_scale", easy))
+            hard_sync = float(payload.get("hard_density_scale", hard))
+            return easy_sync, hard_sync
+        except Exception:
+            pass
+
+    mmgj_path = Path(__file__).resolve().with_name("mmgj_transformer.py")
+    try:
+        src_text = mmgj_path.read_text(encoding="utf-8")
+    except Exception:
+        return easy, hard
+
+    easy_from_file = _extract_float_default_from_mmgj(src_text, "easy_density_scale")
+    hard_from_file = _extract_float_default_from_mmgj(src_text, "hard_density_scale")
+    if easy_from_file is not None:
+        easy = float(easy_from_file)
+    if hard_from_file is not None:
+        hard = float(hard_from_file)
+    return easy, hard
+
+
+DEFAULT_EASY_DENSITY_SCALE, DEFAULT_HARD_DENSITY_SCALE = load_density_defaults_from_mmgj()
 
 
 class Env(BaseEnv):
@@ -27,6 +85,8 @@ class Env(BaseEnv):
         random_rotation=False,
         cam_angle=10,
         obstacle_count_scale=1.0,
+        easy_density_scale=DEFAULT_EASY_DENSITY_SCALE,
+        hard_density_scale=DEFAULT_HARD_DENSITY_SCALE,
         speed_limit_softness=0.05,
         max_speed_ceiling=5.0,
         hard_vpred_clip=20.0,
@@ -34,10 +94,12 @@ class Env(BaseEnv):
         start_goal_plane_y_abs=50.0,
         include_u_local_optimum=False,
         compact_two_zone_map=True,
+        unified_four_maps=False,
+        forced_map_type="",
         wall_physical_feedback=False,
     ):
         self.map_x_max = 10.0
-        self.compact_two_zone_map = bool(compact_two_zone_map)
+        self.compact_two_zone_map = bool(compact_two_zone_map) or bool(unified_four_maps)
         self.map_y_half = 8.0 if self.compact_two_zone_map else 12.0
         self.map_y_min = -self.map_y_half
         self.map_y_max = self.map_y_half
@@ -48,6 +110,8 @@ class Env(BaseEnv):
         self.object_height = self.map_z_max / 3.0
         self.object_half_height = 0.5 * self.object_height
         self.two_drone_passage_width = 0.60
+        self.easy_density_scale = max(0.05, float(easy_density_scale))
+        self.hard_density_scale = max(0.05, float(hard_density_scale))
         self.region_types = ("easy", "hard") if self.compact_two_zone_map else (
             ("easy", "hard", "u-minimal") if bool(include_u_local_optimum) else ("hard", "easy", "easy")
         )
@@ -71,6 +135,11 @@ class Env(BaseEnv):
         self.full_wall_hz = 2.45
         self.inner_wall_hz = 2.30
         self.include_u_local_optimum = bool(include_u_local_optimum)
+        self.unified_four_maps = bool(unified_four_maps)
+        self._four_map_types = ("easy", "hard", "u-min", "hairpin")
+        self._four_map_cycle_idx = 0
+        self.forced_map_type = self._normalize_map_type_name(forced_map_type)
+        self._unified_builder_fn = None
         # 起终点固定在上下边界内缩 0.5m 的平面上；紧凑地图时会自动变为 y=±7.5。
         self.spawn_start_y = self.map_y_min + 0.5
         self.spawn_goal_y = self.map_y_max - 0.5
@@ -106,6 +175,37 @@ class Env(BaseEnv):
 
     def _scaled_region_count(self, base_count, min_count=0):
         return max(min_count, int(round(base_count * self.obstacle_count_scale)))
+
+    def _density_scale_for_difficulty(self, difficulty):
+        if difficulty == "easy":
+            return self.easy_density_scale
+        return self.hard_density_scale
+
+    def _normalize_map_type_name(self, map_type):
+        if map_type is None:
+            return ""
+        name = str(map_type).strip().lower()
+        if name in ("", "cycle", "auto"):
+            return ""
+        if name == "u_min":
+            return "u-min"
+        if name not in self._four_map_types:
+            raise ValueError(f"Unsupported map_type={map_type}. expected one of {self._four_map_types} or cycle")
+        return name
+
+    def _pick_unified_map_type(self):
+        if self.forced_map_type:
+            return self.forced_map_type
+        map_type = self._four_map_types[self._four_map_cycle_idx % len(self._four_map_types)]
+        self._four_map_cycle_idx += 1
+        return map_type
+
+    def _get_unified_builder(self):
+        if self._unified_builder_fn is None:
+            from precompute_potential_maps import _build_unified_geometry
+
+            self._unified_builder_fn = _build_unified_geometry
+        return self._unified_builder_fn
 
     def _build_boundary_voxels(self):
         return [
@@ -315,7 +415,9 @@ class Env(BaseEnv):
         }
 
     def _build_scatter_specs(self, difficulty):
-        density = 0.55 if difficulty == "easy" else 1.0
+        base_density = 0.55 if difficulty == "easy" else 1.0
+        density_scale = self._density_scale_for_difficulty(difficulty)
+        density = base_density * density_scale
         base_counts = {
             "ball": 3,
             "cyl": 18,
@@ -329,7 +431,8 @@ class Env(BaseEnv):
         # 只生成圆柱主干；球体/立方体通过附着流程生成，避免其独立出现。
         total_base = sum(base_counts.values())
         total_min = sum(min_counts[difficulty].values())
-        trunk_count = self._scaled_region_count(max(1, int(round(total_base * density))), min_count=total_min)
+        scaled_min = max(1, int(round(total_min * max(0.30, density_scale))))
+        trunk_count = self._scaled_region_count(max(1, int(round(total_base * density))), min_count=scaled_min)
 
         specs = []
         for _ in range(trunk_count):
@@ -820,8 +923,11 @@ class Env(BaseEnv):
         pair_gap = 0.24
         nav_inflate = 0.5 * self.two_drone_passage_width
         # easy/hard only differ in density target.
-        blocked_lo = 0.06 if difficulty == "easy" else 0.18
-        blocked_hi = 0.22 if difficulty == "easy" else 0.38
+        density_scale = self._density_scale_for_difficulty(difficulty)
+        blocked_lo = (0.06 if difficulty == "easy" else 0.18) * density_scale
+        blocked_hi = (0.22 if difficulty == "easy" else 0.38) * density_scale
+        blocked_lo = max(0.02, min(0.80, blocked_lo))
+        blocked_hi = max(blocked_lo + 0.04, min(0.92, blocked_hi))
 
         best_placed = None
         best_score = -1e9
@@ -955,6 +1061,62 @@ class Env(BaseEnv):
             "corridor_span": [corridor_y0, corridor_y1],
         }
 
+    def _expand_obs_to_batch(self, arr, cols, B, device):
+        t = torch.as_tensor(arr, device=device, dtype=torch.float32)
+        if t.numel() == 0:
+            t = torch.zeros((0, cols), device=device, dtype=torch.float32)
+        else:
+            t = t.reshape(-1, cols)
+        t = t.unsqueeze(0)
+        if B > 1:
+            t = t.repeat(B, 1, 1)
+        return t
+
+    def _reset_unified_four_map(self):
+        B = self.batch_size
+        device = self.device
+        map_type = self._pick_unified_map_type()
+        builder = self._get_unified_builder()
+        geom = builder(self, map_type)
+
+        self.balls = self._expand_obs_to_batch(geom.get("balls", []), 4, B, device)
+        self.cyl = self._expand_obs_to_batch(geom.get("cyl", []), 3, B, device)
+        self.voxels = self._expand_obs_to_batch(geom.get("voxels", []), 6, B, device)
+        self.cyl_h = self._expand_obs_to_batch(geom.get("cyl_h", []), 3, B, device)
+
+        spawn_start = tuple(float(v) for v in geom.get("spawn_start", (self.spawn_x_center, self.map_y_min + 0.5, self.spawn_z_center)))
+        spawn_goal = tuple(float(v) for v in geom.get("spawn_goal", (self.spawn_x_center, self.map_y_max - 0.5, self.spawn_z_center)))
+        self.spawn_start_y = float(spawn_start[1])
+        self.spawn_goal_y = float(spawn_goal[1])
+        self.spawn_start_x = float(spawn_start[0])
+        self.spawn_goal_x = float(spawn_goal[0])
+        self.spawn_start_z = float(spawn_start[2])
+        self.spawn_goal_z = float(spawn_goal[2])
+        self.spawn_start_x_half_span = float(geom.get("spawn_start_x_half_span", self.fixed_spawn_half_span))
+        self.spawn_goal_x_half_span = float(geom.get("spawn_goal_x_half_span", self.fixed_spawn_half_span))
+        self.spawn_start_z_half_span = float(geom.get("spawn_start_z_half_span", self.fixed_spawn_half_span))
+        self.spawn_goal_z_half_span = float(geom.get("spawn_goal_z_half_span", self.fixed_spawn_half_span))
+
+        start_bounds = torch.tensor(
+            [[self.spawn_start_y - 0.05, self.spawn_start_y + 0.05]],
+            device=device,
+            dtype=torch.float32,
+        )
+        goal_bounds = torch.tensor(
+            [[self.spawn_goal_y - 0.05, self.spawn_goal_y + 0.05]],
+            device=device,
+            dtype=torch.float32,
+        )
+        self._spawn_start_bounds = start_bounds.repeat(B, 1)
+        self._spawn_goal_bounds = goal_bounds.repeat(B, 1)
+
+        region_order = tuple(geom.get("region_order", (map_type,)))
+        self.region_order = [region_order for _ in range(B)]
+        u_meta = geom.get("u_meta", {"map_type": map_type})
+        self.u_meta = [u_meta for _ in range(B)]
+        self.current_map_idx = -1
+        self._maze_rotation = None
+
     def reset(self):
         B = self.batch_size
         device = self.device
@@ -980,6 +1142,13 @@ class Env(BaseEnv):
         self.drone_radius = random.uniform(0.10, 0.15)
         self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
         self._obstacle_scale = torch.ones((B, 1), device=device)
+
+        if self.unified_four_maps:
+            self._reset_unified_four_map()
+            self._reset_drone_state(self._obstacle_scale)
+            if self.random_rotation:
+                self._maze_rotation = None
+            return
 
         balls_batch = []
         cyl_batch = []

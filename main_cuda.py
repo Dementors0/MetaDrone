@@ -77,6 +77,34 @@ parser.set_defaults(unified_four_maps=True)
 parser.add_argument('--map_type', type=str, default='cycle',
                     choices=['cycle', 'easy', 'hard', 'u-min', 'u_min', 'hairpin'],
                     help='Force a single unified map type; cycle rotates through all four types')
+parser.add_argument('--unified_map_easy_enable', dest='unified_map_easy_enable', action='store_true',
+                    help='Enable easy map generation in unified four-map mode')
+parser.add_argument('--no_unified_map_easy_enable', dest='unified_map_easy_enable', action='store_false',
+                    help='Disable easy map generation in unified four-map mode')
+parser.set_defaults(unified_map_easy_enable=True)
+parser.add_argument('--unified_map_hard_enable', dest='unified_map_hard_enable', action='store_true',
+                    help='Enable hard map generation in unified four-map mode')
+parser.add_argument('--no_unified_map_hard_enable', dest='unified_map_hard_enable', action='store_false',
+                    help='Disable hard map generation in unified four-map mode')
+parser.set_defaults(unified_map_hard_enable=True)
+parser.add_argument('--unified_map_u_min_enable', dest='unified_map_u_min_enable', action='store_true',
+                    help='Enable u-min map generation in unified four-map mode')
+parser.add_argument('--no_unified_map_u_min_enable', dest='unified_map_u_min_enable', action='store_false',
+                    help='Disable u-min map generation in unified four-map mode')
+parser.set_defaults(unified_map_u_min_enable=True)
+parser.add_argument('--unified_map_hairpin_enable', dest='unified_map_hairpin_enable', action='store_true',
+                    help='Enable hairpin map generation in unified four-map mode')
+parser.add_argument('--no_unified_map_hairpin_enable', dest='unified_map_hairpin_enable', action='store_false',
+                    help='Disable hairpin map generation in unified four-map mode')
+parser.set_defaults(unified_map_hairpin_enable=True)
+parser.add_argument('--unified_map_easy_count', type=int, default=1,
+                    help='Consecutive reset count for easy map blocks in unified mode')
+parser.add_argument('--unified_map_hard_count', type=int, default=1,
+                    help='Consecutive reset count for hard map blocks in unified mode')
+parser.add_argument('--unified_map_u_min_count', type=int, default=1,
+                    help='Consecutive reset count for u-min map blocks in unified mode')
+parser.add_argument('--unified_map_hairpin_count', type=int, default=1,
+                    help='Consecutive reset count for hairpin map blocks in unified mode')
 parser.add_argument('--wall_physical_feedback', dest='wall_physical_feedback', action='store_true')
 parser.add_argument('--no_wall_physical_feedback', dest='wall_physical_feedback', action='store_false')
 parser.set_defaults(wall_physical_feedback=False)
@@ -106,6 +134,14 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           compact_two_zone_map=args.compact_two_zone_map,
           unified_four_maps=args.unified_four_maps,
           forced_map_type=("" if args.map_type == "cycle" else args.map_type),
+          unified_map_easy_enable=args.unified_map_easy_enable,
+          unified_map_hard_enable=args.unified_map_hard_enable,
+          unified_map_u_min_enable=args.unified_map_u_min_enable,
+          unified_map_hairpin_enable=args.unified_map_hairpin_enable,
+          unified_map_easy_count=args.unified_map_easy_count,
+          unified_map_hard_count=args.unified_map_hard_count,
+          unified_map_u_min_count=args.unified_map_u_min_count,
+          unified_map_hairpin_count=args.unified_map_hairpin_count,
           wall_physical_feedback=args.wall_physical_feedback)
 
 ##########初始化神经网络##########

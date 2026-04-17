@@ -96,6 +96,14 @@ class Env(BaseEnv):
         compact_two_zone_map=True,
         unified_four_maps=False,
         forced_map_type="",
+        unified_map_easy_enable=True,
+        unified_map_hard_enable=True,
+        unified_map_u_min_enable=True,
+        unified_map_hairpin_enable=True,
+        unified_map_easy_count=1,
+        unified_map_hard_count=1,
+        unified_map_u_min_count=1,
+        unified_map_hairpin_count=1,
         wall_physical_feedback=False,
     ):
         self.map_x_max = 10.0
@@ -139,6 +147,27 @@ class Env(BaseEnv):
         self._four_map_types = ("easy", "hard", "u-min", "hairpin")
         self._four_map_cycle_idx = 0
         self.forced_map_type = self._normalize_map_type_name(forced_map_type)
+        self._four_map_enable = {
+            "easy": bool(unified_map_easy_enable),
+            "hard": bool(unified_map_hard_enable),
+            "u-min": bool(unified_map_u_min_enable),
+            "hairpin": bool(unified_map_hairpin_enable),
+        }
+        self._four_map_count = {
+            "easy": max(1, int(unified_map_easy_count)),
+            "hard": max(1, int(unified_map_hard_count)),
+            "u-min": max(1, int(unified_map_u_min_count)),
+            "hairpin": max(1, int(unified_map_hairpin_count)),
+        }
+        self._four_map_enabled_types = [m for m in self._four_map_types if self._four_map_enable.get(m, False)]
+        if len(self._four_map_enabled_types) == 0:
+            raise ValueError(
+                "At least one unified map type must be enabled among easy/hard/u-min/hairpin."
+            )
+        self._four_map_block_order = []
+        self._four_map_block_cursor = 0
+        self._four_map_block_remaining = 0
+        self._four_map_active_type = ""
         self._unified_builder_fn = None
         # 起终点固定在上下边界内缩 0.5m 的平面上；紧凑地图时会自动变为 y=±7.5。
         self.spawn_start_y = self.map_y_min + 0.5
@@ -196,7 +225,24 @@ class Env(BaseEnv):
     def _pick_unified_map_type(self):
         if self.forced_map_type:
             return self.forced_map_type
-        map_type = self._four_map_types[self._four_map_cycle_idx % len(self._four_map_types)]
+        if self._four_map_block_remaining > 0 and self._four_map_active_type:
+            self._four_map_block_remaining -= 1
+            return self._four_map_active_type
+
+        if self._four_map_block_cursor >= len(self._four_map_block_order):
+            enabled_types = list(self._four_map_enabled_types)
+            if len(enabled_types) == 1:
+                self._four_map_block_order = [enabled_types[0]]
+            else:
+                # Use CUDA RNG for map-order randomization when available.
+                perm = torch.randperm(len(enabled_types), device=self.device).tolist()
+                self._four_map_block_order = [enabled_types[idx] for idx in perm]
+            self._four_map_block_cursor = 0
+
+        map_type = self._four_map_block_order[self._four_map_block_cursor]
+        self._four_map_block_cursor += 1
+        self._four_map_active_type = map_type
+        self._four_map_block_remaining = max(0, int(self._four_map_count.get(map_type, 1)) - 1)
         self._four_map_cycle_idx += 1
         return map_type
 

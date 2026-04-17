@@ -350,6 +350,58 @@ parser.set_defaults(unified_four_maps=True)
 parser.add_argument('--map_type', type=str, default='cycle',
                     choices=['cycle', 'easy', 'hard', 'u-min', 'u_min', 'hairpin'],
                     help='Force a single unified map type; cycle rotates through all four types')
+# [统一四地图调度参数]
+# 仅在 unified_four_maps=True 且 map_type=cycle 时生效。
+# 参数分两类（四种地图都可独立设置）：
+# 1) 生成开关参数（是否生成该类型）：
+#    unified_map_<type>_enable
+#    - True: 该类型会被纳入训练地图池（会生成）
+#    - False: 该类型不生成
+# 2) 训练使用数量参数（该类型每轮“打包”用多少张）：
+#    unified_map_<type>_count
+#    - 含义：该类型连续使用多少次 reset（可理解为连续多少张同类型地图）
+#    - 例如 easy_count=3：会连续用 3 张 easy，再切到下一个随机类型块
+# 类型块切换顺序由 CUDA 随机打乱（实现见 env_multi.py）。
+# 如果 map_type 被强制为单一类型（easy/hard/u-min/hairpin），以下 enable/count 不参与调度。
+
+# easy 组
+parser.add_argument('--unified_map_easy_enable', dest='unified_map_easy_enable', action='store_true',
+                    help='[生成开关] 是否生成 easy 地图类型')
+parser.add_argument('--no_unified_map_easy_enable', dest='unified_map_easy_enable', action='store_false',
+                    help='[生成开关] 不生成 easy 地图类型')
+parser.add_argument('--unified_map_easy_count', type=int, default=1,
+                    help='[训练数量] easy 类型每轮连续使用多少张（多少次 reset）')
+
+# hard 组
+parser.add_argument('--unified_map_hard_enable', dest='unified_map_hard_enable', action='store_true',
+                    help='[生成开关] 是否生成 hard 地图类型')
+parser.add_argument('--no_unified_map_hard_enable', dest='unified_map_hard_enable', action='store_false',
+                    help='[生成开关] 不生成 hard 地图类型')
+parser.add_argument('--unified_map_hard_count', type=int, default=1,
+                    help='[训练数量] hard 类型每轮连续使用多少张（多少次 reset）')
+
+# u-min 组
+parser.add_argument('--unified_map_u_min_enable', dest='unified_map_u_min_enable', action='store_true',
+                    help='[生成开关] 是否生成 u-min 地图类型')
+parser.add_argument('--no_unified_map_u_min_enable', dest='unified_map_u_min_enable', action='store_false',
+                    help='[生成开关] 不生成 u-min 地图类型')
+parser.add_argument('--unified_map_u_min_count', type=int, default=1,
+                    help='[训练数量] u-min 类型每轮连续使用多少张（多少次 reset）')
+
+# hairpin 组
+parser.add_argument('--unified_map_hairpin_enable', dest='unified_map_hairpin_enable', action='store_true',
+                    help='[生成开关] 是否生成 hairpin 地图类型')
+parser.add_argument('--no_unified_map_hairpin_enable', dest='unified_map_hairpin_enable', action='store_false',
+                    help='[生成开关] 不生成 hairpin 地图类型')
+parser.add_argument('--unified_map_hairpin_count', type=int, default=1,
+                    help='[训练数量] hairpin 类型每轮连续使用多少张（多少次 reset）')
+
+parser.set_defaults(
+    unified_map_easy_enable=True,
+    unified_map_hard_enable=True,
+    unified_map_u_min_enable=True,
+    unified_map_hairpin_enable=True,
+)
 # [开关2] 墙壁物理反馈开关（默认: 关闭）
 # - 默认行为：不传任何参数时 wall_physical_feedback=False，采用自由运动结果（当前代码行为）。
 # - 开启反馈：--wall_physical_feedback（启用软接触反馈，修正穿墙/贴墙时的位置与速度）
@@ -567,6 +619,14 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           compact_two_zone_map=args.compact_two_zone_map,
           unified_four_maps=args.unified_four_maps,
           forced_map_type=("" if args.map_type == "cycle" else args.map_type),
+          unified_map_easy_enable=args.unified_map_easy_enable,
+          unified_map_hard_enable=args.unified_map_hard_enable,
+          unified_map_u_min_enable=args.unified_map_u_min_enable,
+          unified_map_hairpin_enable=args.unified_map_hairpin_enable,
+          unified_map_easy_count=args.unified_map_easy_count,
+          unified_map_hard_count=args.unified_map_hard_count,
+          unified_map_u_min_count=args.unified_map_u_min_count,
+          unified_map_hairpin_count=args.unified_map_hairpin_count,
           wall_physical_feedback=args.wall_physical_feedback)
 
 

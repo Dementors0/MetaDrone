@@ -1246,14 +1246,47 @@ def _build_legacy_tasks(args) -> List[Dict]:
 
 def _build_unified_tasks(args) -> List[Dict]:
     maps_per_type = int(args.maps_per_type)
-    if maps_per_type <= 0:
-        raise ValueError("--maps_per_type must be > 0 in unified dataset mode")
+    easy_n = int(getattr(args, "easy_maps", -1))
+    hard_n = int(getattr(args, "hard_maps", -1))
+    u_min_n = int(getattr(args, "u_min_maps", -1))
+    hairpin_n = int(getattr(args, "hairpin_maps", -1))
+
+    any_override = any(v >= 0 for v in (easy_n, hard_n, u_min_n, hairpin_n))
+    if any_override:
+        if easy_n < 0:
+            easy_n = 0
+        if hard_n < 0:
+            hard_n = 0
+        if u_min_n < 0:
+            u_min_n = 0
+        if hairpin_n < 0:
+            hairpin_n = 0
+    else:
+        if maps_per_type <= 0:
+            raise ValueError(
+                "In unified dataset mode, set --maps_per_type > 0, "
+                "or provide per-type counts via --easy_maps/--hard_maps/--u_min_maps/--hairpin_maps"
+            )
+        easy_n = maps_per_type
+        hard_n = maps_per_type
+        u_min_n = maps_per_type
+        hairpin_n = maps_per_type
+
+    per_type_counts = {
+        "hard": hard_n,
+        "easy": easy_n,
+        "u-min": u_min_n,
+        "hairpin": hairpin_n,
+    }
+    if sum(per_type_counts.values()) <= 0:
+        raise ValueError("At least one map must be generated in unified dataset mode.")
 
     tasks = []
     global_index = 0
     for map_type in MAP_TYPE_ORDER:
         prefix = _map_type_prefix(map_type)
-        for local_idx in range(maps_per_type):
+        local_total = int(per_type_counts.get(map_type, 0))
+        for local_idx in range(local_total):
             stem = f"{prefix}_{local_idx:03d}"
             tasks.append({
                 "map_id": stem,
@@ -1333,7 +1366,34 @@ def main():
         "--maps_per_type",
         type=int,
         default=0,
-        help="Maps generated for each type when --unified_dataset_mode is enabled",
+        help=(
+            "Fallback map count for each type in unified mode. "
+            "Ignored when any per-type count (--easy_maps/--hard_maps/--u_min_maps/--hairpin_maps) is provided."
+        ),
+    )
+    parser.add_argument(
+        "--easy_maps",
+        type=int,
+        default=-1,
+        help="Unified mode: number of easy maps to generate (>=0). -1 means use maps_per_type fallback.",
+    )
+    parser.add_argument(
+        "--hard_maps",
+        type=int,
+        default=-1,
+        help="Unified mode: number of hard maps to generate (>=0). -1 means use maps_per_type fallback.",
+    )
+    parser.add_argument(
+        "--u_min_maps",
+        type=int,
+        default=-1,
+        help="Unified mode: number of u-min maps to generate (>=0). -1 means use maps_per_type fallback.",
+    )
+    parser.add_argument(
+        "--hairpin_maps",
+        type=int,
+        default=-1,
+        help="Unified mode: number of hairpin maps to generate (>=0). -1 means use maps_per_type fallback.",
     )
 
     args = parser.parse_args()
@@ -1363,10 +1423,23 @@ def main():
         f"easy={float(args.easy_density_scale):.3f}, hard={float(args.hard_density_scale):.3f}"
     )
     if bool(args.unified_dataset_mode):
+        # Unified per-type counts summary (after fallback resolution logic).
+        if any(int(v) >= 0 for v in (args.easy_maps, args.hard_maps, args.u_min_maps, args.hairpin_maps)):
+            easy_show = max(0, int(args.easy_maps))
+            hard_show = max(0, int(args.hard_maps))
+            umin_show = max(0, int(args.u_min_maps))
+            hairpin_show = max(0, int(args.hairpin_maps))
+            counts_str = f"hard={hard_show}, easy={easy_show}, u-min={umin_show}, hairpin={hairpin_show}"
+        else:
+            fallback = int(args.maps_per_type)
+            counts_str = (
+                f"hard={fallback}, easy={fallback}, "
+                f"u-min={fallback}, hairpin={fallback}"
+            )
         print(
             "[Precompute] unified order fixed: "
             "hard -> easy -> u-min -> hairpin "
-            f"(maps_per_type={int(args.maps_per_type)})"
+            f"(per_type_counts: {counts_str})"
         )
 
     task_by_id = {t["map_id"]: t for t in tasks_template}

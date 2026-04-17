@@ -4,6 +4,16 @@
 
 ## 1. 重新生成地图（统一模式）
 
+统一模式下有两种数量控制方式：
+- 统一数量：`--maps_per_type x`（四种类型都生成 `x` 张）
+- 独立数量：`--hard_maps` / `--easy_maps` / `--u_min_maps` / `--hairpin_maps`（每种单独指定）
+
+注意：
+- 只要设置了任意一个 `*_maps`，就进入“独立数量模式”；未设置到的类型默认按 `0` 处理。
+- `maps_per_type` 仅作为兜底参数，在没有使用任何 `*_maps` 时生效。
+
+### 1.1 统一数量（四种类型相同）
+
 ```bash
 python3 precompute_potential_maps.py \
   --unified_dataset_mode \
@@ -24,6 +34,22 @@ python3 precompute_potential_maps.py \
   2) `mmgj_transformer.py` 里 `--easy_density_scale` / `--hard_density_scale` 的默认值  
   3) 回退到 `1.0 / 1.0`
 
+### 1.2 独立数量（每种类型单独控制）
+
+```bash
+python3 precompute_potential_maps.py \
+  --unified_dataset_mode \
+  --hard_maps 40 \
+  --easy_maps 20 \
+  --u_min_maps 10 \
+  --hairpin_maps 5 \
+  --save_dir ./generated_maps \
+  --seed 42 \
+  --resolution 0.3 \
+  --margin 0.15 \
+  --z_min 0.0 \
+  --z_max 5.0
+```
 
 如果你希望先清空旧失败日志：
 
@@ -100,11 +126,14 @@ python3 mmgj_transformer.py \
 
 然后直接执行第 1 节和第 2.1 节命令，不用再在命令里手写密度参数；`precompute/preview` 会自动读取这次 `mmgj` 传入值。
 
-索引范围（`maps_per_type = x` 时）：
+索引范围（仅当 `maps_per_type = x`，且四种类型数量相同）：
 - `hard`: `0 ~ x-1`
 - `easy`: `x ~ 2x-1`
 - `u_min`: `2x ~ 3x-1`
 - `hairpin`: `3x ~ 4x-1`
+
+如果你使用了“独立数量模式”（`*_maps`），建议直接按文件名预览（见 2.1），
+或先 `ls ./generated_maps/*.pt` 查看实际顺序后再用 `--map-index`。
 
 ## 3. 预览势场 + 方向场（3D）
 

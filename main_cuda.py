@@ -134,7 +134,7 @@ def is_save_iter(i):
 
 
 def is_save_trajectory_iter(i):
-    return i == 0 or (i + 1) % 250 == 0
+    return (i + 1) % 500 == 0
 
 
 def rotation_matrix_to_rpy_deg(R):
@@ -244,14 +244,17 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
 
     traj_xyz = p_cpu.numpy()
     speed_cpu = v_cpu.norm(dim=-1).numpy()
+    speed_hover = speed_cpu.reshape(-1, 1)
     fig = go.Figure()
 
     fig.add_trace(go.Scatter3d(
         x=traj_xyz[:, 0], y=traj_xyz[:, 1], z=traj_xyz[:, 2],
         mode='lines+markers',
+        customdata=speed_hover,
         marker=dict(size=3, color=speed_cpu, colorscale='Turbo', colorbar=dict(title='Speed (m/s)')),
         line=dict(color='limegreen', width=5),
-        name='Trajectory'
+        name='Trajectory',
+        hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<br>speed=%{customdata[0]:.2f} m/s<extra></extra>'
     ))
 
     if hasattr(env, 'voxels') and env.voxels.numel() > 0:

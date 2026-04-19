@@ -319,6 +319,11 @@ parser.add_argument('--ground_voxels', default=False, action='store_true')
 parser.add_argument('--scaffold', default=False, action='store_true')
 parser.add_argument('--random_rotation', default=False, action='store_true')
 parser.add_argument('--no_odom', default=False, action='store_true')
+parser.add_argument('--sync_worker_lgn_inputs', dest='sync_worker_lgn_inputs', action='store_true',
+                    help='Feed worker with synchronized LGN features (state+geom+progress)')
+parser.add_argument('--no_sync_worker_lgn_inputs', dest='sync_worker_lgn_inputs', action='store_false',
+                    help='Disable synchronized extra LGN features for worker; use state only')
+parser.set_defaults(sync_worker_lgn_inputs=True)
 # [开关1] U 型局部最优陷阱地图开关（默认: 关闭）
 # - 默认行为：不传任何参数时 include_u_local_optimum=False。
 # - 显式开启：--include_u_local_optimum
@@ -617,17 +622,12 @@ print(
 state_dim = 7 if args.no_odom else 10
 geom_dim = 19
 progress_dim = 8
+worker_obs_dim = state_dim + (geom_dim + progress_dim if args.sync_worker_lgn_inputs else 0)
 
-if args.no_odom:
-    try:
-        worknet = WorkNet(7, 6, max_seq_len=args.worker_max_seq_len)
-    except TypeError:
-        worknet = WorkNet(7, 6)
-else:
-    try:
-        worknet = WorkNet(7 + 3, 6, max_seq_len=args.worker_max_seq_len)
-    except TypeError:
-        worknet = WorkNet(7 + 3, 6)
+try:
+    worknet = WorkNet(worker_obs_dim, 6, max_seq_len=args.worker_max_seq_len)
+except TypeError:
+    worknet = WorkNet(worker_obs_dim, 6)
 worknet = worknet.to(device)
 
 try:
@@ -3044,7 +3044,59 @@ def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement
     return loss_stuck, loss_collision_duration, stuck_ratio
 
 
-def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
+def build_step_model_inputs(
+    env,
+    depth,
+    target_v,
+    p_history_list,
+    v_history_list,
+    dist_obj_history_list,
+    state_normalizer,
+    geom_normalizer,
+    progress_normalizer,
+    no_odom,
+    sync_worker_lgn_inputs,
+    update_normalizer,
+):
+    """Build synchronized model inputs for LGN and Worker at a single rollout step."""
+    R = env.R
+    state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+    local_v = torch.squeeze(env.v[:, None] @ R, 1)
+    if not no_odom:
+        state_list.insert(0, local_v)
+
+    raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+    state_tensor = state_normalizer(raw_state_tensor, update=update_normalizer)
+    state_tensor = sanitize_tensor(state_tensor, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+    x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
+    x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+    geom_feat_raw = extract_depth_geometry_features(depth)
+    geom_feat = geom_normalizer(geom_feat_raw, update=update_normalizer)
+    geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+    progress_feat_raw = extract_progress_features(
+        p_history_list=p_history_list,
+        v_history_list=v_history_list,
+        dist_obj_history_list=dist_obj_history_list,
+        p_target=env.p_target,
+        window=8,
+    )
+    progress_feat = progress_normalizer(progress_feat_raw, update=update_normalizer)
+    progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+    if sync_worker_lgn_inputs:
+        worker_input_tensor = torch.cat([state_tensor, geom_feat, progress_feat], dim=-1)
+    else:
+        worker_input_tensor = state_tensor
+
+    return x_pooled, state_tensor, geom_feat, progress_feat, worker_input_tensor
+
+
+def unrolled_meta_rollout(
+    env, worknet, fast_params, state_normalizer, geom_normalizer, progress_normalizer, args, B, device,
+):
     """
     Validation rollout with virtually-updated worker params (via functional_call).
     Computes and returns meta_loss plus key optimization components.
@@ -3055,6 +3107,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     env.reset_drone_only()
 
     p_list, v_list, a_list, vec_list = [], [], [], []
+    dist_obj_list = []
     act_buf = [env.act.detach()] * 2
     v_preds_val = []
     h_val = None
@@ -3067,7 +3120,10 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         p_list.append(env.p)
         v_list.append(env.v)
         a_list.append(env.a)
-        vec_list.append(env.find_vec_to_nearest_pt())
+        vec_curr = env.find_vec_to_nearest_pt()
+        vec_list.append(vec_curr)
+        dist_obj_curr = safe_l2_norm(vec_curr, dim=-1) - env.margin
+        dist_obj_list.append(dist_obj_curr)
 
         target_v_raw = env.p_target - env.p.detach()
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
@@ -3076,20 +3132,28 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
 
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom:
-            state_list.insert(0, local_v)
-
-        raw_state = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        state_t = state_normalizer(raw_state, update=False)  # 不更新统计量
-        state_t = sanitize_tensor(state_t, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
-        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        x_pooled, _, _, _, worker_input_t = build_step_model_inputs(
+            env=env,
+            depth=depth,
+            target_v=target_v,
+            p_history_list=p_list,
+            v_history_list=v_list,
+            dist_obj_history_list=dist_obj_list,
+            state_normalizer=state_normalizer,
+            geom_normalizer=geom_normalizer,
+            progress_normalizer=progress_normalizer,
+            no_odom=args.no_odom,
+            sync_worker_lgn_inputs=args.sync_worker_lgn_inputs,
+            update_normalizer=False,
+        )
+        if worker_input_t.shape[-1] != worknet.v_proj.in_features:
+            raise RuntimeError(
+                f"worker input dim mismatch in unrolled rollout: got {worker_input_t.shape[-1]}, "
+                f"expected {worknet.v_proj.in_features}"
+            )
 
         # Worker forward with virtually-updated params
-        act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, state_t, h_val))
+        act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, worker_input_t, h_val))
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
@@ -3235,6 +3299,7 @@ for i in pbar:
     dist_obj_history = []
     geom_feat_last = None
     progress_feat_last = None
+    worker_input_last = None
 
     h = None
     lgn_hx = None
@@ -3267,32 +3332,27 @@ for i in pbar:
         target_v_history.append(target_v)
 
         R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom: state_list.insert(0, local_v)
-        
-        raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        state_tensor = state_normalizer(raw_state_tensor, update=True)
-        state_tensor = sanitize_tensor(state_tensor, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
-        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        geom_feat_raw = extract_depth_geometry_features(depth)
-        geom_feat = geom_normalizer(geom_feat_raw, update=True)
-        geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        progress_feat_raw = extract_progress_features(
+        x_pooled, state_tensor, geom_feat, progress_feat, worker_input_tensor = build_step_model_inputs(
+            env=env,
+            depth=depth,
+            target_v=target_v,
             p_history_list=p_history,
             v_history_list=v_history,
             dist_obj_history_list=dist_obj_history,
-            p_target=env.p_target,
-            window=8,
+            state_normalizer=state_normalizer,
+            geom_normalizer=geom_normalizer,
+            progress_normalizer=progress_normalizer,
+            no_odom=args.no_odom,
+            sync_worker_lgn_inputs=args.sync_worker_lgn_inputs,
+            update_normalizer=True,
         )
-        progress_feat = progress_normalizer(progress_feat_raw, update=True)
-        progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        if worker_input_tensor.shape[-1] != worker_obs_dim:
+            raise RuntimeError(
+                f"worker input dim mismatch: got {worker_input_tensor.shape[-1]}, expected {worker_obs_dim}"
+            )
         geom_feat_last = geom_feat
         progress_feat_last = progress_feat
+        worker_input_last = worker_input_tensor
 
         # LGN Forward (训练侧执行正值非归一化约束)
         current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
@@ -3307,7 +3367,7 @@ for i in pbar:
         trajectory_lgn_weights.append(current_weights)
 
         # Worker Forward
-        act, _, h = worknet(x_pooled, state_tensor, h)
+        act, _, h = worknet(x_pooled, worker_input_tensor, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         act_for_diag = act
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
@@ -3685,7 +3745,9 @@ for i in pbar:
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur = \
-            unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
+            unrolled_meta_rollout(
+                env, worknet, fast_params, state_normalizer, geom_normalizer, progress_normalizer, args, B, device
+            )
         if not torch.isfinite(meta_loss_unrolled):
             if term_log_now:
                 pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
@@ -3968,6 +4030,12 @@ for i in pbar:
                 log_data[f'LGN_Input/Geom_{feat_idx}'] = geom_feat_last[:, feat_idx].mean()
             for feat_idx in range(min(4, progress_feat_last.shape[-1])):
                 log_data[f'LGN_Input/Progress_{feat_idx}'] = progress_feat_last[:, feat_idx].mean()
+
+        if worker_input_last is not None:
+            log_data['Worker_Input/Mean'] = worker_input_last.mean()
+            log_data['Worker_Input/Std'] = worker_input_last.std(unbiased=False)
+            log_data['Worker_Input/Norm'] = worker_input_last.norm(dim=-1).mean()
+            log_data['Worker_Input/Dim'] = float(worker_input_last.shape[-1])
 
         smooth_dict(log_data)
 

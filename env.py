@@ -621,9 +621,23 @@ class Env:
 
     def find_vec_to_nearest_pt(self):
         p = self.p + self.v * self.sub_div
-        nearest_pt = torch.empty_like(p)
-        quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
-        return nearest_pt - p
+        return self.find_vec_to_nearest_pt_at(p)
+
+    def find_vec_to_nearest_pt_at(self, p_query):
+        squeeze_time = False
+        if p_query.dim() == 2:
+            p_query = p_query.unsqueeze(0)
+            squeeze_time = True
+        p_query = p_query.contiguous()
+        nearest_pt = torch.empty_like(p_query)
+        quadsim_cuda.find_nearest_pt(
+            nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels,
+            p_query, self.drone_radius, self.n_drones_per_group
+        )
+        vec = nearest_pt - p_query
+        if squeeze_time:
+            vec = vec.squeeze(0)
+        return vec
 
     def run(self, act_pred, ctl_dt=1/15, v_pred=None):
         act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)

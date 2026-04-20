@@ -14,6 +14,7 @@ def build_occupancy_grid_from_obstacles(
     cyl_h: np.ndarray,
     resolution: float = 0.3,
     margin: float = 0.15,
+    extra_inflate: float = 0.0,
     bounds: Optional[Dict[str, float]] = None,
     z_min: float = 0.0,
     z_max: float = 5.0,
@@ -39,7 +40,9 @@ def build_occupancy_grid_from_obstacles(
     grid = np.zeros((nx, ny, nz), dtype=np.uint8)
     origin = np.asarray([x_min, y_min, z_min], dtype=np.float32)
     shape = (nx, ny, nz)
-    total_margin = float(margin) + 0.15
+    # Keep obstacle inflation explicit and configurable.
+    # `margin` is the user-facing safety inflation; `extra_inflate` is optional.
+    total_margin = max(0.0, float(margin)) + max(0.0, float(extra_inflate))
 
     # Voxels
     if voxels is not None and voxels.size > 0:
@@ -159,18 +162,34 @@ def compute_dijkstra_potential(
     occupancy: np.ndarray,
     goal_idx: Tuple[int, int, int],
     resolution: float,
+    goal_sources: Optional[List[Tuple[int, int, int]]] = None,
 ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
-    """Compute shortest-path distance field from goal over free voxels."""
+    """Compute shortest-path distance field over free voxels from one or more goal seeds."""
     nx, ny, nz = occupancy.shape
     potential = np.full((nx, ny, nz), np.inf, dtype=np.float32)
 
-    g = _find_nearest_free(occupancy, goal_idx)
-    if g is None:
-        return potential, goal_idx
+    seeds: List[Tuple[int, int, int]] = []
+    if goal_sources is not None and len(goal_sources) > 0:
+        seen = set()
+        for src in goal_sources:
+            g_src = _find_nearest_free(occupancy, src)
+            if g_src is None:
+                continue
+            if g_src in seen:
+                continue
+            seen.add(g_src)
+            seeds.append(g_src)
+    if len(seeds) == 0:
+        g = _find_nearest_free(occupancy, goal_idx)
+        if g is None:
+            return potential, goal_idx
+        seeds = [g]
 
+    g_used = seeds[0]
     pq: List[Tuple[float, Tuple[int, int, int]]] = []
-    potential[g] = 0.0
-    heapq.heappush(pq, (0.0, g))
+    for g in seeds:
+        potential[g] = 0.0
+        heapq.heappush(pq, (0.0, g))
 
     while pq:
         cur_d, (x, y, z) = heapq.heappop(pq)
@@ -190,7 +209,7 @@ def compute_dijkstra_potential(
                 heapq.heappush(pq, (nd, (nx_i, ny_i, nz_i)))
 
     potential[occupancy != 0] = np.inf
-    return potential, g
+    return potential, g_used
 
 
 def compute_descending_vector_field(potential: np.ndarray, occupancy: np.ndarray) -> np.ndarray:

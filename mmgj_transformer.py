@@ -406,7 +406,7 @@ parser.add_argument('--meta_smooth_jerk_weight', type=float, default=0.001,
 parser.add_argument('--meta_smooth_snap_weight', type=float, default=0.0002,
                     help='Meta loss weight for second-order normalized action difference (snap) smoothing')
 parser.add_argument('--meta_smooth_v_pred_weight', type=float, default=0.1,
-                    help='Meta loss weight for velocity prediction error')
+                    help='Proxy loss weight for velocity prediction error')
 
 # 全局规划引导元损失参数
 parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
@@ -591,6 +591,57 @@ def _align_env_goal_planes_to_precomputed_map(map_data, env_obj, map_idx_hint=No
             f"start_y {old_start:.3f}->{new_start:.3f}, goal_y {old_goal:.3f}->{new_goal:.3f}"
         )
 
+
+def _summarize_potential_map_quality(map_data, spawn_half_span=1.0):
+    try:
+        potential = map_data.get("potential", None)
+        occupancy = map_data.get("occupancy", None)
+        guide_dir = map_data.get("guide_dir", None)
+        origin = map_data.get("grid_origin", None)
+        resolution = float(map_data.get("resolution", 0.0))
+        spawn_start_y = float(map_data.get("spawn_start_y", float("nan")))
+        spawn_goal_y = float(map_data.get("spawn_goal_y", float("nan")))
+
+        if potential is None or occupancy is None or guide_dir is None or origin is None or resolution <= 0:
+            return None
+
+        potential = potential.detach().cpu() if isinstance(potential, torch.Tensor) else torch.as_tensor(potential)
+        occupancy = occupancy.detach().cpu() if isinstance(occupancy, torch.Tensor) else torch.as_tensor(occupancy)
+        guide_dir = guide_dir.detach().cpu() if isinstance(guide_dir, torch.Tensor) else torch.as_tensor(guide_dir)
+        origin = origin.detach().cpu() if isinstance(origin, torch.Tensor) else torch.as_tensor(origin)
+
+        finite = torch.isfinite(potential)
+        free = occupancy == 0
+        nonzero_dir = guide_dir.norm(dim=-1) > 1e-6
+        valid = finite & free & nonzero_dir
+        nx, ny, nz = potential.shape
+
+        def _band_ratio(y_world):
+            y_idx = int(round((float(y_world) - float(origin[1])) / resolution))
+            y_idx = max(0, min(ny - 1, y_idx))
+            x_center = 5.0
+            z_center = 2.5
+            x0 = max(0, int(math.floor((x_center - spawn_half_span - float(origin[0])) / resolution)))
+            x1 = min(nx - 1, int(math.ceil((x_center + spawn_half_span - float(origin[0])) / resolution)))
+            z0 = max(0, int(math.floor((z_center - spawn_half_span - float(origin[2])) / resolution)))
+            z1 = min(nz - 1, int(math.ceil((z_center + spawn_half_span - float(origin[2])) / resolution)))
+            band = valid[x0 : x1 + 1, y_idx, z0 : z1 + 1]
+            if band.numel() == 0:
+                return 0.0
+            return float(band.float().mean().item())
+
+        return {
+            "global_valid_ratio": float(valid.float().mean().item()),
+            "start_band_valid_ratio": _band_ratio(spawn_start_y),
+            "goal_band_valid_ratio": _band_ratio(spawn_goal_y),
+            "spawn_start_y": spawn_start_y,
+            "spawn_goal_y": spawn_goal_y,
+            "resolution": resolution,
+        }
+    except Exception:
+        return None
+
+
 if args.use_precomputed_potential_maps:
     if PotentialMapCache is None or query_potential_guidance is None:
         raise RuntimeError("potential_map_utils.py is required for --use_precomputed_potential_maps")
@@ -607,6 +658,16 @@ if args.use_precomputed_potential_maps:
     _align_env_goal_planes_to_precomputed_map(first_map, env, map_idx_hint=0)
     env.reset_from_precomputed_map(first_map)
     env.current_map_idx = 0
+    _quality = _summarize_potential_map_quality(first_map, spawn_half_span=float(getattr(env, "fixed_spawn_half_span", 1.0)))
+    if _quality is not None:
+        print(
+            "[PotentialMap] map_idx=0 quality "
+            f"global_valid={_quality['global_valid_ratio']:.6f}, "
+            f"start_band_valid={_quality['start_band_valid_ratio']:.6f}, "
+            f"goal_band_valid={_quality['goal_band_valid_ratio']:.6f}, "
+            f"spawn_y=({_quality['spawn_start_y']:.3f}, {_quality['spawn_goal_y']:.3f}), "
+            f"res={_quality['resolution']:.4f}"
+        )
     print(
         f"[PotentialMap] Enabled. loaded={len(POTENTIAL_MAP_CACHE)} "
         f"from {args.precomputed_map_dir}, current_map_idx=0"
@@ -2006,6 +2067,9 @@ def compute_potential_guidance_meta_loss(env, p_history, v_history, vec_to_pt, d
 
     guidance_loss_per_point = torch.where(valid_guidance_mask, guidance_for_valid, guidance_for_recovery)
     guidance_loss = guidance_loss_per_point.mean()
+    valid_guidance_ratio = valid_guidance_mask.float().mean()
+    guidance_valid_mean = _masked_mean(guidance_for_valid, valid_guidance_mask)
+    guidance_recovery_mean = _masked_mean(guidance_for_recovery, ~valid_guidance_mask)
 
     potential_decrease = torch.tensor(0.0, device=p_history.device, dtype=p_history.dtype)
     if T > 1:
@@ -2043,6 +2107,10 @@ def compute_potential_guidance_meta_loss(env, p_history, v_history, vec_to_pt, d
         'potential_mean': _masked_mean(safe_pot, valid_mask),
         'potential_decrease': potential_decrease,
         'field_dir_align': field_dir_align,
+        'valid_guidance_ratio': valid_guidance_ratio,
+        'guidance_valid_mean': guidance_valid_mean,
+        'guidance_recovery_mean': guidance_recovery_mean,
+        'guidance_boost': torch.tensor(1.0, device=p_history.device, dtype=p_history.dtype),
     }
     return guidance_loss, loss_components
 
@@ -2226,6 +2294,9 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
 
     # 总损失
     guidance_loss = guidance_loss_per_point.mean()
+    valid_guidance_ratio = valid_guidance_mask.float().mean()
+    guidance_valid_mean = _masked_mean(guidance_for_valid, valid_guidance_mask)
+    guidance_recovery_mean = _masked_mean(guidance_for_recovery, ~valid_guidance_mask)
 
     # 返回各分项用于日志
     loss_components = {
@@ -2249,6 +2320,10 @@ def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_t
         'planner_success_ratio': planner_info.get('planner_success_ratio', 0.0),
         'avg_ref_speed': ref_speed.mean().item(),
         'sampled_astar_paths': planner_info.get('sampled_astar_paths', []),
+        'valid_guidance_ratio': valid_guidance_ratio,
+        'guidance_valid_mean': guidance_valid_mean,
+        'guidance_recovery_mean': guidance_recovery_mean,
+        'guidance_boost': torch.tensor(1.0, device=p_history.device, dtype=p_history.dtype),
     }
 
     return guidance_loss, loss_components
@@ -3109,7 +3184,6 @@ def unrolled_meta_rollout(
     p_list, v_list, a_list, vec_list = [], [], [], []
     dist_obj_list = []
     act_buf = [env.act.detach()] * 2
-    v_preds_val = []
     h_val = None
 
     for t in range(args.lgn_timesteps):
@@ -3157,7 +3231,6 @@ def unrolled_meta_rollout(
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
         a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
-        v_preds_val.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
@@ -3206,9 +3279,7 @@ def unrolled_meta_rollout(
                + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
                + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
-    v_preds_val_tensor = torch.stack(v_preds_val)  # [T, B, 3]
     v_val = torch.stack(v_list)  # [T, B, 3]
-    m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
     m_stuck = loss_stuck_val.mean()
 
     # 全局规划引导损失：始终进入 unrolled 二阶链路
@@ -3237,7 +3308,6 @@ def unrolled_meta_rollout(
         + args.meta_guidance_weight * m_guidance
         + args.meta_smooth_jerk_weight * m_jerk
         + args.meta_smooth_snap_weight * m_snap
-        + args.meta_smooth_v_pred_weight * m_v_pred
         + args.stuck_loss_weight * m_stuck
     )
     return meta_val, m_pos, m_coll
@@ -3277,6 +3347,15 @@ for i in pbar:
             map_data_cur = POTENTIAL_MAP_CACHE.get_map(current_precomputed_map_idx)
             _align_env_goal_planes_to_precomputed_map(map_data_cur, env, map_idx_hint=current_precomputed_map_idx)
             env.reset_from_precomputed_map(map_data_cur)
+            if term_log_now:
+                _q = _summarize_potential_map_quality(map_data_cur, spawn_half_span=float(getattr(env, "fixed_spawn_half_span", 1.0)))
+                if _q is not None:
+                    print(
+                        f"[PotentialMap] map_idx={current_precomputed_map_idx} quality "
+                        f"global_valid={_q['global_valid_ratio']:.6f}, "
+                        f"start_band_valid={_q['start_band_valid_ratio']:.6f}, "
+                        f"goal_band_valid={_q['goal_band_valid_ratio']:.6f}"
+                    )
         else:
             env.reset_drone_only()
     else:
@@ -3491,7 +3570,9 @@ for i in pbar:
     )
 
     # 3. 最终 Proxy Loss
-    proxy_loss = weighted_loss_map.mean()
+    v_preds_tensor = torch.stack(v_preds)  # [T, B, 3]
+    loss_proxy_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
+    proxy_loss = weighted_loss_map.mean() + args.meta_smooth_v_pred_weight * loss_proxy_v_pred
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
@@ -3528,8 +3609,6 @@ for i in pbar:
     loss_meta_snap = (F.normalize(act_buffer - env.g_std, dim=-1)
                       .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
     loss_meta_height = loss_height_seq.mean()
-    v_preds_tensor = torch.stack(v_preds)  # [T, B, 3]
-    loss_meta_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
 
     # --- 全局规划引导损失 ---
     # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
@@ -3586,7 +3665,6 @@ for i in pbar:
         args.meta_guidance_weight * loss_meta_guidance +
         args.meta_smooth_jerk_weight * loss_meta_jerk +
         args.meta_smooth_snap_weight * loss_meta_snap +
-        args.meta_smooth_v_pred_weight * loss_meta_v_pred +
         args.stuck_loss_weight * loss_meta_stuck
     )
     if _diag_should_log(i):
@@ -3848,7 +3926,11 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
-        success = torch.all(dist_obj > 0, 0)
+        dist_obj_success = safe_l2_norm(env.find_vec_to_nearest_pt_at(p_history), dim=-1) - env.margin
+        no_collision = torch.all(dist_obj_success > 0, 0)
+        dist_to_goal_hist = safe_l2_norm(p_history - env.p_target, dim=-1)
+        reached_goal = torch.any(dist_to_goal_hist < float(args.goal_radius), dim=0)
+        success = no_collision & reached_goal
         # 计算平均权重 (用于 Scalar 显示)
         avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始输出权重
         avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际使用权重
@@ -3901,7 +3983,9 @@ for i in pbar:
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Turn': loss_turn_seq.mean(),
-            'Proxy_Comp/5_Height': loss_height_seq.mean(),
+            'Proxy_Comp/5_V_Pred': loss_proxy_v_pred,
+            'Proxy_Comp/5_1_V_Pred_Weighted': args.meta_smooth_v_pred_weight * loss_proxy_v_pred,
+            'Proxy_Comp/6_Height': loss_height_seq.mean(),
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
             'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
@@ -3916,7 +4000,6 @@ for i in pbar:
             'Meta_Comp/6_Stuck': loss_meta_stuck,
             'Meta_Comp/8_Smooth_Jerk': loss_meta_jerk,
             'Meta_Comp/9_Smooth_Snap': loss_meta_snap,
-            'Meta_Comp/10_Smooth_V_Pred': loss_meta_v_pred,
 
             # === 全局规划引导损失分项 ===
             'Meta_Comp/5_Guidance': loss_meta_guidance,
@@ -3945,6 +4028,8 @@ for i in pbar:
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
+            'Metrics/No_Collision_Rate': no_collision.float().mean(),
+            'Metrics/Goal_Reached_Rate': reached_goal.float().mean(),
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),
@@ -4013,6 +4098,15 @@ for i in pbar:
             'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
             'Grad_ProxyWorker/4_Turn_GradElem': proxy_grad_turn_elems
         }
+
+        if train_lgn_phase:
+            log_data['Guidance_LGNOnly/Valid_Ratio'] = guidance_components.get('valid_ratio', 0.0)
+            log_data['Guidance_LGNOnly/Valid_Guidance_Ratio'] = guidance_components.get('valid_guidance_ratio', 0.0)
+            log_data['Guidance_LGNOnly/Invalid_Ratio'] = guidance_components.get('invalid_ratio', 0.0)
+            log_data['Guidance_LGNOnly/Collision_Ratio'] = guidance_components.get('collision_ratio', 0.0)
+            log_data['Guidance_LGNOnly/Valid_Mean'] = guidance_components.get('guidance_valid_mean', 0.0)
+            log_data['Guidance_LGNOnly/Recovery_Mean'] = guidance_components.get('guidance_recovery_mean', 0.0)
+            log_data['Guidance_LGNOnly/Boost'] = guidance_components.get('guidance_boost', 1.0)
 
         if train_lgn_phase:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss

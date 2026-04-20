@@ -2,6 +2,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import random
 import traceback
 from typing import Dict, List
 
@@ -22,7 +23,13 @@ except Exception:
     tqdm = None
 
 
-def _make_env(include_u_local_optimum: bool, compact_two_zone_map: bool):
+def _make_env(
+    include_u_local_optimum: bool,
+    compact_two_zone_map: bool,
+    obstacle_count_scale: float,
+    scene_scale: float,
+    start_goal_plane_y_abs: float,
+):
     return Env(
         batch_size=1,
         width=64,
@@ -35,19 +42,78 @@ def _make_env(include_u_local_optimum: bool, compact_two_zone_map: bool):
         ground_voxels=False,
         scaffold=False,
         speed_mtp=1.0,
-        scene_scale=1.0,
+        scene_scale=float(scene_scale),
         random_rotation=False,
         cam_angle=10,
-        obstacle_count_scale=0.5,
+        obstacle_count_scale=float(obstacle_count_scale),
         speed_limit_softness=0.05,
         max_speed_ceiling=10.0,
         hard_vpred_clip=20.0,
         hard_speed_clip=30.0,
-        start_goal_plane_y_abs=25.0,
+        start_goal_plane_y_abs=float(start_goal_plane_y_abs),
         include_u_local_optimum=include_u_local_optimum,
         compact_two_zone_map=compact_two_zone_map,
         wall_physical_feedback=False,
     )
+
+
+def _axis_window(center: float, half_span: float, origin_axis: float, resolution: float, axis_size: int):
+    lo = int(np.floor((center - half_span - origin_axis) / resolution))
+    hi = int(np.ceil((center + half_span - origin_axis) / resolution))
+    lo = max(0, min(axis_size - 1, lo))
+    hi = max(0, min(axis_size - 1, hi))
+    if hi < lo:
+        hi = lo
+    return lo, hi
+
+
+def _spawn_band_valid_ratio(
+    valid_mask: np.ndarray,
+    origin: np.ndarray,
+    resolution: float,
+    y_world: float,
+    x_center: float,
+    z_center: float,
+    half_span: float,
+) -> float:
+    nx, ny, nz = valid_mask.shape
+    y_idx = int(round((float(y_world) - float(origin[1])) / float(resolution)))
+    y_idx = max(0, min(ny - 1, y_idx))
+    x0, x1 = _axis_window(float(x_center), float(half_span), float(origin[0]), float(resolution), nx)
+    z0, z1 = _axis_window(float(z_center), float(half_span), float(origin[2]), float(resolution), nz)
+    band = valid_mask[x0 : x1 + 1, y_idx, z0 : z1 + 1]
+    if band.size <= 0:
+        return 0.0
+    return float(band.mean())
+
+
+def _collect_goal_band_sources(
+    occupancy: np.ndarray,
+    origin: np.ndarray,
+    resolution: float,
+    y_world: float,
+    x_center: float,
+    z_center: float,
+    half_span: float,
+    y_pad_cells: int = 1,
+    max_sources: int = 4096,
+):
+    nx, ny, nz = occupancy.shape
+    y_idx = int(round((float(y_world) - float(origin[1])) / float(resolution)))
+    y_idx = max(0, min(ny - 1, y_idx))
+    x0, x1 = _axis_window(float(x_center), float(half_span), float(origin[0]), float(resolution), nx)
+    z0, z1 = _axis_window(float(z_center), float(half_span), float(origin[2]), float(resolution), nz)
+
+    ys = list(range(max(0, y_idx - int(y_pad_cells)), min(ny - 1, y_idx + int(y_pad_cells)) + 1))
+    sources = []
+    for yy in ys:
+        for xx in range(x0, x1 + 1):
+            for zz in range(z0, z1 + 1):
+                if occupancy[xx, yy, zz] == 0:
+                    sources.append((xx, yy, zz))
+                    if len(sources) >= int(max_sources):
+                        return sources
+    return sources
 
 
 def _build_single_map(task: Dict):
@@ -60,9 +126,19 @@ def _build_single_map(task: Dict):
 
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
 
     try:
-        env = _make_env(include_u_local_optimum=include_u, compact_two_zone_map=compact_two_zone)
+        env = _make_env(
+            include_u_local_optimum=include_u,
+            compact_two_zone_map=compact_two_zone,
+            obstacle_count_scale=float(task.get("obstacle_count_scale", 0.3)),
+            scene_scale=float(task.get("scene_scale", 0.5)),
+            start_goal_plane_y_abs=float(task.get("start_goal_plane_y_abs", 25.0)),
+        )
+        spawn_plane_inset = float(task.get("spawn_plane_inset", 1.5))
+        env.spawn_start_y = float(env.map_y_min + spawn_plane_inset)
+        env.spawn_goal_y = float(env.map_y_max - spawn_plane_inset)
 
         bounds = {
             "x_min": -0.5,
@@ -85,6 +161,7 @@ def _build_single_map(task: Dict):
             cyl_h=cyl_h,
             resolution=float(task["resolution"]),
             margin=float(task["margin"]),
+            extra_inflate=float(task.get("extra_inflate", 0.0)),
             bounds=bounds,
             z_min=float(task["z_min"]),
             z_max=float(task["z_max"]),
@@ -92,18 +169,53 @@ def _build_single_map(task: Dict):
 
         goal_world = np.asarray([env.spawn_x_center, float(env.spawn_goal_y), env.spawn_z_center], dtype=np.float32)
         goal_idx = world_to_grid_index(goal_world, origin, shape, float(task["resolution"]))
+        spawn_half_span = float(getattr(env, "fixed_spawn_half_span", 1.0))
+        goal_sources = _collect_goal_band_sources(
+            occupancy=occupancy,
+            origin=origin,
+            resolution=float(task["resolution"]),
+            y_world=float(env.spawn_goal_y),
+            x_center=float(env.spawn_x_center),
+            z_center=float(env.spawn_z_center),
+            half_span=spawn_half_span,
+            y_pad_cells=1,
+            max_sources=int(task.get("max_goal_sources", 4096)),
+        )
 
         potential, goal_idx_used = compute_dijkstra_potential(
             occupancy=occupancy,
             goal_idx=goal_idx,
             resolution=float(task["resolution"]),
+            goal_sources=goal_sources,
         )
         guide_dir = compute_descending_vector_field(potential, occupancy)
+        dir_norm = np.linalg.norm(guide_dir, axis=-1)
+        valid_mask = np.isfinite(potential) & (occupancy == 0) & (dir_norm > 1e-6)
+        global_valid_ratio = float(valid_mask.mean())
+        start_valid_ratio = _spawn_band_valid_ratio(
+            valid_mask=valid_mask,
+            origin=origin,
+            resolution=float(task["resolution"]),
+            y_world=float(env.spawn_start_y),
+            x_center=float(env.spawn_x_center),
+            z_center=float(env.spawn_z_center),
+            half_span=spawn_half_span,
+        )
+        goal_valid_ratio = _spawn_band_valid_ratio(
+            valid_mask=valid_mask,
+            origin=origin,
+            resolution=float(task["resolution"]),
+            y_world=float(env.spawn_goal_y),
+            x_center=float(env.spawn_x_center),
+            z_center=float(env.spawn_z_center),
+            half_span=spawn_half_span,
+        )
 
         save_obj = {
             "map_id": map_id,
             "resolution": float(task["resolution"]),
             "margin": float(task["margin"]),
+            "extra_inflate": float(task.get("extra_inflate", 0.0)),
             "z_min": float(task["z_min"]),
             "z_max": float(task["z_max"]),
             "bounds": bounds,
@@ -125,18 +237,53 @@ def _build_single_map(task: Dict):
             "spawn_goal_bounds": env._spawn_goal_bounds[0].detach().cpu(),
             "spawn_start_y": float(env.spawn_start_y),
             "spawn_goal_y": float(env.spawn_goal_y),
+            "goal_source_count": int(len(goal_sources)),
+            "global_valid_ratio": float(global_valid_ratio),
+            "start_band_valid_ratio": float(start_valid_ratio),
+            "goal_band_valid_ratio": float(goal_valid_ratio),
         }
+
+        reachable = int(np.isfinite(potential).sum())
+        total = int(potential.size)
+        min_global = float(task.get("min_global_valid_ratio", 0.0))
+        min_start = float(task.get("min_start_valid_ratio", 0.0))
+        min_goal = float(task.get("min_goal_valid_ratio", 0.0))
+        quality_ok = (
+            global_valid_ratio >= min_global
+            and start_valid_ratio >= min_start
+            and goal_valid_ratio >= min_goal
+        )
+        if not quality_ok:
+            return {
+                "ok": False,
+                "map_id": map_id,
+                "out_path": "",
+                "reachable": reachable,
+                "total": total,
+                "global_valid_ratio": global_valid_ratio,
+                "start_valid_ratio": start_valid_ratio,
+                "goal_valid_ratio": goal_valid_ratio,
+                "goal_source_count": int(len(goal_sources)),
+                "error": (
+                    "map quality check failed: "
+                    f"global_valid_ratio={global_valid_ratio:.6f} (<{min_global:.6f}) or "
+                    f"start_valid_ratio={start_valid_ratio:.6f} (<{min_start:.6f}) or "
+                    f"goal_valid_ratio={goal_valid_ratio:.6f} (<{min_goal:.6f})"
+                ),
+            }
 
         out_path = os.path.join(save_dir, f"map_{map_id:03d}.pt")
         torch.save(save_obj, out_path)
-        reachable = int(np.isfinite(potential).sum())
-        total = int(potential.size)
         return {
             "ok": True,
             "map_id": map_id,
             "out_path": out_path,
             "reachable": reachable,
             "total": total,
+            "global_valid_ratio": global_valid_ratio,
+            "start_valid_ratio": start_valid_ratio,
+            "goal_valid_ratio": goal_valid_ratio,
+            "goal_source_count": int(len(goal_sources)),
             "error": "",
         }
     except Exception:
@@ -146,6 +293,10 @@ def _build_single_map(task: Dict):
             "out_path": "",
             "reachable": 0,
             "total": 0,
+            "global_valid_ratio": 0.0,
+            "start_valid_ratio": 0.0,
+            "goal_valid_ratio": 0.0,
+            "goal_source_count": 0,
             "error": traceback.format_exc(),
         }
 
@@ -188,6 +339,26 @@ def main():
     parser.add_argument("--resolution", type=float, default=0.3)
     # 障碍膨胀边距（米）：给墙体外扩安全缓冲，值越大路径越保守。
     parser.add_argument("--margin", type=float, default=0.15)
+    # 额外膨胀项（米）：默认 0，避免对 margin 进行隐式双重膨胀。
+    parser.add_argument("--extra_inflate", type=float, default=0.0)
+    # 地图质量阈值（设为 0 可关闭对应约束）
+    parser.add_argument("--min_global_valid_ratio", type=float, default=0.001,
+                        help="Minimum ratio of globally valid guidance voxels (0 disables)")
+    parser.add_argument("--min_start_valid_ratio", type=float, default=0.01,
+                        help="Minimum valid guidance ratio inside start spawn band (0 disables)")
+    parser.add_argument("--min_goal_valid_ratio", type=float, default=0.01,
+                        help="Minimum valid guidance ratio inside goal spawn band (0 disables)")
+    parser.add_argument("--max_goal_sources", type=int, default=4096,
+                        help="Maximum number of free cells sampled in goal spawn band as Dijkstra seeds")
+    # 与训练环境对齐的地图生成参数（建议与训练脚本保持一致）
+    parser.add_argument("--obstacle_count_scale", type=float, default=0.3,
+                        help="Obstacle density multiplier for precomputed-map env generation")
+    parser.add_argument("--scene_scale", type=float, default=0.5,
+                        help="Scene scale for precomputed-map env generation")
+    parser.add_argument("--start_goal_plane_y_abs", type=float, default=25.0,
+                        help="Start/goal plane y abs value forwarded to env generation")
+    parser.add_argument("--spawn_plane_inset", type=float, default=1.5,
+                        help="Inset from +/-map_y_half used to place start/goal y planes in precomputed maps")
     # 势场 z 方向覆盖范围（米）：应覆盖飞行高度和目标高度。
     parser.add_argument("--z_min", type=float, default=0.0)
     parser.add_argument("--z_max", type=float, default=5.0)
@@ -222,7 +393,10 @@ def main():
 
     print(
         f"[Precompute] num_maps={args.num_maps}, workers={num_workers}, "
-        f"chunksize={chunksize}, max_retries={args.max_retries}, save_dir={args.save_dir}"
+        f"chunksize={chunksize}, max_retries={args.max_retries}, save_dir={args.save_dir}, "
+        f"margin={args.margin}, extra_inflate={args.extra_inflate}, "
+        f"spawn_plane_inset={args.spawn_plane_inset}, "
+        f"min_valid(global/start/goal)=({args.min_global_valid_ratio}, {args.min_start_valid_ratio}, {args.min_goal_valid_ratio})"
     )
 
     pending = all_ids[:]
@@ -236,8 +410,17 @@ def main():
                 "seed": int(args.seed) + int(map_id) + 100000 * round_idx,
                 "resolution": float(args.resolution),
                 "margin": float(args.margin),
+                "extra_inflate": float(args.extra_inflate),
                 "z_min": float(args.z_min),
                 "z_max": float(args.z_max),
+                "min_global_valid_ratio": float(args.min_global_valid_ratio),
+                "min_start_valid_ratio": float(args.min_start_valid_ratio),
+                "min_goal_valid_ratio": float(args.min_goal_valid_ratio),
+                "max_goal_sources": int(args.max_goal_sources),
+                "obstacle_count_scale": float(args.obstacle_count_scale),
+                "scene_scale": float(args.scene_scale),
+                "start_goal_plane_y_abs": float(args.start_goal_plane_y_abs),
+                "spawn_plane_inset": float(args.spawn_plane_inset),
                 "include_u_local_optimum": bool(args.include_u_local_optimum),
                 "compact_two_zone_map": bool(args.compact_two_zone_map),
             })
@@ -253,7 +436,10 @@ def main():
                 ok_cnt += 1
                 print(
                     f"[OK] map={out['map_id']:03d} saved={out['out_path']} "
-                    f"reachable={out['reachable']}/{out['total']}"
+                    f"reachable={out['reachable']}/{out['total']} "
+                    f"valid(global/start/goal)=({out.get('global_valid_ratio', 0.0):.4f}/"
+                    f"{out.get('start_valid_ratio', 0.0):.4f}/{out.get('goal_valid_ratio', 0.0):.4f}) "
+                    f"goal_sources={int(out.get('goal_source_count', 0))}"
                 )
             else:
                 fail_cnt += 1
@@ -261,11 +447,21 @@ def main():
                 err_msg = {
                     "round": round_idx,
                     "map_id": int(out["map_id"]),
+                    "global_valid_ratio": float(out.get("global_valid_ratio", 0.0)),
+                    "start_valid_ratio": float(out.get("start_valid_ratio", 0.0)),
+                    "goal_valid_ratio": float(out.get("goal_valid_ratio", 0.0)),
+                    "goal_source_count": int(out.get("goal_source_count", 0)),
                     "error": out["error"],
                 }
                 with open(fail_log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(err_msg, ensure_ascii=False) + "\n")
-                print(f"[FAIL] map={out['map_id']:03d} (logged to {fail_log_path})")
+                print(
+                    f"[FAIL] map={out['map_id']:03d} "
+                    f"valid(global/start/goal)=({out.get('global_valid_ratio', 0.0):.4f}/"
+                    f"{out.get('start_valid_ratio', 0.0):.4f}/{out.get('goal_valid_ratio', 0.0):.4f}) "
+                    f"goal_sources={int(out.get('goal_source_count', 0))} "
+                    f"(logged to {fail_log_path})"
+                )
 
         print(f"[Precompute] round={round_idx} done, ok={ok_cnt}, fail={fail_cnt}")
         pending = sorted(set(next_pending))

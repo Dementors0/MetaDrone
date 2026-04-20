@@ -1,5 +1,5 @@
-#7.10
-#转向损失在二维平面投影，加入探索损失
+#8.2
+#4月20日备份 速度变化损失
 
 import argparse
 import atexit

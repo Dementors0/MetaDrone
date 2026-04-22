@@ -121,7 +121,7 @@ class Env:
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.n_drones_per_group = random.choice([4, 8])
-        self.drone_radius = random.uniform(0.1, 0.15)
+        self.drone_radius = 0.13
         if self.single:
             self.n_drones_per_group = 1
 
@@ -250,7 +250,7 @@ class Env:
             torch.zeros_like(self.yaw_ctl_delay), 5)
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+        self.margin = torch.full((B,), 0.07, device=device)
 
         # drag coef
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
@@ -329,4 +329,3 @@ class Env:
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
-

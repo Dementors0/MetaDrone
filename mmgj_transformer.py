@@ -1,5 +1,5 @@
-#7.10
-#转向损失在二维平面投影，加入探索损失
+#9.1
+#时间平均权重替代
 
 import argparse
 import atexit
@@ -379,6 +379,17 @@ parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
                     help='Compatibility arg (unused): no extra floor is applied beyond current LGN output constraints')
 parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
                     help='Compatibility arg (unused): no ceiling constraint is applied to current LGN outputs')
+parser.add_argument('--proxy_non_speed_weight_source', type=str, default='time_avg_fixed',
+                    choices=['dynamic', 'time_avg_fixed'],
+                    help='How non-speed proxy weights (dir/avoid/expl/turn) are applied: dynamic LGN output or fixed time-averaged constants')
+parser.add_argument('--proxy_time_avg_weight_direction', type=float, default=1.8737245172327548,
+                    help='Fixed Direction weight used when proxy_non_speed_weight_source=time_avg_fixed')
+parser.add_argument('--proxy_time_avg_weight_avoidance', type=float, default=1.797433498331852,
+                    help='Fixed Avoidance weight used when proxy_non_speed_weight_source=time_avg_fixed')
+parser.add_argument('--proxy_time_avg_weight_exploration', type=float, default=4.71434117584865,
+                    help='Fixed Exploration weight used when proxy_non_speed_weight_source=time_avg_fixed')
+parser.add_argument('--proxy_time_avg_weight_turn', type=float, default=3.5311372854599825,
+                    help='Fixed Turn weight used when proxy_non_speed_weight_source=time_avg_fixed')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
                     help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
@@ -497,6 +508,17 @@ if args.guidance_backend == 'dijkstra_potential':
 else:
     args.use_precomputed_potential_maps = False
     args.use_astar_guidance = True
+
+if args.proxy_non_speed_weight_source == 'time_avg_fixed':
+    print(
+        "Proxy non-speed weights use fixed time averages: "
+        f"dir={args.proxy_time_avg_weight_direction:.6f}, "
+        f"avoid={args.proxy_time_avg_weight_avoidance:.6f}, "
+        f"expl={args.proxy_time_avg_weight_exploration:.6f}, "
+        f"turn={args.proxy_time_avg_weight_turn:.6f}"
+    )
+else:
+    print("Proxy non-speed weights use LGN dynamic outputs.")
 
 # Planner parallel runtime config (used by guidance reference computation)
 PLANNER_PARALLEL_ENABLE = bool(args.planner_parallel)
@@ -3464,12 +3486,35 @@ for i in pbar:
             f"expl={loss_exploration_seq.requires_grad}, turn={loss_turn_seq.requires_grad}"
         )
     # LGN 输出已完成约束：speed_sign∈[-1,1]，其余权重>=0。
-    effective_weights_seq = weights_seq_raw
+    # 实验开关：速度偏好保持时变，其余偏好可切换为固定时间平均权重。
+    if args.proxy_non_speed_weight_source == 'time_avg_fixed':
+        fixed_non_speed = torch.tensor(
+            [
+                args.proxy_time_avg_weight_direction,
+                args.proxy_time_avg_weight_avoidance,
+                args.proxy_time_avg_weight_exploration,
+                args.proxy_time_avg_weight_turn,
+            ],
+            device=weights_seq_raw.device,
+            dtype=weights_seq_raw.dtype,
+        ).view(1, 1, 4)
+        fixed_non_speed = fixed_non_speed.expand(weights_seq_raw.shape[0], weights_seq_raw.shape[1], 4)
+        effective_weights_seq = torch.cat([weights_seq_raw[:, :, :2], fixed_non_speed], dim=-1)
+    else:
+        effective_weights_seq = weights_seq_raw
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
             f"grad_fn={type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else 'None'}"
         )
+        if args.proxy_non_speed_weight_source == 'time_avg_fixed':
+            print(
+                f"[DIAG iter={i}] fixed_non_speed_weights="
+                f"({args.proxy_time_avg_weight_direction:.6f}, "
+                f"{args.proxy_time_avg_weight_avoidance:.6f}, "
+                f"{args.proxy_time_avg_weight_exploration:.6f}, "
+                f"{args.proxy_time_avg_weight_turn:.6f})"
+            )
 
     # 速度偏好双通道：方向(有符号) + 强度(非负)。
     speed_pref_signed = effective_weights_seq[:, :, 0].clamp(-1.0, 1.0)
@@ -3848,7 +3893,12 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
-        success = torch.all(dist_obj > 0, 0)
+        # 旧成功率定义：全程无碰撞（保留为单独指标“无碰撞率”）
+        no_collision = torch.all(dist_obj > 0, 0)
+        # 新成功率定义：到达终点附近 AND 全程无碰撞
+        final_dist_to_goal = safe_l2_norm(p_history[-1] - env.p_target, dim=-1)
+        reached_goal = final_dist_to_goal < args.goal_radius
+        success = reached_goal & no_collision
         # 计算平均权重 (用于 Scalar 显示)
         avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始输出权重
         avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际使用权重
@@ -3865,6 +3915,11 @@ for i in pbar:
             # === 主要Loss ===
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
+            'Weights/Mode_NonSpeed_TimeAvgFixed': 1.0 if args.proxy_non_speed_weight_source == 'time_avg_fixed' else 0.0,
+            'Weights_Fixed/1_Direction': float(args.proxy_time_avg_weight_direction),
+            'Weights_Fixed/2_Avoidance': float(args.proxy_time_avg_weight_avoidance),
+            'Weights_Fixed/3_Exploration': float(args.proxy_time_avg_weight_exploration),
+            'Weights_Fixed/4_Turn': float(args.proxy_time_avg_weight_turn),
 
             # === [增强] 速度偏好双通道 + 其余4个权重 ===
             'Weights/0_SpeedPref_Signed': avg_weights[0],
@@ -3945,6 +4000,7 @@ for i in pbar:
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
+            'Metrics/无碰撞率': no_collision.float().mean(),
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),

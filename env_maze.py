@@ -202,7 +202,7 @@ class Env:
         # Drone & Path Initialization
         # ---------------------------------------------------------------------
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
-        self.drone_radius = random.uniform(0.1, 0.15)
+        self.drone_radius = 0.13
         if self.single:
             self.n_drones_per_group = 1
         else:
@@ -246,7 +246,7 @@ class Env:
             torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+        self.margin = torch.full((B,), 0.07, device=device)
 
         # drag coef
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
@@ -272,7 +272,7 @@ class Env:
         ], -1).reshape(B, 3, 3)
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
-        self.drone_radius = random.uniform(0.1, 0.15)
+        self.drone_radius = 0.13
         if self.single:
             self.n_drones_per_group = 1
         else:
@@ -315,7 +315,7 @@ class Env:
             torch.zeros_like(self.yaw_ctl_delay), 2)
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+        self.margin = torch.full((B,), 0.07, device=device)
 
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
         self.drag_2[:, 0] = 0

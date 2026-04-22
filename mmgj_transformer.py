@@ -1,5 +1,5 @@
 #9.1
-#时间平均权重替代
+#时间平均权重替代，修改成功率
 
 import argparse
 import atexit

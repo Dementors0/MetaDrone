@@ -1,5 +1,5 @@
-#7.10
-#转向损失在二维平面投影，加入探索损失
+#9.2
+#转向损失在二维平面投影，加入探索损失测试组
 
 import argparse
 import atexit
@@ -3776,7 +3776,9 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
-        success = torch.all(dist_obj > 0, 0)
+        collision_free = torch.all(dist_obj > 0, dim=0)
+        reached_goal = torch.any(dist_to_goal < args.goal_radius, dim=0)
+        success = collision_free & reached_goal
         # 计算平均权重 (用于 Scalar 显示)
         avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始输出权重
         avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际使用权重
@@ -3871,6 +3873,8 @@ for i in pbar:
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
+            'Metrics/No_Collision_Rate': collision_free.float().mean(),
+            'Metrics/Reach_Goal_Rate': reached_goal.float().mean(),
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),

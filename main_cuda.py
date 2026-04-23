@@ -47,6 +47,8 @@ parser.add_argument('--obstacle_count_scale', type=float, default=0.5,
                     help='global multiplier for obstacle counts')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
+parser.add_argument('--goal_radius', type=float, default=0.5,
+                    help='Success goal proximity radius (meters)')
 parser.add_argument('--maze_update_interval', type=int, default=50,
                     help='Regenerate maze every N iterations; drone-only reset in between')
 parser.add_argument('--cam_angle', type=int, default=10)
@@ -510,8 +512,15 @@ for i in pbar:
     ######接下来运行的代码，不需要计算梯度######
     with torch.no_grad():
         avg_speed = speed_history.mean(0)
-        success = torch.all(distance.flatten(0, 1) > 0, 0)
-        _success = success.sum() / B
+        if distance.dim() == 2:
+            collision_free = torch.all(distance > 0, dim=0)
+        else:
+            collision_free = torch.all(distance.flatten(0, 1) > 0, dim=0)
+        dist_to_goal = torch.norm(p_history - env.p_target.unsqueeze(0), 2, -1)
+        reached_goal = torch.any(dist_to_goal < args.goal_radius, dim=0)
+        success = collision_free & reached_goal
+        _success = success.float().mean()
+        _no_collision_rate = collision_free.float().mean()
         smooth_dict({
             'loss': loss,
             'loss_v': loss_v,
@@ -525,9 +534,11 @@ for i in pbar:
             'loss_collide': loss_collide,
             'loss_ground_affinity': loss_ground_affinity,
             'success': _success,
+            'no_collision_rate': _no_collision_rate,
+            'reach_goal_rate': reached_goal.float().mean(),
             'max_speed': speed_history.max(0).values.mean(),
             'avg_speed': avg_speed.mean(),
-            'ar': (success * avg_speed).mean()})
+            'ar': (success.float() * avg_speed).mean()})
         log_dict = {}
         if is_save_trajectory_iter(i):
             # vid = torch.stack(vid).cpu().div(10).clamp(0, 1)[None, :, None]

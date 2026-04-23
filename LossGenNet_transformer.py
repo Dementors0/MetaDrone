@@ -1,11 +1,11 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 class LossGenNet(nn.Module):
     """
-    升级版损失生成网络: 
+    升级版损失生成网络:
     CNN (视觉) + MLP (状态) -> Token Fusion -> Transformer (时序记忆) -> MLP (输出)
+    输出为 proxy reference 的残差修正量（而非旧版 loss weights）。
     """
 
     def __init__(
@@ -84,10 +84,11 @@ class LossGenNet(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_dim)
 
         # 4. 输出头
+        # [delta_dir(3), delta_speed(1), delta_yaw(3), delta_margin(1)] -> total 8
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, 6),  # [SpeedPrefSigned, SpeedPrefStrength, Dir, Obs, Expl, Turn]
+            nn.Linear(hidden_dim, 8),
         )
 
     def forward(self, depth_feat, state, geom_feat, progress_feat, hx=None):
@@ -99,7 +100,7 @@ class LossGenNet(nn.Module):
             progress_feat: [B, progress_dim] 近期进展/卡住统计特征
             hx: [B, T_mem, hidden_dim] 历史记忆 token (如果是第一步则为 None)
         返回:
-            weights: [B, 6]
+            delta_refs: [B, 8]
             hx: [B, T_mem, hidden_dim] 更新后的记忆序列
         """
         # 1. 提取视觉特征
@@ -134,12 +135,8 @@ class LossGenNet(nn.Module):
         x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 6. 速度偏好双通道 + 其余非负权重
-        raw = self.head(last_token)
-        speed_pref_signed = torch.tanh(raw[:, 0:1])     # [-1, 1], 方向: +加速 / -减速
-        speed_pref_strength = F.softplus(raw[:, 1:2])   # >= 0, 强度
-        other_weights = F.softplus(raw[:, 2:])          # [Dir, Obs, Expl, Turn], >= 0
-        weights = torch.cat([speed_pref_signed, speed_pref_strength, other_weights], dim=-1)
+        # 6. 输出 reference 残差（范围约束在训练脚本里结合 naive reference 处理）
+        delta_refs = self.head(last_token)
 
-        # 返回 weights 和 Transformer 编码后的记忆序列
-        return weights, x_out
+        # 返回 delta_refs 和 Transformer 编码后的记忆序列
+        return delta_refs, x_out

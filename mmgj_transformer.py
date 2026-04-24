@@ -1,5 +1,5 @@
 #8.1
-#制作四种独立地图
+#制作四种独立地图,修复势场
 
 import argparse
 import atexit

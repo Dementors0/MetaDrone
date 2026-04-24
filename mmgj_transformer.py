@@ -51,10 +51,15 @@ except ModuleNotFoundError:
         sys.path.append(parent_dir)
     from env_multi import Env
 try:
-    from potential_map_utils import PotentialMapCache, query_potential_guidance
-except ModuleNotFoundError:
+    from potential_map_utils import (
+        PLANNER_DRONE_RADIUS as POTENTIAL_MAP_DRONE_RADIUS,
+        PotentialMapCache,
+        query_potential_guidance,
+    )
+except (ModuleNotFoundError, ImportError):
     PotentialMapCache = None
     query_potential_guidance = None
+    POTENTIAL_MAP_DRONE_RADIUS = 0.13
 from env import probe_update_state_vec_common_upstream
 try:
     from WorkNet_transformer import WorkNet
@@ -332,8 +337,8 @@ parser.add_argument('--include_u_local_optimum', dest='include_u_local_optimum',
 parser.add_argument('--no_include_u_local_optimum', dest='include_u_local_optimum', action='store_false',
                     help='Disable U-shaped trap region and use shuffled hard/easy/easy region order')
 parser.set_defaults(include_u_local_optimum=False)
-# [开关1.1] 两分区紧凑地图开关（默认: 关闭）
-# - 默认行为：不传任何参数时 compact_two_zone_map=False，保持当前三分区地图逻辑不变。
+# [开关1.1] 两分区紧凑地图开关（默认: 开启）
+# - 默认行为：不传任何参数时 compact_two_zone_map=True，使用紧凑两分区布局。
 # - 显式开启：--compact_two_zone_map（仅保留 easy/hard 两种地图，Y 向尺寸缩小，起终点平面随之调整）
 # - 显式关闭：--no_compact_two_zone_map
 # - 说明：与 include_u_local_optimum 共存时，开启紧凑两分区会优先使用两分区布局（不再包含 U 区）。
@@ -494,9 +499,9 @@ parser.add_argument('--guide_collision_threshold', type=float, default=-0.05,
                     help='Penetration threshold below which point is considered collided')
 parser.add_argument('--guide_accel_weight', type=float, default=0.1,
                     help='Weight for acceleration mismatch penalty (deceleration requirement)')
-parser.add_argument('--planner_resolution', type=float, default=0.3,
+parser.add_argument('--planner_resolution', type=float, default=0.15,
                     help='Resolution of the occupancy grid for A* planning (meters)')
-parser.add_argument('--planner_margin', type=float, default=0.15,
+parser.add_argument('--planner_margin', type=float, default=0.07,
                     help='Safety margin for obstacle inflation in planner (meters)')
 parser.add_argument('--planner_parallel', dest='planner_parallel', action='store_true',
                     help='Enable sample-level parallel global planning with multiprocessing pool')
@@ -514,7 +519,7 @@ parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
 # - 默认不写时为 astar（在线规划）。
 # - 切到势场模式：--guidance_backend dijkstra_potential
 #   需要配合预计算地图目录，例如：
-#   --precomputed_map_dir ../precomputed_maps --num_precomputed_maps 100
+#   --precomputed_map_dir ../precomputed_maps_all4_custom --num_precomputed_maps 100
 # - 切回 A* 模式：--guidance_backend astar
 # 说明：这是统一开关，优先于旧的 use_precomputed_potential_maps/use_astar_guidance 组合语义。
 parser.add_argument('--guidance_backend', type=str, default='astar',
@@ -522,10 +527,10 @@ parser.add_argument('--guidance_backend', type=str, default='astar',
                     help='Switch guidance backend between online A* and cached Dijkstra potential field')
 parser.add_argument('--use_precomputed_potential_maps', default=False, action='store_true',
                     help='Use precomputed Dijkstra potential-map guidance instead of online A* planning')
-parser.add_argument('--precomputed_map_dir', type=str, default='../precomputed_maps',
-                    help='Directory containing map_XXX.pt potential cache files')
-parser.add_argument('--num_precomputed_maps', type=int, default=100,
-                    help='Max number of precomputed maps to load from precomputed_map_dir')
+parser.add_argument('--precomputed_map_dir', type=str, default='../precomputed_maps_all4_custom',
+                    help='Directory containing precomputed potential cache files (*.pt)')
+parser.add_argument('--num_precomputed_maps', type=int, default=0,
+                    help='Max number of precomputed maps to load from precomputed_map_dir (<=0 means load all)')
 # [势场查询参数]
 # - trilinear: 三线性插值，点落在栅格内部时按8个角点加权，训练更平滑（推荐）
 # - nearest: 最近邻查询，调试方便但梯度更离散
@@ -1024,19 +1029,28 @@ class GlobalPlanner:
     然后从路径中提取参考方向、速度和加速度。
     """
 
-    def __init__(self, resolution: float = 0.3, margin: float = 0.15,
-                 z_min: float = 0.0, z_max: float = 2.5, device='cuda'):
+    def __init__(
+        self,
+        resolution: float = 0.15,
+        margin: float = 0.07,
+        z_min: float = 0.0,
+        z_max: float = 5.0,
+        drone_radius: float = POTENTIAL_MAP_DRONE_RADIUS,
+        device='cuda',
+    ):
         """
         Args:
             resolution: 栅格分辨率 (米)
             margin: 安全边距 (米)，障碍物膨胀量
             z_min, z_max: Z轴范围
+            drone_radius: 规划器使用的无人机半径 (米)
             device: 计算设备
         """
         self.resolution = resolution
         self.margin = margin
         self.z_min = z_min
         self.z_max = z_max
+        self.drone_radius = max(0.0, float(drone_radius))
         self.device = device
 
         # 缓存的占用栅格地图
@@ -1066,14 +1080,20 @@ class GlobalPlanner:
             env: 环境对象，包含 voxels, balls, cyl, cyl_h 等障碍物
             batch_idx: batch 索引
         """
-        # 确定地图边界
-        x_min, x_max = -15.0, 15.0
-        y_min, y_max = -25.0, 25.0
+        # 以环境地图边界为准，和预构建地图口径保持一致。
+        if all(hasattr(env, k) for k in ('map_x_max', 'map_y_min', 'map_y_max')):
+            x_min = -0.5
+            x_max = float(getattr(env, 'map_x_max')) + 0.5
+            y_min = float(getattr(env, 'map_y_min')) - 1.0
+            y_max = float(getattr(env, 'map_y_max')) + 1.0
+        else:
+            x_min, x_max = -15.0, 15.0
+            y_min, y_max = -25.0, 25.0
 
         if hasattr(env, 'p_target') and env.p_target is not None:
             target = env.p_target[batch_idx].detach().cpu()
-            y_min = min(y_min, float(target[1]) - 5.0)
-            y_max = max(y_max, float(target[1]) + 5.0)
+            y_min = min(y_min, float(target[1]) - 2.0)
+            y_max = max(y_max, float(target[1]) + 2.0)
 
         # 栅格尺寸
         nx = int(math.ceil((x_max - x_min) / self.resolution))
@@ -1087,7 +1107,7 @@ class GlobalPlanner:
         self.occupancy_grid = np.zeros((nx, ny, nz), dtype=np.uint8)
 
         # 填充障碍物
-        total_margin = self.margin + 0.15  # 额外的安全边距
+        total_margin = float(self.margin) + float(self.drone_radius)
 
         # 1. 体素盒体障碍物
         if hasattr(env, 'voxels') and env.voxels.numel() > 0:
@@ -1591,6 +1611,9 @@ def _plan_sample_points_worker(payload):
     max_decel = float(payload['max_decel'])
     lookahead_dist = float(payload['lookahead_dist'])
     invalid_dist_threshold = float(payload['invalid_dist_threshold'])
+    map_x_max = float(payload.get('map_x_max', 10.0))
+    map_y_min = float(payload.get('map_y_min', -13.0))
+    map_y_max = float(payload.get('map_y_max', 13.0))
 
     planner = GlobalPlanner(resolution=resolution, margin=margin, z_min=z_min, z_max=z_max, device='cpu')
 
@@ -1603,6 +1626,9 @@ def _plan_sample_points_worker(payload):
     env_shim.cyl = torch.from_numpy(cyl_np).unsqueeze(0)
     env_shim.cyl_h = torch.from_numpy(cyl_h_np).unsqueeze(0)
     env_shim.p_target = torch.from_numpy(goal_np).reshape(1, 3)
+    env_shim.map_x_max = map_x_max
+    env_shim.map_y_min = map_y_min
+    env_shim.map_y_max = map_y_max
 
     planner.build_occupancy_grid(env_shim, batch_idx=0)
 
@@ -1683,7 +1709,13 @@ def _plan_sample_points_worker(payload):
 
 
 # 全局规划器实例（在迷宫更新时重新规划）
-global_planner = GlobalPlanner(resolution=0.3, margin=0.15)
+global_planner = GlobalPlanner(
+    resolution=0.15,
+    margin=0.07,
+    z_min=0.0,
+    z_max=5.0,
+    drone_radius=POTENTIAL_MAP_DRONE_RADIUS,
+)
 
 
 def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, planner: GlobalPlanner,
@@ -1770,6 +1802,9 @@ def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, plann
                     'margin': planner.margin,
                     'z_min': planner.z_min,
                     'z_max': planner.z_max,
+                    'map_x_max': float(getattr(env, 'map_x_max', 10.0)),
+                    'map_y_min': float(getattr(env, 'map_y_min', -13.0)),
+                    'map_y_max': float(getattr(env, 'map_y_max', 13.0)),
                     'max_speed': max_speed,
                     'max_accel': max_accel,
                     'max_decel': max_decel,
@@ -3306,9 +3341,16 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
 global_planner = GlobalPlanner(
     resolution=args.planner_resolution,
     margin=args.planner_margin,
+    z_min=0.0,
+    z_max=float(getattr(env, 'map_z_max', 5.0)),
+    drone_radius=POTENTIAL_MAP_DRONE_RADIUS,
     device=device
 )
-print(f"[GlobalPlanner] Initialized with resolution={args.planner_resolution}m, margin={args.planner_margin}m")
+print(
+    "[GlobalPlanner] Initialized with "
+    f"resolution={args.planner_resolution}m, margin={args.planner_margin}m, "
+    f"drone_radius={POTENTIAL_MAP_DRONE_RADIUS}m, z=[{global_planner.z_min}, {global_planner.z_max}]"
+)
 
 current_precomputed_map_idx = -1
 

@@ -42,6 +42,46 @@ def _collect_map_files(map_dir):
     return files
 
 
+def _map_type_from_file(path_or_name):
+    stem = os.path.splitext(os.path.basename(path_or_name))[0]
+    if stem.startswith("hard_"):
+        return "hard"
+    if stem.startswith("easy_"):
+        return "easy"
+    if stem.startswith("u_min_"):
+        return "u_min"
+    if stem.startswith("hairpin_"):
+        return "hairpin"
+    return ""
+
+
+def _select_four_type_paths(files, per_type_index=0):
+    groups = {
+        "hard": [],
+        "easy": [],
+        "u_min": [],
+        "hairpin": [],
+    }
+    for path in files:
+        map_type = _map_type_from_file(path)
+        if map_type in groups:
+            groups[map_type].append(path)
+
+    missing = [k for k, v in groups.items() if len(v) == 0]
+    if missing:
+        raise ValueError(
+            "four_map_mode requires unified maps of all 4 types. Missing: "
+            + ",".join(missing)
+        )
+
+    idx = int(per_type_index)
+    selected = {}
+    for map_type in ("hard", "easy", "u_min", "hairpin"):
+        arr = groups[map_type]
+        selected[map_type] = arr[idx % len(arr)]
+    return selected
+
+
 def _pick_slice_z(z_world, origin_z, resolution, nz):
     if z_world is None:
         return max(0, min(nz - 1, nz // 2))
@@ -433,6 +473,23 @@ def main():
         help="Index in sorted map file list",
     )
     parser.add_argument(
+        "--four_map_mode",
+        action="store_true",
+        help="Render one map per type (hard/easy/u_min/hairpin) and save 4 HTML files",
+    )
+    parser.add_argument(
+        "--per_type_index",
+        type=int,
+        default=0,
+        help="In four-map mode, choose the N-th map within each type (mod by available count)",
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="",
+        help="In four-map mode, output directory of generated HTML files (default: <map_dir>/viz_four_maps)",
+    )
+    parser.add_argument(
         "--z_world",
         type=float,
         default=None,
@@ -506,6 +563,31 @@ def main():
 
     if go is None:
         raise ImportError("plotly is required for 3D HTML visualization. Please install plotly first.")
+
+    if bool(args.four_map_mode):
+        selected = _select_four_type_paths(files, per_type_index=args.per_type_index)
+        out_dir = args.save_dir if args.save_dir else os.path.join(args.map_dir, "viz_four_maps")
+        os.makedirs(out_dir, exist_ok=True)
+
+        for map_type in ("hard", "easy", "u_min", "hairpin"):
+            path = selected[map_type]
+            map_data = torch.load(path, map_location="cpu")
+            fig = _build_3d_figure(
+                map_data,
+                z_world=args.z_world,
+                z_band_layers=args.z_band_layers,
+                stride=args.stride,
+                arrow_stride=args.arrow_stride,
+                max_arrows=max(1, int(args.max_arrows)),
+                show_occupancy_points=bool(args.show_occupancy_points),
+                show_potential_points=bool(args.show_potential_points),
+                title_prefix=f"[{map_type}:{os.path.basename(path)}]",
+            )
+            out_name = f"{os.path.splitext(os.path.basename(path))[0]}_potential.html"
+            out_path = os.path.join(out_dir, out_name)
+            fig.write_html(out_path, include_plotlyjs="cdn")
+            print(f"[{map_type}] Saved: {out_path}")
+        return
 
     fig = _build_3d_figure(
         map_data,

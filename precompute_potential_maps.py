@@ -12,6 +12,7 @@ import torch
 
 from env_multi import Env, DEFAULT_EASY_DENSITY_SCALE, DEFAULT_HARD_DENSITY_SCALE
 from potential_map_utils import (
+    PLANNER_DRONE_RADIUS,
     build_occupancy_grid_from_obstacles,
     compute_descending_vector_field,
     compute_dijkstra_potential,
@@ -31,6 +32,10 @@ _MAP_TYPE_PREFIX = {
     "u-min": "u_min",
     "hairpin": "hairpin",
 }
+MIN_REACHABLE_FREE_RATIO = 0.12
+PLANNER_MARGIN = 0.07
+PLANNER_INFLATION_RADIUS = float(PLANNER_DRONE_RADIUS) + float(PLANNER_MARGIN)
+PLANNER_PASSAGE_SAFE_WIDTH = 2.0 * PLANNER_INFLATION_RADIUS + 0.08
 
 
 def _map_type_prefix(map_type: str) -> str:
@@ -73,6 +78,71 @@ def _has_reachable_free_near_index(
     if local_p.size == 0 or local_occ.size == 0:
         return False
     return bool(np.any(np.isfinite(local_p) & (local_occ == 0)))
+
+
+def _safe_ratio(numer: int, denom: int) -> float:
+    return float(numer) / float(max(1, int(denom)))
+
+
+def _spawn_plane_center_from_bounds(bounds: np.ndarray, fallback: float) -> float:
+    b = np.asarray(bounds, dtype=np.float32).reshape(-1)
+    if b.size >= 2 and np.isfinite(b[0]) and np.isfinite(b[1]):
+        return float(0.5 * (b[0] + b[1]))
+    return float(fallback)
+
+
+def _compute_reachable_stats(potential: np.ndarray, occupancy: np.ndarray) -> Dict[str, float]:
+    free_mask = occupancy == 0
+    reachable_free = np.isfinite(potential) & free_mask
+    free_count = int(free_mask.sum())
+    reachable_count = int(reachable_free.sum())
+    return {
+        "free_count": free_count,
+        "reachable_count": reachable_count,
+        "reachable_ratio": _safe_ratio(reachable_count, free_count),
+    }
+
+
+def _evaluate_potential_quality(
+    potential: np.ndarray,
+    occupancy: np.ndarray,
+    start_idx: Tuple[int, int, int],
+    goal_idx: Tuple[int, int, int],
+    min_reachable_ratio: float = MIN_REACHABLE_FREE_RATIO,
+) -> Dict[str, object]:
+    stats = _compute_reachable_stats(potential, occupancy)
+    start_reachable_near = _has_reachable_free_near_index(
+        potential=potential,
+        occupancy=occupancy,
+        center_idx=start_idx,
+        radius_xy=6,
+        radius_z=2,
+    )
+    goal_reachable_near = _has_reachable_free_near_index(
+        potential=potential,
+        occupancy=occupancy,
+        center_idx=goal_idx,
+        radius_xy=6,
+        radius_z=2,
+    )
+
+    reasons = []
+    if not start_reachable_near:
+        reasons.append("start_unreachable_near_spawn")
+    if not goal_reachable_near:
+        reasons.append("goal_unreachable_near_spawn")
+    if float(stats["reachable_ratio"]) < float(min_reachable_ratio):
+        reasons.append("reachable_ratio_too_low")
+
+    return {
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+        "start_reachable_near": bool(start_reachable_near),
+        "goal_reachable_near": bool(goal_reachable_near),
+        "free_count": int(stats["free_count"]),
+        "reachable_count": int(stats["reachable_count"]),
+        "reachable_ratio": float(stats["reachable_ratio"]),
+    }
 
 
 def _make_env(
@@ -291,12 +361,12 @@ def _append_horizontal_wall_from_boundary(
 
 
 def _design_corridor_params(env: Env):
-    # Use conservative max training radius so every map honors the minimum-clearance rule.
-    drone_radius_ref = 0.15
-    drone_width = 2.0 * drone_radius_ref
-    corridor_width = max(float(env.two_drone_passage_width), 3.0 * drone_width)
+    # Keep geometry consistent with planner inflation semantics (13cm body + 7cm margin).
+    drone_radius_ref = float(PLANNER_DRONE_RADIUS)
+    single_passage_width = max(0.36, float(PLANNER_PASSAGE_SAFE_WIDTH))
+    corridor_width = max(float(env.two_drone_passage_width), 2.15 * single_passage_width)
     corridor_width = _clamp(corridor_width, 0.65, float(env.map_x_max) - 1.40)
-    min_clear_width = 1.5 * drone_radius_ref
+    min_clear_width = _clamp(single_passage_width, 0.40, corridor_width - 0.10)
     return drone_radius_ref, corridor_width, min_clear_width
 
 
@@ -322,10 +392,11 @@ def _add_embedded_narrowings_vertical(
         y_mid = y0 + frac * (y1 - y0) + random.uniform(-0.16, 0.16)
         y_mid = _clamp(y_mid, y0 + 0.45, y1 - 0.45)
 
-        gap_lo = min(corridor_width - 0.10, min_clear_width + 0.14)
-        gap_hi = max(gap_lo, corridor_width - 0.16)
+        gap_safe_min = min(corridor_width - 0.08, max(min_clear_width, PLANNER_PASSAGE_SAFE_WIDTH))
+        gap_lo = min(corridor_width - 0.08, max(gap_safe_min, corridor_width - 0.34))
+        gap_hi = max(gap_lo, corridor_width - 0.12)
         gap = random.uniform(gap_lo, gap_hi) if gap_hi > gap_lo + 1e-6 else gap_lo
-        gap = _clamp(gap, min_clear_width + 0.10, corridor_width - 0.08)
+        gap = _clamp(gap, gap_safe_min, corridor_width - 0.08)
 
         removable = max(0.0, corridor_width - gap)
         if removable <= 1e-6:
@@ -399,10 +470,11 @@ def _add_embedded_narrowings_horizontal(
         x_mid = x_lo + frac * (x_hi - x_lo) + random.uniform(-0.12, 0.12)
         x_mid = _clamp(x_mid, x_lo + 0.30, x_hi - 0.30)
 
-        gap_lo = min(corridor_width - 0.10, min_clear_width + 0.14)
-        gap_hi = max(gap_lo, corridor_width - 0.16)
+        gap_safe_min = min(corridor_width - 0.08, max(min_clear_width, PLANNER_PASSAGE_SAFE_WIDTH))
+        gap_lo = min(corridor_width - 0.08, max(gap_safe_min, corridor_width - 0.34))
+        gap_hi = max(gap_lo, corridor_width - 0.12)
         gap = random.uniform(gap_lo, gap_hi) if gap_hi > gap_lo + 1e-6 else gap_lo
-        gap = _clamp(gap, min_clear_width + 0.10, corridor_width - 0.08)
+        gap = _clamp(gap, gap_safe_min, corridor_width - 0.08)
 
         removable = max(0.0, corridor_width - gap)
         if removable <= 1e-6:
@@ -660,16 +732,8 @@ def _build_u_min_geometry(env: Env) -> Dict:
         wall_thickness=wall_thickness,
     )
 
-    min_gap_straight = _add_embedded_narrowings_vertical(
-        env=env,
-        voxels=voxels,
-        balls=balls,
-        x_center=start_x,
-        y0=start_y + 0.85,
-        y1=straight_end_y - 0.45,
-        corridor_width=corridor_width,
-        min_clear_width=min_clear_width,
-    )
+    # Keep the straight corridor uniformly open: no internal narrowing perturbation.
+    min_gap_straight = corridor_width
 
     u_diameter = 4.0
     u_radius = 0.5 * u_diameter
@@ -795,7 +859,7 @@ def _build_hairpin_geometry(env: Env) -> Dict:
     cyls: List[List[float]] = []
 
     far_extra = 0.65
-    near_retract = 0.14
+    near_retract = max(0.14, 0.5 * PLANNER_PASSAGE_SAFE_WIDTH + 0.18)
 
     # 远端墙：更长，封死直行出口；近端墙：更短，给拐弯留入口。
     _append_vertical_wall_from_boundary(
@@ -829,7 +893,7 @@ def _build_hairpin_geometry(env: Env) -> Dict:
         wall_thickness=wall_thickness,
     )
 
-    near_release = max(0.26, 1.10 * wall_thickness)
+    near_release = max(0.26, 1.10 * wall_thickness, PLANNER_PASSAGE_SAFE_WIDTH + 0.10)
     if turn_dir > 0:
         near_x0 = x_turn_side + near_release
         near_x1 = x_turn_end + wall_thickness
@@ -970,6 +1034,21 @@ def _build_single_map_legacy(task: Dict):
         balls = env.balls[0].detach().cpu().numpy().astype(np.float32)
         cyl = env.cyl[0].detach().cpu().numpy().astype(np.float32)
         cyl_h = env.cyl_h[0].detach().cpu().numpy().astype(np.float32)
+        start_bounds = env._spawn_start_bounds[0].detach().cpu().numpy().astype(np.float32)
+        goal_bounds = env._spawn_goal_bounds[0].detach().cpu().numpy().astype(np.float32)
+
+        start_x = float(getattr(env, "spawn_start_x", env.spawn_x_center))
+        goal_x = float(getattr(env, "spawn_goal_x", env.spawn_x_center))
+        start_z = float(getattr(env, "spawn_start_z", env.spawn_z_center))
+        goal_z = float(getattr(env, "spawn_goal_z", env.spawn_z_center))
+        start_x_half = float(getattr(env, "spawn_start_x_half_span", env.fixed_spawn_half_span))
+        goal_x_half = float(getattr(env, "spawn_goal_x_half_span", env.fixed_spawn_half_span))
+        start_z_half = float(getattr(env, "spawn_start_z_half_span", env.fixed_spawn_half_span))
+        goal_z_half = float(getattr(env, "spawn_goal_z_half_span", env.fixed_spawn_half_span))
+
+        # Use spawn band centers to define start/goal planes in legacy mode.
+        start_y = _spawn_plane_center_from_bounds(start_bounds, float(env.spawn_start_y))
+        goal_y = _spawn_plane_center_from_bounds(goal_bounds, float(env.spawn_goal_y))
 
         occupancy, origin, shape = build_occupancy_grid_from_obstacles(
             voxels=voxels,
@@ -983,7 +1062,9 @@ def _build_single_map_legacy(task: Dict):
             z_max=float(task["z_max"]),
         )
 
-        goal_world = np.asarray([env.spawn_x_center, float(env.spawn_goal_y), env.spawn_z_center], dtype=np.float32)
+        start_world = np.asarray([start_x, start_y, start_z], dtype=np.float32)
+        goal_world = np.asarray([goal_x, goal_y, goal_z], dtype=np.float32)
+        start_idx = world_to_grid_index(start_world, origin, shape, float(task["resolution"]))
         goal_idx = world_to_grid_index(goal_world, origin, shape, float(task["resolution"]))
 
         potential, goal_idx_used = compute_dijkstra_potential(
@@ -992,6 +1073,20 @@ def _build_single_map_legacy(task: Dict):
             resolution=float(task["resolution"]),
         )
         guide_dir = compute_descending_vector_field(potential, occupancy)
+        quality = _evaluate_potential_quality(
+            potential=potential,
+            occupancy=occupancy,
+            start_idx=start_idx,
+            goal_idx=goal_idx,
+        )
+        if not bool(quality["ok"]):
+            raise RuntimeError(
+                "invalid potential coverage: "
+                f"map_id={map_id}, reasons={quality['reasons']}, "
+                f"reachable={quality['reachable_count']}/{quality['free_count']} "
+                f"({quality['reachable_ratio']:.4f}), "
+                f"start_idx={start_idx}, goal_idx={goal_idx}"
+            )
 
         save_obj = {
             "map_id": map_id,
@@ -1002,9 +1097,14 @@ def _build_single_map_legacy(task: Dict):
             "bounds": bounds,
             "grid_origin": torch.from_numpy(origin),
             "grid_shape": torch.tensor(shape, dtype=torch.long),
+            "start_world": torch.from_numpy(start_world),
             "goal_world": torch.from_numpy(goal_world),
+            "start_idx": torch.tensor(start_idx, dtype=torch.long),
             "goal_idx": torch.tensor(goal_idx, dtype=torch.long),
             "goal_idx_used": torch.tensor(goal_idx_used, dtype=torch.long),
+            "start_reachable_near": bool(quality["start_reachable_near"]),
+            "goal_reachable_near": bool(quality["goal_reachable_near"]),
+            "reachable_free_ratio": float(quality["reachable_ratio"]),
             "occupancy": torch.from_numpy(occupancy),
             "potential": torch.from_numpy(potential),
             "guide_dir": torch.from_numpy(guide_dir),
@@ -1014,10 +1114,18 @@ def _build_single_map_legacy(task: Dict):
             "cyl_h": torch.from_numpy(cyl_h),
             "region_order": env.region_order[0] if len(env.region_order) > 0 else tuple(),
             "u_meta": env.u_meta[0] if len(env.u_meta) > 0 else {},
-            "spawn_start_bounds": env._spawn_start_bounds[0].detach().cpu(),
-            "spawn_goal_bounds": env._spawn_goal_bounds[0].detach().cpu(),
-            "spawn_start_y": float(env.spawn_start_y),
-            "spawn_goal_y": float(env.spawn_goal_y),
+            "spawn_start_bounds": torch.from_numpy(start_bounds),
+            "spawn_goal_bounds": torch.from_numpy(goal_bounds),
+            "spawn_start_x": float(start_x),
+            "spawn_goal_x": float(goal_x),
+            "spawn_start_y": float(start_y),
+            "spawn_goal_y": float(goal_y),
+            "spawn_start_z": float(start_z),
+            "spawn_goal_z": float(goal_z),
+            "spawn_start_x_half_span": float(start_x_half),
+            "spawn_goal_x_half_span": float(goal_x_half),
+            "spawn_start_z_half_span": float(start_z_half),
+            "spawn_goal_z_half_span": float(goal_z_half),
         }
 
         out_path = os.path.join(save_dir, f"map_{map_id:03d}.pt")
@@ -1102,17 +1210,21 @@ def _build_single_map_unified(task: Dict):
         guide_dir = compute_descending_vector_field(potential, occupancy)
 
         start_idx = world_to_grid_index(start_world, origin, shape, float(task["resolution"]))
-        start_reachable_near = _has_reachable_free_near_index(
+        min_reachable_ratio = 0.04 if map_type == "hairpin" else MIN_REACHABLE_FREE_RATIO
+        quality = _evaluate_potential_quality(
             potential=potential,
             occupancy=occupancy,
-            center_idx=start_idx,
-            radius_xy=6,
-            radius_z=2,
+            start_idx=start_idx,
+            goal_idx=goal_idx,
+            min_reachable_ratio=min_reachable_ratio,
         )
-        if not start_reachable_near:
-            print(
-                f"[WARN] no reachable-free voxel near start: "
-                f"map_id={map_id}, map_type={map_type}, start_idx={start_idx}"
+        if not bool(quality["ok"]):
+            raise RuntimeError(
+                "invalid potential coverage: "
+                f"map_id={map_id}, map_type={map_type}, reasons={quality['reasons']}, "
+                f"reachable={quality['reachable_count']}/{quality['free_count']} "
+                f"({quality['reachable_ratio']:.4f}, min={min_reachable_ratio:.4f}), "
+                f"start_idx={start_idx}, goal_idx={goal_idx}"
             )
 
         start_y = float(spawn_start[1])
@@ -1135,7 +1247,9 @@ def _build_single_map_unified(task: Dict):
             "goal_idx": torch.tensor(goal_idx, dtype=torch.long),
             "goal_idx_used": torch.tensor(goal_idx_used, dtype=torch.long),
             "start_idx": torch.tensor(start_idx, dtype=torch.long),
-            "start_reachable_near": bool(start_reachable_near),
+            "start_reachable_near": bool(quality["start_reachable_near"]),
+            "goal_reachable_near": bool(quality["goal_reachable_near"]),
+            "reachable_free_ratio": float(quality["reachable_ratio"]),
             "occupancy": torch.from_numpy(occupancy),
             "potential": torch.from_numpy(potential),
             "guide_dir": torch.from_numpy(guide_dir),
@@ -1313,8 +1427,8 @@ def main():
     parser.add_argument("--num_maps", type=int, default=100)
     parser.add_argument("--save_dir", type=str, default="../precomputed_maps")
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--resolution", type=float, default=0.3)
-    parser.add_argument("--margin", type=float, default=0.15)
+    parser.add_argument("--resolution", type=float, default=0.15)
+    parser.add_argument("--margin", type=float, default=0.07)
     parser.add_argument("--z_min", type=float, default=0.0)
     parser.add_argument("--z_max", type=float, default=5.0)
     parser.add_argument(
@@ -1352,7 +1466,7 @@ def main():
     parser.add_argument("--compact_two_zone_map", dest="compact_two_zone_map", action="store_true")
     parser.add_argument("--no_compact_two_zone_map", dest="compact_two_zone_map", action="store_false")
     parser.set_defaults(include_u_local_optimum=False)
-    parser.set_defaults(compact_two_zone_map=False)
+    parser.set_defaults(compact_two_zone_map=True)
 
     parser.add_argument(
         "--unified_dataset_mode",

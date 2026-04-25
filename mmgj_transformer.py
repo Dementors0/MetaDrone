@@ -1,5 +1,5 @@
-#9.2
-#转向损失在二维平面投影，加入探索损失测试组
+#9.2.3
+#时间权重替代
 
 import argparse
 import atexit

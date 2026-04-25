@@ -1,5 +1,5 @@
-#9.2
-#转向损失在二维平面投影，加入探索损失测试组
+#9.2.2
+#修改无人机坐标系
 
 import argparse
 import atexit
@@ -102,6 +102,47 @@ def safe_normalize(x, dim=-1, eps=1e-6):
 def safe_l2_norm(x, dim=-1, keepdim=False, eps=1e-6):
     x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return torch.sqrt((x * x).sum(dim=dim, keepdim=keepdim) + eps)
+
+
+def build_yaw_frame(R):
+    fwd = R[:, :, 0]
+    zeros = torch.zeros_like(fwd)
+    up = zeros.clone()
+    up[:, 2] = 1.0
+    fwd_h_raw = torch.stack([fwd[:, 0], fwd[:, 1], torch.zeros_like(fwd[:, 2])], dim=-1)
+    fwd_h_norm = safe_l2_norm(fwd_h_raw, dim=-1, keepdim=True)
+    fallback = zeros.clone()
+    fallback[:, 0] = 1.0
+    fwd_h = torch.where(fwd_h_norm > 1e-6, fwd_h_raw / fwd_h_norm.clamp_min(1e-6), fallback)
+    left = safe_normalize(torch.cross(up, fwd_h, dim=-1), dim=-1)
+    return torch.stack([fwd_h, left, up], -1)
+
+
+def compute_heading_reference(env, R_yaw, yaw_rate_max_value, yaw_ref_kp=3.0):
+    target_vec = env.p_target - env.p.detach()
+    zeros = torch.zeros_like(target_vec[:, 2])
+    heading_ref_world = torch.stack([target_vec[:, 0], target_vec[:, 1], zeros], dim=-1)
+    heading_norm = safe_l2_norm(heading_ref_world, dim=-1, keepdim=True)
+    fallback = R_yaw[:, :, 0]
+    heading_ref_world = torch.where(
+        heading_norm > 1e-6,
+        heading_ref_world / heading_norm.clamp_min(1e-6),
+        fallback,
+    )
+    heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
+    yaw_error = torch.atan2(heading_ref_local[:, 1], heading_ref_local[:, 0]).unsqueeze(-1)
+    yaw_rate_ref = torch.clamp(float(yaw_ref_kp) * yaw_error, -float(yaw_rate_max_value), float(yaw_rate_max_value))
+    return heading_ref_world, heading_ref_local[:, :2], yaw_rate_ref, yaw_error
+
+
+def decode_worker_action(act, R_yaw, yaw_rate_max_value):
+    B_local = act.shape[0]
+    act6 = act[:, :6]
+    a_pred, v_pred = (R_yaw @ act6.reshape(B_local, 3, 2)).unbind(-1)
+    yaw_rate_cmd = None
+    if act.shape[-1] > 6:
+        yaw_rate_cmd = torch.tanh(act[:, 6:7]) * float(yaw_rate_max_value)
+    return a_pred, v_pred, yaw_rate_cmd
 
 
 def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
@@ -294,6 +335,14 @@ parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v
                     help='Hard clip magnitude for velocity tensors (v_free/self.v) in env.run')
 parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
+parser.add_argument('--attitude_model', type=str, default='legacy', choices=['legacy', 'v2'],
+                    help='legacy uses v_pred-projected heading; v2 uses explicit yaw-rate dynamics')
+parser.add_argument('--yaw_control_source', type=str, default='rule', choices=['rule', 'model'],
+                    help='rule lets the dynamics compute yaw-rate from heading_ref; model uses act[...,6]')
+parser.add_argument('--yaw_rate_max_deg', type=float, default=150.0)
+parser.add_argument('--yaw_cmd_warmup_iters', type=int, default=2000)
+parser.add_argument('--coef_yaw_cmd', type=float, default=0.2)
+parser.add_argument('--coef_yaw_smooth', type=float, default=0.01)
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
 parser.add_argument('--lgn_timesteps', type=int, default=150,
@@ -492,6 +541,8 @@ parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 
 args = parser.parse_args()
+yaw_rate_max = math.radians(float(args.yaw_rate_max_deg))
+use_attitude_v2 = args.attitude_model == 'v2'
 
 # 统一 guidance 开关生效：根据 guidance_backend 映射为旧布尔参数，保持后续逻辑兼容。
 if args.guidance_backend == 'dijkstra_potential':
@@ -622,20 +673,22 @@ print(
     f"{env.update_state_vec_in_meta_path} (delta={_upstream_probe['delta']:.6g})"
 )
 
-state_dim = 7 if args.no_odom else 10
+base_state_dim = 7 if args.no_odom else 10
+state_dim = base_state_dim + (3 if use_attitude_v2 else 0)
+action_dim = 7 if use_attitude_v2 else 6
 geom_dim = 19
 progress_dim = 8
 
 if args.no_odom:
     try:
-        worknet = WorkNet(7, 6, max_seq_len=args.worker_max_seq_len)
+        worknet = WorkNet(state_dim, action_dim, max_seq_len=args.worker_max_seq_len)
     except TypeError:
-        worknet = WorkNet(7, 6)
+        worknet = WorkNet(state_dim, action_dim)
 else:
     try:
-        worknet = WorkNet(7 + 3, 6, max_seq_len=args.worker_max_seq_len)
+        worknet = WorkNet(state_dim, action_dim, max_seq_len=args.worker_max_seq_len)
     except TypeError:
-        worknet = WorkNet(7 + 3, 6)
+        worknet = WorkNet(state_dim, action_dim)
 worknet = worknet.to(device)
 
 try:
@@ -654,20 +707,56 @@ geom_normalizer = RunningMeanStd(shape=(geom_dim,)).to(device)
 progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
 
 ########## 4. 加载预训练模型 ##########
-# def load_checkpoint(model, path, name):
-#     if path and os.path.isfile(path):
-#         print(f"Loading {name} from {path}")
-#         model.load_state_dict(torch.load(path, map_location=device), strict=False)
-#     elif path:
-#         print(f"Warning: {name} path provided but file not found: {path}")
+def load_compatible_checkpoint(module, path, name, zero_expanded=True):
+    if not path:
+        return
+    if not os.path.isfile(path):
+        print(f"Warning: {name} path provided but file not found: {path}")
+        return
+    print(f"Loading {name} from {path}")
+    state_dict = torch.load(path, map_location=device)
+    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
 
-# load_checkpoint(worknet, args.resume_worker, "Worker")
-# load_checkpoint(lgn, args.resume_lgn, "LGN")
-# if args.resume_norm:
-#     load_checkpoint(state_normalizer, args.resume_norm, "Norm Stats")
-# elif args.resume_worker:
-#     norm_path = args.resume_worker.replace('worker_', 'norm_')
-#     load_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats")
+    target_state = module.state_dict()
+    compatible_state = {}
+    resized_keys = []
+    skipped_keys = []
+    for key, value in state_dict.items():
+        if key not in target_state:
+            skipped_keys.append(key)
+            continue
+        target_value = target_state[key]
+        if value.shape == target_value.shape:
+            compatible_state[key] = value
+            continue
+        if value.dim() != target_value.dim():
+            skipped_keys.append(key)
+            continue
+        expanded = torch.zeros_like(target_value) if zero_expanded else target_value.clone()
+        slices = tuple(slice(0, min(value.shape[d], target_value.shape[d])) for d in range(value.dim()))
+        expanded[slices] = value[slices]
+        compatible_state[key] = expanded
+        resized_keys.append((key, tuple(value.shape), tuple(target_value.shape)))
+
+    missing_keys, unexpected_keys = module.load_state_dict(compatible_state, strict=False)
+    if missing_keys:
+        print(f"{name} missing_keys:", missing_keys)
+    if unexpected_keys:
+        print(f"{name} unexpected_keys:", unexpected_keys)
+    if resized_keys:
+        print(f"{name} resized_keys:", resized_keys)
+    if skipped_keys:
+        print(f"{name} skipped_keys:", skipped_keys)
+
+
+load_compatible_checkpoint(worknet, args.resume_worker, "Worker", zero_expanded=True)
+load_compatible_checkpoint(lgn, args.resume_lgn, "LGN", zero_expanded=True)
+if args.resume_norm:
+    load_compatible_checkpoint(state_normalizer, args.resume_norm, "Norm Stats", zero_expanded=False)
+elif args.resume_worker:
+    norm_path = args.resume_worker.replace('worker_', 'norm_')
+    load_compatible_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats", zero_expanded=False)
 
 ########## 5. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
@@ -3051,7 +3140,7 @@ def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement
     return loss_stuck, loss_collision_duration, stuck_ratio
 
 
-def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
+def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device, iter_idx=0):
     """
     Validation rollout with virtually-updated worker params (via functional_call).
     Computes and returns meta_loss (position + collision + height) plus components.
@@ -3066,6 +3155,7 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
     act_buf = [env.act.detach()] * 2
     v_preds_val = []
     h_val = None
+    yaw_rate_max_value = math.radians(float(args.yaw_rate_max_deg))
 
     for t in range(args.lgn_timesteps):
         ctl_dt = 1.0 / 15.0
@@ -3083,8 +3173,13 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
                                     dtype=target_v_norm.dtype)
         target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
 
-        R = env.R
+        R = build_yaw_frame(env.R) if args.attitude_model == 'v2' else env.R
         state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        if args.attitude_model == 'v2':
+            heading_ref_world, heading_ref_local_xy, yaw_rate_ref, _ = compute_heading_reference(
+                env, R, yaw_rate_max_value)
+            yaw_rate_norm = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)) / float(yaw_rate_max_value)
+            state_list.extend([heading_ref_local_xy, yaw_rate_norm])
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom:
             state_list.insert(0, local_v)
@@ -3100,13 +3195,30 @@ def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, 
         act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, state_t, h_val))
         act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
+        if args.attitude_model == 'v2':
+            a_pred, v_pred, yaw_rate_cmd = decode_worker_action(act_out, R, yaw_rate_max_value)
+        else:
+            a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
+            yaw_rate_cmd = None
         v_preds_val.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         act_buf.append(real_act)
 
-        env.run(real_act, ctl_dt, target_v_raw)
+        if args.attitude_model == 'v2':
+            if args.yaw_control_source == 'model':
+                blend = min(1.0, float(iter_idx + 1) / max(1, int(args.yaw_cmd_warmup_iters)))
+                yaw_rate_used = (1.0 - blend) * yaw_rate_ref.detach() + blend * yaw_rate_cmd
+            else:
+                yaw_rate_used = None
+            env.run(
+                real_act, ctl_dt,
+                heading_ref=heading_ref_world,
+                yaw_rate_cmd=yaw_rate_used,
+                yaw_rate_max=yaw_rate_max_value,
+            )
+        else:
+            env.run(real_act, ctl_dt, target_v_raw)
 
         # Early termination when all drones reach their goals
         with torch.no_grad():
@@ -3240,6 +3352,9 @@ for i in pbar:
     act_buffer = [env.act.detach()] * 2
     trajectory_lgn_weights = []
     v_preds = []
+    yaw_rate_cmd_history = []
+    yaw_rate_ref_history = []
+    yaw_error_history = []
     act_for_diag = None
     dist_obj_history = []
     geom_feat_last = None
@@ -3274,8 +3389,13 @@ for i in pbar:
         max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device, dtype=target_v_norm.dtype)
         target_v = (target_v_raw_curr / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
 
-        R = env.R
+        R = build_yaw_frame(env.R) if use_attitude_v2 else env.R
         state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
+        if use_attitude_v2:
+            heading_ref_world, heading_ref_local_xy, yaw_rate_ref, yaw_error = compute_heading_reference(
+                env, R, yaw_rate_max)
+            yaw_rate_norm = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)) / float(yaw_rate_max)
+            state_list.extend([heading_ref_local_xy, yaw_rate_norm])
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
@@ -3324,14 +3444,34 @@ for i in pbar:
         act, _, h = worknet(x_pooled, state_tensor, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         act_for_diag = act
-        a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+        if use_attitude_v2:
+            a_pred, v_pred, yaw_rate_cmd = decode_worker_action(act, R, yaw_rate_max)
+        else:
+            a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+            yaw_rate_cmd = None
         v_preds.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         real_act_history.append(real_act.detach())
         act_buffer.append(real_act)
 
-        env.run(real_act, ctl_dt, target_v_raw_curr)
+        if use_attitude_v2:
+            if args.yaw_control_source == 'model':
+                blend = min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters)))
+                yaw_rate_used = (1.0 - blend) * yaw_rate_ref.detach() + blend * yaw_rate_cmd
+                yaw_rate_cmd_history.append(yaw_rate_cmd)
+                yaw_rate_ref_history.append(yaw_rate_ref)
+            else:
+                yaw_rate_used = None
+            yaw_error_history.append(yaw_error.detach())
+            env.run(
+                real_act, ctl_dt,
+                heading_ref=heading_ref_world,
+                yaw_rate_cmd=yaw_rate_used,
+                yaw_rate_max=yaw_rate_max,
+            )
+        else:
+            env.run(real_act, ctl_dt, target_v_raw_curr)
 
         # Early termination when all drones reach their goals
         with torch.no_grad():
@@ -3392,7 +3532,26 @@ for i in pbar:
     loss_exploration_seq = compute_overlap_loss_per_step(
         p_history, sigma=1.0, time_window=int(args.exploration_time_window)
     ).permute(1, 0)
-    loss_turn_seq = compute_turn_preference_loss(v_history, speed_threshold=0.2)
+    loss_turn_base_seq = compute_turn_preference_loss(v_history, speed_threshold=0.2)
+    zero_seq = torch.zeros_like(loss_turn_base_seq)
+    if use_attitude_v2 and args.yaw_control_source == 'model' and len(yaw_rate_cmd_history) > 0:
+        yaw_rate_cmd_seq = torch.stack(yaw_rate_cmd_history)  # [T, B, 1]
+        yaw_rate_ref_seq = torch.stack(yaw_rate_ref_history)
+        loss_yaw_cmd_seq = F.smooth_l1_loss(
+            yaw_rate_cmd_seq, yaw_rate_ref_seq.detach(), reduction='none').squeeze(-1)
+        if yaw_rate_cmd_seq.shape[0] > 1:
+            smooth_tail = yaw_rate_cmd_seq.diff(1, 0).pow(2).squeeze(-1)
+            loss_yaw_smooth_seq = torch.cat([torch.zeros_like(smooth_tail[:1]), smooth_tail], dim=0)
+        else:
+            loss_yaw_smooth_seq = zero_seq
+    else:
+        loss_yaw_cmd_seq = zero_seq
+        loss_yaw_smooth_seq = zero_seq
+    loss_turn_seq = (
+        loss_turn_base_seq
+        + args.coef_yaw_cmd * loss_yaw_cmd_seq
+        + args.coef_yaw_smooth * loss_yaw_smooth_seq
+    )
 
     loss_stuck_seq, loss_collision_duration_seq, stuck_ratio = compute_stuck_loss(
         p_history, collision_depth,
@@ -3459,6 +3618,8 @@ for i in pbar:
         _diag_tensor_finite("loss_avoidance_seq", loss_avoidance_seq, i)
         _diag_tensor_finite("loss_exploration_seq", loss_exploration_seq, i)
         _diag_tensor_finite("loss_turn_seq", loss_turn_seq, i)
+        _diag_tensor_finite("loss_yaw_cmd_seq", loss_yaw_cmd_seq, i)
+        _diag_tensor_finite("loss_yaw_smooth_seq", loss_yaw_smooth_seq, i)
         _diag_tensor_finite("weights_seq_raw", weights_seq_raw, i)
         _diag_tensor_finite("weighted_loss_map", weighted_loss_map, i)
         _diag_tensor_finite("proxy_loss", proxy_loss, i)
@@ -3710,7 +3871,7 @@ for i in pbar:
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
         meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
-            unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
+            unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device, iter_idx=i)
         if not torch.isfinite(meta_loss_unrolled):
             if term_log_now:
                 pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
@@ -3821,6 +3982,18 @@ for i in pbar:
         act_cmd_mean = real_act_history.mean(dim=(0, 1))
         act_cmd_abs_mean = real_act_history.abs().mean(dim=(0, 1))
         act_cmd_norm_mean = real_act_history.norm(dim=-1).mean()
+        if len(yaw_error_history) > 0:
+            yaw_error_abs_deg = torch.stack(yaw_error_history).abs().mean() * (180.0 / math.pi)
+            yaw_rate_env_abs_deg = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)).abs().mean() * (180.0 / math.pi)
+        else:
+            yaw_error_abs_deg = torch.tensor(0.0, device=device)
+            yaw_rate_env_abs_deg = torch.tensor(0.0, device=device)
+        if use_attitude_v2 and args.yaw_control_source == 'model' and len(yaw_rate_cmd_history) > 0:
+            yaw_rate_cmd_abs_deg = torch.stack(yaw_rate_cmd_history).abs().mean() * (180.0 / math.pi)
+            yaw_rate_ref_abs_deg = torch.stack(yaw_rate_ref_history).abs().mean() * (180.0 / math.pi)
+        else:
+            yaw_rate_cmd_abs_deg = torch.tensor(0.0, device=device)
+            yaw_rate_ref_abs_deg = torch.tensor(0.0, device=device)
         
         log_data = {
             # === 主要Loss ===
@@ -3834,6 +4007,9 @@ for i in pbar:
             'Proxy_Comp/2_1_Collision_Depth': collision_depth.mean(),#穿入墙体深度
             'Proxy_Comp/3_Exploration': loss_exploration_seq.mean(),
             'Proxy_Comp/4_Turn': loss_turn_seq.mean(),
+            'Proxy_Comp/4_0_Turn_Base': loss_turn_base_seq.mean(),
+            'Proxy_Comp/4_1_Yaw_Cmd': loss_yaw_cmd_seq.mean(),
+            'Proxy_Comp/4_2_Yaw_Smooth': loss_yaw_smooth_seq.mean(),
             'Proxy_Comp/5_Height': loss_height_seq.mean(),
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
@@ -3891,6 +4067,11 @@ for i in pbar:
             'Control/Accel_Cmd_X_AbsMean': act_cmd_abs_mean[0],
             'Control/Accel_Cmd_Y_AbsMean': act_cmd_abs_mean[1],
             'Control/Accel_Cmd_Z_AbsMean': act_cmd_abs_mean[2],
+            'Heading/Yaw_Error_Abs_Deg': yaw_error_abs_deg,
+            'Heading/Yaw_Rate_Env_Abs_Deg': yaw_rate_env_abs_deg,
+            'Heading/Yaw_Rate_Cmd_Abs_Deg': yaw_rate_cmd_abs_deg,
+            'Heading/Yaw_Rate_Ref_Abs_Deg': yaw_rate_ref_abs_deg,
+            'Heading/Yaw_Blend': min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters))) if use_attitude_v2 else 0.0,
 
             # === [对齐] 归一化统计命名（与第二脚本风格一致） ===
             'Norm/State_Mean': state_normalizer.mean[0],

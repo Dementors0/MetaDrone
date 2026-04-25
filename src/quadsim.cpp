@@ -41,6 +41,18 @@ torch::Tensor update_state_vec_cuda(
     torch::Tensor alpha,
     float yaw_inertia);
 
+std::vector<torch::Tensor> update_state_vec_v2_cuda(
+    torch::Tensor R,
+    torch::Tensor a_thr,
+    torch::Tensor heading_ref,
+    torch::Tensor yaw_rate,
+    torch::Tensor yaw_rate_cmd,
+    torch::Tensor alpha,
+    float ctl_dt,
+    float yaw_rate_max,
+    float yaw_ref_kp,
+    bool use_yaw_rate_cmd);
+
 std::vector<torch::Tensor> run_forward_cuda(
     torch::Tensor R,
     torch::Tensor dg,
@@ -122,6 +134,22 @@ torch::Tensor update_state_vec_first_order_cuda(
     return update_state_vec_cuda(R, a_thr, v_pred, alpha, yaw_inertia);
 }
 
+std::vector<torch::Tensor> update_state_vec_v2_first_order_cuda(
+        torch::Tensor R,
+        torch::Tensor a_thr,
+        torch::Tensor heading_ref,
+        torch::Tensor yaw_rate,
+        torch::Tensor yaw_rate_cmd,
+        torch::Tensor alpha,
+        float ctl_dt,
+        float yaw_rate_max,
+        float yaw_ref_kp,
+        bool use_yaw_rate_cmd) {
+    return update_state_vec_v2_cuda(
+            R, a_thr, heading_ref, yaw_rate, yaw_rate_cmd, alpha,
+            ctl_dt, yaw_rate_max, yaw_ref_kp, use_yaw_rate_cmd);
+}
+
 // C++ interface
 
 // // NOTE: AT_ASSERT has become AT_CHECK on master after 0.4.
@@ -149,6 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("render", &render_cuda, "render (CUDA)");
   m.def("find_nearest_pt", &find_nearest_pt_cuda, "find_nearest_pt (CUDA)");
   m.def("update_state_vec", &update_state_vec_cuda, "update_state_vec (CUDA)");
+  m.def("update_state_vec_v2", &update_state_vec_v2_cuda, "update_state_vec_v2 explicit yaw-rate (CUDA)");
   m.def("run_forward", &run_forward_cuda, "run_forward_cuda (CUDA)");
   m.def("run_backward", &run_backward_cuda, "run_backward_cuda (CUDA)");
   m.def("rerender_backward", &rerender_backward_cuda, "rerender_backward_cuda (CUDA)");
@@ -157,4 +186,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_forward_first_order", &run_forward_first_order_cuda, "run_forward first-order (CUDA)");
     m.def("run_backward_first_order", &run_backward_first_order_cuda, "run_backward first-order (CUDA)");
     m.def("update_state_vec_first_order", &update_state_vec_first_order_cuda, "update_state_vec first-order (CUDA)");
+    m.def("update_state_vec_v2_first_order", &update_state_vec_v2_first_order_cuda, "update_state_vec_v2 first-order (CUDA)");
 }

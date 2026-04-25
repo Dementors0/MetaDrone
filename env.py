@@ -127,6 +127,70 @@ def update_state_vec_torch(R, a_thr, v_pred, alpha, yaw_inertia=2, eps=1e-6):
     return r_new
 
 
+def update_state_vec_torch_v2(
+    R,
+    a_thr,
+    heading_ref,
+    alpha,
+    yaw_rate,
+    yaw_rate_cmd=None,
+    ctl_dt=1 / 15,
+    yaw_rate_max=math.radians(150.0),
+    yaw_ref_kp=3.0,
+    eps=1e-6,
+):
+    """Explicit yaw-rate attitude update.
+
+    The thrust vector still defines the body z axis. The body x axis is advanced
+    in the horizontal plane by yaw_rate, then projected onto the thrust plane.
+    """
+    g_std = a_thr.new_tensor([0.0, 0.0, -9.80665]).view(1, 3)
+    up = safe_normalize(a_thr - g_std, dim=-1, eps=eps)
+
+    zeros = torch.zeros_like(R[:, 0, 0])
+    cur_h = torch.stack([R[:, 0, 0], R[:, 1, 0], zeros], dim=-1)
+    ref_h = torch.stack([heading_ref[:, 0], heading_ref[:, 1], zeros], dim=-1)
+
+    cur_h_norm = torch.norm(cur_h, 2, -1, keepdim=True)
+    ref_h_norm = torch.norm(ref_h, 2, -1, keepdim=True)
+    cur_h = torch.where(cur_h_norm > eps, cur_h / cur_h_norm.clamp_min(eps), safe_normalize(ref_h, dim=-1, eps=eps))
+    ref_h = torch.where(ref_h_norm > eps, ref_h / ref_h_norm.clamp_min(eps), cur_h)
+
+    cross_z = cur_h[:, 0] * ref_h[:, 1] - cur_h[:, 1] * ref_h[:, 0]
+    dot_xy = (cur_h[:, :2] * ref_h[:, :2]).sum(-1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    yaw_error = torch.atan2(cross_z, dot_xy).unsqueeze(-1)
+    yaw_rate_ref = torch.clamp(float(yaw_ref_kp) * yaw_error, -float(yaw_rate_max), float(yaw_rate_max))
+
+    if yaw_rate_cmd is None:
+        yaw_cmd = yaw_rate_ref
+    else:
+        yaw_cmd = torch.clamp(yaw_rate_cmd, -float(yaw_rate_max), float(yaw_rate_max))
+    yaw_cmd = torch.nan_to_num(yaw_cmd, nan=0.0, posinf=float(yaw_rate_max), neginf=-float(yaw_rate_max))
+
+    yaw_rate_next = yaw_rate * alpha + yaw_cmd * (1 - alpha)
+    yaw_rate_next = torch.clamp(yaw_rate_next, -float(yaw_rate_max), float(yaw_rate_max))
+
+    dpsi = yaw_rate_next[:, 0] * float(ctl_dt)
+    c = torch.cos(dpsi)
+    s = torch.sin(dpsi)
+    fwd_h = torch.stack([
+        c * cur_h[:, 0] - s * cur_h[:, 1],
+        s * cur_h[:, 0] + c * cur_h[:, 1],
+        zeros,
+    ], dim=-1)
+
+    fwd = fwd_h - (fwd_h * up).sum(-1, keepdim=True) * up
+    fwd_norm = torch.norm(fwd, 2, -1, keepdim=True)
+    fallback = ref_h - (ref_h * up).sum(-1, keepdim=True) * up
+    fallback = safe_normalize(fallback, dim=-1, eps=eps)
+    fwd = torch.where(fwd_norm > eps, fwd / fwd_norm.clamp_min(eps), fallback)
+
+    left = safe_normalize(torch.cross(up, fwd, dim=-1), dim=-1, eps=eps)
+    fwd = safe_normalize(torch.cross(left, up, dim=-1), dim=-1, eps=eps)
+    r_new = torch.stack([fwd, left, up], dim=-1)
+    return r_new, yaw_rate_next
+
+
 @torch.no_grad()
 def probe_update_state_vec_common_upstream(device, batch_size=8):
     """Classify whether update_state_vec sits on the shared upstream of proxy losses."""
@@ -490,6 +554,7 @@ class Env:
 
         self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
         self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
+        self.yaw_rate = torch.zeros((B, 1), device=device)
 
         self.v = torch.randn((B, 3), device=device) * 0.2
         self.v_wind = torch.randn((B, 3), device=device) * self.v_wind_w
@@ -625,10 +690,27 @@ class Env:
         quadsim_cuda.find_nearest_pt(nearest_pt, self.balls, self.cyl, self.cyl_h, self.voxels, p, self.drone_radius, self.n_drones_per_group)
         return nearest_pt - p
 
-    def run(self, act_pred, ctl_dt=1/15, v_pred=None):
+    def run(
+        self,
+        act_pred,
+        ctl_dt=1/15,
+        v_pred=None,
+        heading_ref=None,
+        yaw_rate_cmd=None,
+        yaw_rate_max=None,
+        yaw_ref_kp=3.0,
+    ):
         act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         if v_pred is not None:
             v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=self.hard_vpred_clip, neginf=-self.hard_vpred_clip).clamp(-self.hard_vpred_clip, self.hard_vpred_clip)
+        use_explicit_yaw = heading_ref is not None or yaw_rate_cmd is not None
+        if use_explicit_yaw:
+            if heading_ref is None:
+                heading_ref = v_pred if v_pred is not None else self.R[:, :, 0].detach()
+            heading_ref = torch.nan_to_num(heading_ref, nan=0.0, posinf=self.hard_vpred_clip, neginf=-self.hard_vpred_clip).clamp(-self.hard_vpred_clip, self.hard_vpred_clip)
+            if yaw_rate_cmd is not None:
+                max_yaw = math.radians(150.0) if yaw_rate_max is None else float(yaw_rate_max)
+                yaw_rate_cmd = torch.nan_to_num(yaw_rate_cmd, nan=0.0, posinf=max_yaw, neginf=-max_yaw).clamp(-max_yaw, max_yaw)
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
         dyn_fn = run_torch if self.use_meta_differentiable_dynamics else run
@@ -651,7 +733,27 @@ class Env:
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
         self.R_old = self.R.clone()
-        if self.use_meta_differentiable_dynamics:
+        if use_explicit_yaw:
+            if not hasattr(self, "yaw_rate"):
+                self.yaw_rate = torch.zeros((self.batch_size, 1), device=self.device)
+            max_yaw = math.radians(150.0) if yaw_rate_max is None else float(yaw_rate_max)
+            use_torch_attitude = (
+                self.use_meta_differentiable_dynamics
+                or (yaw_rate_cmd is not None and yaw_rate_cmd.requires_grad)
+                or not hasattr(quadsim_cuda, "update_state_vec_v2")
+            )
+            if use_torch_attitude:
+                self.R, self.yaw_rate = update_state_vec_torch_v2(
+                    self.R, self.act, heading_ref, alpha, self.yaw_rate,
+                    yaw_rate_cmd=yaw_rate_cmd, ctl_dt=ctl_dt,
+                    yaw_rate_max=max_yaw, yaw_ref_kp=yaw_ref_kp,
+                )
+            else:
+                yaw_rate_cmd_arg = torch.zeros_like(self.yaw_rate) if yaw_rate_cmd is None else yaw_rate_cmd
+                self.R, self.yaw_rate = quadsim_cuda.update_state_vec_v2(
+                    self.R, self.act, heading_ref, self.yaw_rate, yaw_rate_cmd_arg,
+                    alpha, float(ctl_dt), max_yaw, float(yaw_ref_kp), yaw_rate_cmd is not None)
+        elif self.use_meta_differentiable_dynamics:
             self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
         else:
             self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 2)

@@ -59,6 +59,138 @@ __global__ void update_state_vec_cuda_kernel(
 
 
 template <typename scalar_t>
+__global__ void update_state_vec_v2_cuda_kernel(
+    torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R_new,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> yaw_rate_new,
+    torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> a_thr,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> heading_ref,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> yaw_rate,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> yaw_rate_cmd,
+    torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> alpha,
+    float ctl_dt,
+    float yaw_rate_max,
+    float yaw_ref_kp,
+    bool use_yaw_rate_cmd) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    const int B = R.size(0);
+    if (b >= B) return;
+
+    const scalar_t eps = static_cast<scalar_t>(1e-6);
+
+    scalar_t ax = a_thr[b][0];
+    scalar_t ay = a_thr[b][1];
+    scalar_t az = a_thr[b][2] + static_cast<scalar_t>(9.80665);
+    scalar_t thrust_sq = ax * ax + ay * ay + az * az;
+    scalar_t thrust = sqrt(thrust_sq > eps ? thrust_sq : eps);
+    scalar_t ux = ax / thrust;
+    scalar_t uy = ay / thrust;
+    scalar_t uz = az / thrust;
+
+    scalar_t cur_x = R[b][0][0];
+    scalar_t cur_y = R[b][1][0];
+    scalar_t cur_norm = sqrt(cur_x * cur_x + cur_y * cur_y);
+    scalar_t ref_x = heading_ref[b][0];
+    scalar_t ref_y = heading_ref[b][1];
+    scalar_t ref_norm = sqrt(ref_x * ref_x + ref_y * ref_y);
+
+    if (ref_norm > eps) {
+        ref_x /= ref_norm;
+        ref_y /= ref_norm;
+    } else {
+        ref_x = cur_x;
+        ref_y = cur_y;
+        ref_norm = sqrt(ref_x * ref_x + ref_y * ref_y);
+        if (ref_norm > eps) {
+            ref_x /= ref_norm;
+            ref_y /= ref_norm;
+        } else {
+            ref_x = static_cast<scalar_t>(1);
+            ref_y = static_cast<scalar_t>(0);
+        }
+    }
+
+    if (cur_norm > eps) {
+        cur_x /= cur_norm;
+        cur_y /= cur_norm;
+    } else {
+        cur_x = ref_x;
+        cur_y = ref_y;
+    }
+
+    scalar_t cross_z = cur_x * ref_y - cur_y * ref_x;
+    scalar_t dot_xy = cur_x * ref_x + cur_y * ref_y;
+    dot_xy = dot_xy > static_cast<scalar_t>(1.0 - 1e-6) ? static_cast<scalar_t>(1.0 - 1e-6) : dot_xy;
+    dot_xy = dot_xy < static_cast<scalar_t>(-1.0 + 1e-6) ? static_cast<scalar_t>(-1.0 + 1e-6) : dot_xy;
+    scalar_t yaw_error = atan2(cross_z, dot_xy);
+    scalar_t cmd = static_cast<scalar_t>(yaw_ref_kp) * yaw_error;
+    if (use_yaw_rate_cmd) {
+        cmd = yaw_rate_cmd[b][0];
+    }
+    const scalar_t max_yaw = static_cast<scalar_t>(yaw_rate_max);
+    cmd = cmd > max_yaw ? max_yaw : cmd;
+    cmd = cmd < -max_yaw ? -max_yaw : cmd;
+
+    scalar_t yr = yaw_rate[b][0] * alpha[b][0] + cmd * (static_cast<scalar_t>(1) - alpha[b][0]);
+    yr = yr > max_yaw ? max_yaw : yr;
+    yr = yr < -max_yaw ? -max_yaw : yr;
+    yaw_rate_new[b][0] = yr;
+
+    scalar_t dpsi = yr * static_cast<scalar_t>(ctl_dt);
+    scalar_t c = cos(dpsi);
+    scalar_t s = sin(dpsi);
+    scalar_t hx = c * cur_x - s * cur_y;
+    scalar_t hy = s * cur_x + c * cur_y;
+    scalar_t hz = static_cast<scalar_t>(0);
+
+    scalar_t dot_up = hx * ux + hy * uy + hz * uz;
+    scalar_t fx = hx - dot_up * ux;
+    scalar_t fy = hy - dot_up * uy;
+    scalar_t fz = hz - dot_up * uz;
+    scalar_t f_norm = sqrt(fx * fx + fy * fy + fz * fz);
+    if (f_norm <= eps) {
+        scalar_t ref_dot_up = ref_x * ux + ref_y * uy;
+        fx = ref_x - ref_dot_up * ux;
+        fy = ref_y - ref_dot_up * uy;
+        fz = -ref_dot_up * uz;
+        f_norm = sqrt(fx * fx + fy * fy + fz * fz);
+    }
+    f_norm = f_norm > eps ? f_norm : eps;
+    fx /= f_norm;
+    fy /= f_norm;
+    fz /= f_norm;
+
+    scalar_t lx = uy * fz - uz * fy;
+    scalar_t ly = uz * fx - ux * fz;
+    scalar_t lz = ux * fy - uy * fx;
+    scalar_t l_norm = sqrt(lx * lx + ly * ly + lz * lz);
+    l_norm = l_norm > eps ? l_norm : eps;
+    lx /= l_norm;
+    ly /= l_norm;
+    lz /= l_norm;
+
+    fx = ly * uz - lz * uy;
+    fy = lz * ux - lx * uz;
+    fz = lx * uy - ly * ux;
+    f_norm = sqrt(fx * fx + fy * fy + fz * fz);
+    f_norm = f_norm > eps ? f_norm : eps;
+    fx /= f_norm;
+    fy /= f_norm;
+    fz /= f_norm;
+
+    R_new[b][0][0] = fx;
+    R_new[b][0][1] = lx;
+    R_new[b][0][2] = ux;
+    R_new[b][1][0] = fy;
+    R_new[b][1][1] = ly;
+    R_new[b][1][2] = uy;
+    R_new[b][2][0] = fz;
+    R_new[b][2][1] = lz;
+    R_new[b][2][2] = uz;
+}
+
+
+template <typename scalar_t>
 __global__ void run_forward_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,3,torch::RestrictPtrTraits,size_t> R,
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> dg,
@@ -381,4 +513,37 @@ torch::Tensor update_state_vec_cuda(
             yaw_inertia);
     }));
     return R_new;
+}
+
+std::vector<torch::Tensor> update_state_vec_v2_cuda(
+    torch::Tensor R,
+    torch::Tensor a_thr,
+    torch::Tensor heading_ref,
+    torch::Tensor yaw_rate,
+    torch::Tensor yaw_rate_cmd,
+    torch::Tensor alpha,
+    float ctl_dt,
+    float yaw_rate_max,
+    float yaw_ref_kp,
+    bool use_yaw_rate_cmd) {
+    const int threads = a_thr.size(0);
+    const dim3 blocks(1);
+    torch::Tensor R_new = torch::empty_like(R);
+    torch::Tensor yaw_rate_new = torch::empty_like(yaw_rate);
+    AT_DISPATCH_FLOATING_TYPES(a_thr.scalar_type(), "update_state_vec_v2", ([&] {
+        update_state_vec_v2_cuda_kernel<scalar_t><<<blocks, threads>>>(
+            R_new.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),
+            yaw_rate_new.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            R.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),
+            a_thr.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            heading_ref.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            yaw_rate.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            yaw_rate_cmd.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            alpha.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
+            ctl_dt,
+            yaw_rate_max,
+            yaw_ref_kp,
+            use_yaw_rate_cmd);
+    }));
+    return {R_new, yaw_rate_new};
 }

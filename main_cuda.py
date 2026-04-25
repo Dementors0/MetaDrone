@@ -40,6 +40,14 @@ parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='control je
 parser.add_argument('--coef_d_snap', type=float, default=0.0, help='legacy')
 parser.add_argument('--coef_ground_affinity', type=float, default=0., help='legacy')
 parser.add_argument('--coef_bias', type=float, default=0.0, help='legacy')
+parser.add_argument('--attitude_model', type=str, default='legacy', choices=['legacy', 'v2'],
+                    help='legacy uses v_pred-projected heading; v2 uses explicit yaw-rate dynamics')
+parser.add_argument('--yaw_control_source', type=str, default='rule', choices=['rule', 'model'],
+                    help='rule lets the dynamics compute yaw-rate from heading_ref; model uses act[...,6]')
+parser.add_argument('--yaw_rate_max_deg', type=float, default=150.0)
+parser.add_argument('--yaw_cmd_warmup_iters', type=int, default=2000)
+parser.add_argument('--coef_yaw_cmd', type=float, default=0.2)
+parser.add_argument('--coef_yaw_smooth', type=float, default=0.01)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--grad_decay', type=float, default=0.4)
 parser.add_argument('--speed_mtp', type=float, default=1.0)
@@ -82,6 +90,8 @@ print(args)
 print(f"Training artifacts will be saved to: {save_dir}")
 
 device = torch.device('cuda')
+yaw_rate_max = math.radians(float(args.yaw_rate_max_deg))
+use_attitude_v2 = args.attitude_model == 'v2'
 
 ##########初始化仿真环境##########
 env = Env(args.batch_size, 64, 48, args.grad_decay, device,
@@ -95,20 +105,46 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           wall_physical_feedback=args.wall_physical_feedback)
 
 ##########初始化神经网络##########
-if args.no_odom:
-    model = Model(7, 6)
-else:
-    model = Model(7+3, 6)
+base_state_dim = 7 if args.no_odom else 10
+state_dim = base_state_dim + (3 if use_attitude_v2 else 0)
+action_dim = 7 if use_attitude_v2 else 6
+model = Model(state_dim, action_dim)
 model = model.to(device)
 
 ##########使用预训练模型/继续训练原有的模型##########
 if args.resume:
     state_dict = torch.load(args.resume, map_location=device)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, False)
+    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
+    target_state = model.state_dict()
+    compatible_state = {}
+    resized_keys = []
+    skipped_keys = []
+    for key, value in state_dict.items():
+        if key not in target_state:
+            skipped_keys.append(key)
+            continue
+        target_value = target_state[key]
+        if value.shape == target_value.shape:
+            compatible_state[key] = value
+            continue
+        if value.dim() != target_value.dim():
+            skipped_keys.append(key)
+            continue
+        expanded = torch.zeros_like(target_value)
+        slices = tuple(slice(0, min(value.shape[d], target_value.shape[d])) for d in range(value.dim()))
+        expanded[slices] = value[slices]
+        compatible_state[key] = expanded
+        resized_keys.append((key, tuple(value.shape), tuple(target_value.shape)))
+    missing_keys, unexpected_keys = model.load_state_dict(compatible_state, False)
     if missing_keys:
         print("missing_keys:", missing_keys)
     if unexpected_keys:
         print("unexpected_keys:", unexpected_keys)
+    if resized_keys:
+        print("resized_keys:", resized_keys)
+    if skipped_keys:
+        print("skipped_keys:", skipped_keys)
 
 ##########优化器##########
 optim = AdamW(model.parameters(), args.lr)
@@ -150,6 +186,47 @@ def rotation_matrix_to_rpy_deg(R):
     roll = torch.atan2(r21, r22)
     yaw = torch.atan2(r10, r00)
     return torch.stack([roll, pitch, yaw], dim=-1) * (180.0 / math.pi)
+
+
+def build_yaw_frame(R):
+    fwd = R[:, :, 0]
+    zeros = torch.zeros_like(fwd)
+    up = zeros.clone()
+    up[:, 2] = 1.0
+    fwd_h_raw = torch.stack([fwd[:, 0], fwd[:, 1], torch.zeros_like(fwd[:, 2])], dim=-1)
+    fwd_h_norm = torch.norm(fwd_h_raw, 2, -1, keepdim=True)
+    fallback = zeros.clone()
+    fallback[:, 0] = 1.0
+    fwd_h = torch.where(fwd_h_norm > 1e-6, fwd_h_raw / fwd_h_norm.clamp_min(1e-6), fallback)
+    left = F.normalize(torch.cross(up, fwd_h, dim=-1), 2, -1, eps=1e-6)
+    return torch.stack([fwd_h, left, up], -1)
+
+
+def compute_heading_reference(env, R_yaw, yaw_rate_max_value, yaw_ref_kp=3.0):
+    target_vec = env.p_target - env.p.detach()
+    zeros = torch.zeros_like(target_vec[:, 2])
+    heading_ref_world = torch.stack([target_vec[:, 0], target_vec[:, 1], zeros], dim=-1)
+    heading_norm = torch.norm(heading_ref_world, 2, -1, keepdim=True)
+    fallback = R_yaw[:, :, 0]
+    heading_ref_world = torch.where(
+        heading_norm > 1e-6,
+        heading_ref_world / heading_norm.clamp_min(1e-6),
+        fallback,
+    )
+    heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
+    yaw_error = torch.atan2(heading_ref_local[:, 1], heading_ref_local[:, 0]).unsqueeze(-1)
+    yaw_rate_ref = torch.clamp(float(yaw_ref_kp) * yaw_error, -float(yaw_rate_max_value), float(yaw_rate_max_value))
+    return heading_ref_world, heading_ref_local[:, :2], yaw_rate_ref, yaw_error
+
+
+def decode_worker_action(act, R_yaw, yaw_rate_max_value):
+    B_local = act.shape[0]
+    act6 = act[:, :6]
+    a_pred, v_pred = (R_yaw @ act6.reshape(B_local, 3, 2)).unbind(-1)
+    yaw_rate_cmd = None
+    if act.shape[-1] > 6:
+        yaw_rate_cmd = torch.tanh(act[:, 6:7]) * float(yaw_rate_max_value)
+    return a_pred, v_pred, yaw_rate_cmd
 
 
 def _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.68):
@@ -341,6 +418,9 @@ for i in pbar:
     rpy_history = []
     act_cmd_history = []
     target_v_history = []
+    yaw_rate_cmd_history = []
+    yaw_rate_ref_history = []
+    yaw_error_history = []
     vec_to_pt_history = []
     act_diff_history = []
     v_preds = []
@@ -351,6 +431,7 @@ for i in pbar:
     ######模拟控制延迟######
     act_lag = 1
     act_buffer = [env.act] * (act_lag + 1)
+    yaw_rate_buffer = [torch.zeros((B, 1), device=device)] * (act_lag + 1)
     ######计算初始目标向量######
     target_v_raw = env.p_target - env.p
     ######偏航角角速度偏移######
@@ -384,17 +465,22 @@ for i in pbar:
             target_v_raw = env.p_target - env.p.detach()
 
         ####仿真器执行一个时间步####
-        env.run(act_buffer[t], ctl_dt, target_v_raw)
+        if use_attitude_v2:
+            R_yaw_pre = build_yaw_frame(env.R)
+            heading_ref_world_pre, _, _, _ = compute_heading_reference(env, R_yaw_pre, yaw_rate_max)
+            yaw_rate_step = yaw_rate_buffer[t] if args.yaw_control_source == 'model' else None
+            env.run(
+                act_buffer[t], ctl_dt,
+                heading_ref=heading_ref_world_pre,
+                yaw_rate_cmd=yaw_rate_step,
+                yaw_rate_max=yaw_rate_max,
+            )
+        else:
+            env.run(act_buffer[t], ctl_dt, target_v_raw)
 
         ####构建航向旋转矩阵####
         ##去除了滚转（Roll）和俯仰（Pitch）”的纯偏航（Yaw）旋转矩阵##
-        R = env.R
-        fwd = env.R[:, :, 0].clone()
-        up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0
-        up[:, 2] = 1
-        fwd = F.normalize(fwd, 2, -1)
-        R = torch.stack([fwd, torch.cross(up, fwd, dim=-1), up], -1)
+        R = build_yaw_frame(env.R)
 
         ####计算理想参考速度####
         ##计算到目标的距离 target_v_raw 的模长##
@@ -413,6 +499,10 @@ for i in pbar:
             env.R[:, 2],
             ##安全半径##
             env.margin[:, None]]
+        if use_attitude_v2:
+            heading_ref_world, heading_ref_local_xy, yaw_rate_ref, yaw_error = compute_heading_reference(env, R, yaw_rate_max)
+            yaw_rate_norm = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)) / float(yaw_rate_max)
+            state.extend([heading_ref_local_xy, yaw_rate_norm])
         ####计算 无人机相对于自身机头方向的飞行速度####
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom:
@@ -427,11 +517,25 @@ for i in pbar:
         x = F.max_pool2d(x[:, None], 4, 4)
         act, values, h = model(x, state, h)
 
-        #神经网络预测加速度，预测速度，垃圾桶变量1
-        a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+        #神经网络预测加速度，预测速度；v2 额外预测 yaw_rate_cmd
+        if use_attitude_v2:
+            a_pred, v_pred, yaw_rate_cmd = decode_worker_action(act, R, yaw_rate_max)
+        else:
+            a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
+            yaw_rate_cmd = None
         v_preds.append(v_pred)
         act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         act_buffer.append(act)
+        if use_attitude_v2:
+            if args.yaw_control_source == 'model':
+                blend = min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters)))
+                yaw_rate_used = (1.0 - blend) * yaw_rate_ref.detach() + blend * yaw_rate_cmd
+                yaw_rate_cmd_history.append(yaw_rate_cmd)
+                yaw_rate_ref_history.append(yaw_rate_ref)
+            else:
+                yaw_rate_used = yaw_rate_ref.detach()
+            yaw_rate_buffer.append(yaw_rate_used)
+            yaw_error_history.append(yaw_error.detach())
         act_cmd_history.append(act_buffer[t])
         v_net_feats.append(torch.cat([act, local_v, h], -1))
         v_history.append(env.v)
@@ -473,6 +577,18 @@ for i in pbar:
     loss_d_acc = act_buffer.pow(2).sum(-1).mean()
     loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
     loss_d_snap = snap_history.pow(2).sum(-1).mean()
+    zero_loss = loss_d_acc.new_tensor(0.0)
+    if use_attitude_v2 and args.yaw_control_source == 'model' and len(yaw_rate_cmd_history) > 0:
+        yaw_rate_cmd_tensor = torch.stack(yaw_rate_cmd_history)
+        yaw_rate_ref_tensor = torch.stack(yaw_rate_ref_history)
+        loss_yaw_cmd = F.smooth_l1_loss(yaw_rate_cmd_tensor, yaw_rate_ref_tensor.detach())
+        if yaw_rate_cmd_tensor.shape[0] > 1:
+            loss_yaw_smooth = yaw_rate_cmd_tensor.diff(1, 0).pow(2).mean()
+        else:
+            loss_yaw_smooth = zero_loss
+    else:
+        loss_yaw_cmd = zero_loss
+        loss_yaw_smooth = zero_loss
 
     ####避障损失和碰撞损失####
     vec_to_pt_history = torch.stack(vec_to_pt_history)
@@ -497,6 +613,8 @@ for i in pbar:
         args.coef_speed * loss_speed + \
         args.coef_v_pred * loss_v_pred + \
         args.coef_collide * loss_collide + \
+        args.coef_yaw_cmd * loss_yaw_cmd + \
+        args.coef_yaw_smooth * loss_yaw_smooth + \
         args.coef_ground_affinity + loss_ground_affinity
 
     if torch.isnan(loss):
@@ -518,6 +636,12 @@ for i in pbar:
             collision_free = torch.all(distance.flatten(0, 1) > 0, dim=0)
         dist_to_goal = torch.norm(p_history - env.p_target.unsqueeze(0), 2, -1)
         final_dist_to_goal = dist_to_goal[-1]
+        if len(yaw_error_history) > 0:
+            yaw_error_abs_deg = torch.stack(yaw_error_history).abs().mean() * (180.0 / math.pi)
+            yaw_rate_env_abs_deg = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)).abs().mean() * (180.0 / math.pi)
+        else:
+            yaw_error_abs_deg = torch.tensor(0.0, device=device)
+            yaw_rate_env_abs_deg = torch.tensor(0.0, device=device)
         reached_goal = torch.any(dist_to_goal < args.goal_radius, dim=0)
         success = collision_free & reached_goal
         _success = success.float().mean()
@@ -534,6 +658,8 @@ for i in pbar:
             'loss_speed': loss_speed,
             'loss_collide': loss_collide,
             'loss_ground_affinity': loss_ground_affinity,
+            'loss_yaw_cmd': loss_yaw_cmd,
+            'loss_yaw_smooth': loss_yaw_smooth,
             'success': _success,
             'no_collision_rate': _no_collision_rate,
             'reach_goal_rate': reached_goal.float().mean(),
@@ -542,6 +668,9 @@ for i in pbar:
             'final_dist_to_goal_max': final_dist_to_goal.max(),
             'max_speed': speed_history.max(0).values.mean(),
             'avg_speed': avg_speed.mean(),
+            'Heading/Yaw_Error_Abs_Deg': yaw_error_abs_deg,
+            'Heading/Yaw_Rate_Abs_Deg': yaw_rate_env_abs_deg,
+            'Heading/Yaw_Blend': min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters))) if use_attitude_v2 else 0.0,
             'ar': (success.float() * avg_speed).mean()})
         log_dict = {}
         if is_save_trajectory_iter(i):

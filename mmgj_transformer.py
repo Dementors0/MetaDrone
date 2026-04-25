@@ -270,8 +270,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--num_iters', type=int, default=2000)
+parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--num_iters', type=int, default=20000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)
@@ -296,14 +296,14 @@ parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節�
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
 parser.add_argument('--timesteps', type=int, default=150)
-parser.add_argument('--lgn_timesteps', type=int, default=50,
+parser.add_argument('--lgn_timesteps', type=int, default=150,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--exploration_time_window', type=int, default=150,
                     help='Look-back gap for exploration overlap loss; effective window is auto-clipped to keep valid long-range pairs')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
 parser.add_argument('--cam_angle', type=int, default=10)
-parser.add_argument('--goal_radius', type=float, default=0.5,
+parser.add_argument('--goal_radius', type=float, default=1.0,
                     help='Episode terminates when all drones are within this radius of their goal')
 parser.add_argument('--maze_update_interval', type=int, default=50,
                     help='Regenerate maze every N iterations; drone-only reset in between for stable LGN signal')
@@ -478,8 +478,16 @@ parser.add_argument('--use_astar_guidance', default=False, action='store_true',
                     help='Force legacy online A* guidance even when precomputed maps are enabled')
 parser.add_argument('--diag_interval', type=int, default=100,
                     help='Print detailed DIAG logs every N iterations (<=0 disables)')
-parser.add_argument('--diag_second_order', default=True, action='store_true',
+parser.add_argument('--diag_second_order', dest='diag_second_order', action='store_true',
                     help='Enable heavy second-order diagnostic probes (can be noisy and slow)')
+parser.add_argument('--no_diag_second_order', dest='diag_second_order', action='store_false',
+                    help='Disable heavy second-order diagnostic probes')
+parser.set_defaults(diag_second_order=False)
+parser.add_argument('--diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_true',
+                    help='Enable diagnostic loss-to-worker gradient probes (extra autograd overhead)')
+parser.add_argument('--no_diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_false',
+                    help='Disable diagnostic loss-to-worker gradient probes')
+parser.set_defaults(diag_proxy_worker_grads=False)
 parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 
@@ -3224,7 +3232,7 @@ for i in pbar:
     maze_update_counter += 1
     worknet.reset()
 
-    p_history, v_history, a_history, target_v_history, vec_to_pt_history = [], [], [], [], []
+    p_history, v_history, a_history, vec_to_pt_history = [], [], [], []
     rpy_history = []
     R_history = []  # 记录姿态矩阵用于可视化
     real_act_history = []
@@ -3258,14 +3266,13 @@ for i in pbar:
         vec_to_pt_history.append(vec_curr)
         dist_obj_curr = safe_l2_norm(vec_curr, dim=-1) - env.margin
         dist_obj_history.append(dist_obj_curr)
-        rpy_history.append(rotation_matrix_to_rpy_deg(env.R))
+        rpy_history.append(rotation_matrix_to_rpy_deg(env.R).detach())
         R_history.append(env.R.detach().clone())  # 保存姿态矩阵
 
         target_v_raw_curr = env.p_target - env.p.detach()
         target_v_norm = torch.norm(target_v_raw_curr, 2, -1, keepdim=True)
         max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device, dtype=target_v_norm.dtype)
         target_v = (target_v_raw_curr / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
-        target_v_history.append(target_v)
 
         R = env.R
         state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
@@ -3295,8 +3302,14 @@ for i in pbar:
         geom_feat_last = geom_feat
         progress_feat_last = progress_feat
 
-        # LGN Forward (训练侧执行正值非归一化约束)
-        current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
+        # LGN forward:
+        # - LGN phase: keep graph for unrolled second-order path.
+        # - Worker phase: freeze LGN graph to avoid unnecessary memory overhead.
+        if train_lgn_phase:
+            current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
+        else:
+            with torch.no_grad():
+                current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
 
         if t == 0 and _diag_should_log(i):
             first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
@@ -3315,7 +3328,7 @@ for i in pbar:
         v_preds.append(v_pred)
         real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
-        real_act_history.append(real_act)
+        real_act_history.append(real_act.detach())
         act_buffer.append(real_act)
 
         env.run(real_act, ctl_dt, target_v_raw_curr)
@@ -3451,22 +3464,42 @@ for i in pbar:
         _diag_tensor_finite("proxy_loss", proxy_loss, i)
 
     # --- Meta Loss Components ---
-    loss_meta_pos = safe_l2_norm(p_history[-1] - env.p_target, dim=-1).mean()
-    loss_meta_coll = loss_collision_seq.mean()
-    loss_meta_ctrl = safe_l2_norm(act_buffer, dim=-1).sum()
-    loss_meta_jerk = act_buffer.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
-    loss_meta_snap = (F.normalize(act_buffer - env.g_std, dim=-1)
-                      .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
-    loss_meta_height = loss_height_seq.mean()
+    # Worker phase does not backprop through meta_loss; detach to avoid unnecessary graph build.
     v_preds_tensor = torch.stack(v_preds)  # [T, B, 3]
-    loss_meta_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
+    if train_lgn_phase:
+        meta_p_history = p_history
+        meta_v_history = v_history
+        meta_a_history = a_history
+        meta_act_buffer = act_buffer
+        meta_loss_collision_seq = loss_collision_seq
+        meta_loss_stuck_seq = loss_stuck_seq
+        meta_loss_height_seq = loss_height_seq
+        meta_v_preds_tensor = v_preds_tensor
+    else:
+        meta_p_history = p_history.detach()
+        meta_v_history = v_history.detach()
+        meta_a_history = a_history.detach()
+        meta_act_buffer = act_buffer.detach()
+        meta_loss_collision_seq = loss_collision_seq.detach()
+        meta_loss_stuck_seq = loss_stuck_seq.detach()
+        meta_loss_height_seq = loss_height_seq.detach()
+        meta_v_preds_tensor = v_preds_tensor.detach()
+
+    loss_meta_pos = safe_l2_norm(meta_p_history[-1] - env.p_target, dim=-1).mean()
+    loss_meta_coll = meta_loss_collision_seq.mean()
+    loss_meta_ctrl = safe_l2_norm(meta_act_buffer, dim=-1).sum()
+    loss_meta_jerk = meta_act_buffer.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
+    loss_meta_snap = (F.normalize(meta_act_buffer - env.g_std, dim=-1)
+                      .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
+    loss_meta_height = meta_loss_height_seq.mean()
+    loss_meta_v_pred = F.mse_loss(meta_v_preds_tensor, meta_v_history.detach())
 
     # --- 全局规划引导损失 ---
     # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
     if train_lgn_phase:
         loss_meta_guidance, guidance_components = compute_global_guidance_meta_loss(
-            env, p_history, v_history, env.p_target, vec_to_pt, dist_obj,
-            a_history=a_history,
+            env, meta_p_history, meta_v_history, env.p_target, vec_to_pt, dist_obj,
+            a_history=meta_a_history,
             sample_count=args.guide_sample_count,
             strategy=args.guide_sample_strategy,
             max_speed=float(env.max_speed),
@@ -3508,7 +3541,7 @@ for i in pbar:
         }
 
     # 训练目标仅使用位置/碰撞/高度/引导; 控制项仅用于日志监控
-    loss_meta_stuck = loss_stuck_seq.mean()
+    loss_meta_stuck = meta_loss_stuck_seq.mean()
     meta_loss = (
         loss_meta_pos +
         loss_meta_coll +
@@ -3574,18 +3607,20 @@ for i in pbar:
             pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
         continue
 
-    worker_params = tuple(worknet.parameters())
-    proxy_grad_speed, proxy_grad_speed_nonfinite, proxy_grad_speed_elems = \
-        get_loss_to_worker_grad_norm(loss_speed_seq.mean(), worker_params)
-    proxy_grad_dir, proxy_grad_dir_nonfinite, proxy_grad_dir_elems = \
-        get_loss_to_worker_grad_norm(loss_direction_seq.mean(), worker_params)
-    proxy_grad_avoid, proxy_grad_avoid_nonfinite, proxy_grad_avoid_elems = \
-        get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
-    proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
-        get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
-    proxy_grad_turn, proxy_grad_turn_nonfinite, proxy_grad_turn_elems = \
-        get_loss_to_worker_grad_norm(loss_turn_seq.mean(), worker_params)
-    if _diag_should_log(i):
+    run_proxy_grad_diag = args.diag_proxy_worker_grads and _diag_should_log(i)
+    if run_proxy_grad_diag:
+        worker_params = tuple(worknet.parameters())
+        proxy_grad_speed, proxy_grad_speed_nonfinite, proxy_grad_speed_elems = \
+            get_loss_to_worker_grad_norm(loss_speed_seq.mean(), worker_params)
+        proxy_grad_dir, proxy_grad_dir_nonfinite, proxy_grad_dir_elems = \
+            get_loss_to_worker_grad_norm(loss_direction_seq.mean(), worker_params)
+        proxy_grad_avoid, proxy_grad_avoid_nonfinite, proxy_grad_avoid_elems = \
+            get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
+        proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
+            get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
+        proxy_grad_turn, proxy_grad_turn_nonfinite, proxy_grad_turn_elems = \
+            get_loss_to_worker_grad_norm(loss_turn_seq.mean(), worker_params)
+    if run_proxy_grad_diag:
         print(
             f"[DIAG iter={i}] loss_to_worker: "
             f"speed={proxy_grad_speed:.6f} (NonFinite={proxy_grad_speed_nonfinite}/{proxy_grad_speed_elems}), "
@@ -3779,11 +3814,7 @@ for i in pbar:
         collision_free = torch.all(dist_obj > 0, dim=0)
         reached_goal = torch.any(dist_to_goal < args.goal_radius, dim=0)
         success = collision_free & reached_goal
-        # 计算平均权重 (用于 Scalar 显示)
-        avg_weights_raw = weights_seq.mean(dim=[0, 1]).cpu()  # 原始输出权重
-        avg_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()  # 实际使用权重
-        avg_effective_weights = effective_weights_seq.mean(dim=[0, 1]).cpu()
-        weight_std = effective_weights_seq.std(dim=-1).mean()
+        final_dist_to_goal = dist_to_goal[-1]
         v_norm = v_history.norm(dim=-1)
         avg_speed = v_norm.mean()
         min_speed_threshold = float(env.max_speed) * 0.7
@@ -3795,30 +3826,6 @@ for i in pbar:
             # === 主要Loss ===
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
-
-            # === [增强] 5个权重均值 (实际使用) ===
-            'Weights/0_Speed': avg_weights[0],
-            'Weights/1_Direction': avg_weights[1],
-            'Weights/2_Avoidance': avg_weights[2],
-            'Weights/3_Exploration': avg_weights[3],
-            'Weights/4_Turn': avg_weights[4],
-            # === 原始输出权重 ===
-            'Weights_Raw/0_Speed': avg_weights_raw[0],
-            'Weights_Raw/1_Direction': avg_weights_raw[1],
-            'Weights_Raw/2_Avoidance': avg_weights_raw[2],
-            'Weights_Raw/3_Exploration': avg_weights_raw[3],
-            'Weights_Raw/4_Turn': avg_weights_raw[4],
-            'Weights_Effective/0_Speed': avg_effective_weights[0],
-            'Weights_Effective/1_Direction': avg_effective_weights[1],
-            'Weights_Effective/2_Avoidance': avg_effective_weights[2],
-            'Weights_Effective/3_Exploration': avg_effective_weights[3],
-            'Weights_Effective/4_Turn': avg_effective_weights[4],
-
-            # === [新增] 权重分布监控 ===
-            'Weight_Stats/Raw_Min': weights_seq.min(),
-            'Weight_Stats/Raw_Max': weights_seq.max(),
-            'Weight_Stats/Raw_Mean': weights_seq.mean(),
-            'Weight_Stats/Std': weight_std,
 
             # === [增强] Proxy Loss 原始分项 (Average over Time & Batch) ===
             'Proxy_Comp/0_Speed': loss_speed_seq.mean(),
@@ -3854,17 +3861,10 @@ for i in pbar:
             'Guidance/Speed_Diff': guidance_components.get('speed_diff', 0.0),
             'Guidance/Escape': guidance_components['escape'],
             'Guidance/Depth': guidance_components['depth'],
-            'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
             'Guidance/Valid_Ratio': guidance_components['valid_ratio'],
-            'Guidance/Valid_Guidance_Ratio': guidance_components.get('valid_guidance_ratio', 0.0),
-            'Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
             'Guidance/Collision_Ratio': guidance_components['collision_ratio'],
-            'Guidance/Valid_Mean': guidance_components.get('guidance_valid_mean', 0.0),
-            'Guidance/Recovery_Mean': guidance_components.get('guidance_recovery_mean', 0.0),
             'Guidance/Boost': guidance_components.get('guidance_boost', 1.0),
             'Guidance/Sample_Count': guidance_components['sample_count'],
-            'Guidance/Avg_Curvature': guidance_components.get('avg_curvature', 0.0),
-            'Guidance/Avg_Path_Progress': guidance_components.get('avg_path_progress', 0.0),
             'Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
             'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
             'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
@@ -3875,6 +3875,9 @@ for i in pbar:
             'Metrics/Success_Rate': success.float().mean(),
             'Metrics/No_Collision_Rate': collision_free.float().mean(),
             'Metrics/Reach_Goal_Rate': reached_goal.float().mean(),
+            'Metrics/Final_Dist_To_Goal': final_dist_to_goal.mean(),
+            'Metrics/Final_Dist_To_Goal_Min': final_dist_to_goal.min(),
+            'Metrics/Final_Dist_To_Goal_Max': final_dist_to_goal.max(),
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),
@@ -4124,31 +4127,7 @@ for i in pbar:
             writer.add_figure('Trajectory/Control_Accel_Cmd_Series', fig_act, i + 1)
             plt.close(fig_act)
 
-            # 4. 权重逐时间步变化图：按分量拆分保存
-            w_cpu = effective_weights_seq[:, idx, :].cpu() # [T, 5] 实际使用权重（非负）
-            labels = ['Speed', 'Direction', 'Avoidance', 'Exploration', 'Turn']
-            tag_suffix = ['0_Speed', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn']
-            for wi in range(5):
-                fig_wi, ax = plt.subplots()
-                ax.plot(w_cpu[:, wi], label=labels[wi])
-                ax.legend()
-                ax.set_title(f"Iter {i} Weight Profile - {labels[wi]} (Per Step, Non-Negative)")
-                writer.add_figure(f'Debug/Weights_StepWise_{tag_suffix[wi]}', fig_wi, i + 1)
-                plt.close(fig_wi)
-
-            # 4.1 [新增] 权重精确值记录（与轨迹同步，用于分析权重动态变化）
-            writer.add_scalar('Weights_Snapshot/0_Speed', avg_weights[0], i + 1)
-            writer.add_scalar('Weights_Snapshot/1_Direction', avg_weights[1], i + 1)
-            writer.add_scalar('Weights_Snapshot/2_Avoidance', avg_weights[2], i + 1)
-            writer.add_scalar('Weights_Snapshot/3_Exploration', avg_weights[3], i + 1)
-            writer.add_scalar('Weights_Snapshot/4_Turn', avg_weights[4], i + 1)
-            writer.add_scalar('Weights_Snapshot/Std', weight_std, i + 1)
-            # 权重统计
-            writer.add_scalar('Weights_Snapshot/Raw_Min', weights_seq.min(), i + 1)
-            writer.add_scalar('Weights_Snapshot/Raw_Max', weights_seq.max(), i + 1)
-            writer.add_scalar('Weights_Snapshot/Raw_Mean', weights_seq.mean(), i + 1)
-
-            # 5. [新增] 深度图视频（保存到本地）
+            # 4. [新增] 深度图视频（保存到本地）
             if len(depth_history) > 0:
                 depth_stack = torch.stack(depth_history).float()  # [T, H, W], meters
                 # 使用逆深度增强近处障碍可见性，并做分位数拉伸避免整段几乎同值导致全黑

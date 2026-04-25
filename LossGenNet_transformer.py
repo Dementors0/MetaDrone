@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 class LossGenNet(nn.Module):
     """
@@ -131,7 +132,15 @@ class LossGenNet(nn.Module):
             torch.ones(seq_len, seq_len, device=x_in.device, dtype=torch.bool),
             diagonal=1,
         )
-        x_out = self.transformer(x_in, mask=causal_mask)
+        # Activation checkpointing cuts peak memory while preserving gradients.
+        if self.training and torch.is_grad_enabled():
+            x_out = checkpoint(
+                lambda xin: self.transformer(xin, mask=causal_mask),
+                x_in,
+                use_reentrant=False,
+            )
+        else:
+            x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
         # 6. 生成非负权重（不做归一化，仅约束 >= 0）

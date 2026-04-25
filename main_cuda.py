@@ -517,6 +517,7 @@ for i in pbar:
         else:
             collision_free = torch.all(distance.flatten(0, 1) > 0, dim=0)
         dist_to_goal = torch.norm(p_history - env.p_target.unsqueeze(0), 2, -1)
+        final_dist_to_goal = dist_to_goal[-1]
         reached_goal = torch.any(dist_to_goal < args.goal_radius, dim=0)
         success = collision_free & reached_goal
         _success = success.float().mean()
@@ -536,6 +537,9 @@ for i in pbar:
             'success': _success,
             'no_collision_rate': _no_collision_rate,
             'reach_goal_rate': reached_goal.float().mean(),
+            'final_dist_to_goal': final_dist_to_goal.mean(),
+            'final_dist_to_goal_min': final_dist_to_goal.min(),
+            'final_dist_to_goal_max': final_dist_to_goal.max(),
             'max_speed': speed_history.max(0).values.mean(),
             'avg_speed': avg_speed.mean(),
             'ar': (success.float() * avg_speed).mean()})

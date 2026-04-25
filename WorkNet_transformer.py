@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 def g_decay(x, alpha):
     return x * alpha + x.detach() * (1 - alpha)
@@ -60,7 +61,15 @@ class WorkNet(nn.Module):
             torch.ones(seq_len, seq_len, device=x_in.device, dtype=torch.bool),
             diagonal=1,
         )
-        x_out = self.transformer(x_in, mask=causal_mask)
+        # Activation checkpointing cuts peak memory while preserving gradients.
+        if self.training and torch.is_grad_enabled():
+            x_out = checkpoint(
+                lambda xin: self.transformer(xin, mask=causal_mask),
+                x_in,
+                use_reentrant=False,
+            )
+        else:
+            x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.ln(x_out[:, -1])
         act = self.fc(self.act(last_token))
         hx = seq

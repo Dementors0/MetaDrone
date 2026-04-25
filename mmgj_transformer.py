@@ -1,5 +1,6 @@
 #8.3
 #重塑proxy loss逻辑 f(w,x)
+#坐标系待修改/势场待修改
 
 import argparse
 import atexit
@@ -3926,6 +3927,8 @@ for i in pbar:
         dist_obj_success = safe_l2_norm(env.find_vec_to_nearest_pt_at(p_history), dim=-1) - env.margin
         no_collision = torch.all(dist_obj_success > 0, 0)
         dist_to_goal_hist = safe_l2_norm(p_history - env.p_target, dim=-1)
+        final_step_dist_to_goal = dist_to_goal_hist[-1]  # [B]
+        final_step_dist_to_goal_mean = final_step_dist_to_goal.mean()
         reached_goal = torch.any(dist_to_goal_hist < float(args.goal_radius), dim=0)
         success = no_collision & reached_goal
         avg_lgn_delta_raw = lgn_delta_raw_seq.mean(dim=[0, 1]).cpu()
@@ -3995,6 +3998,7 @@ for i in pbar:
             'Metrics/Success_Rate': success.float().mean(),
             'Metrics/No_Collision_Rate': no_collision.float().mean(),
             'Metrics/Goal_Reached_Rate': reached_goal.float().mean(),
+            'Metrics/FinalStep_DistToGoal_Mean': final_step_dist_to_goal_mean,
             'Metrics/Avg_Speed': avg_speed,
             'Metrics/Speed_Below_Threshold': (avg_speed < min_speed_threshold).float(),
             'Metrics/Min_Speed': v_norm.min(),
@@ -4083,6 +4087,8 @@ for i in pbar:
             log_data['Worker_Input/Dim'] = float(worker_input_last.shape[-1])
 
         smooth_dict(log_data)
+        # Per-iteration raw curve (no 25-step smoothing): final timestep distance-to-goal.
+        writer.add_scalar('FinalStep/DistToGoal_Mean_PerIter', final_step_dist_to_goal_mean, i + 1)
 
         if (i + 1) % 25 == 0:
             for k, v in scaler_q.items():

@@ -374,6 +374,30 @@ parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
                     help='Compatibility arg (unused): no extra floor is applied beyond non-negative constraint')
 parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
                     help='Compatibility arg (unused): no ceiling constraint is applied to LGN weights')
+# 对照实验开关：代理损失偏好权重全部改为时间平均固定值，不接收 LGN 时变输出。
+# 默认均值来自:
+# /home/robot/transformer/checkpoints/mmgj_transformer_default_2026-04-25_16-26-46/logs/events.out.tfevents.1777105606.robot-System-Product-Name.14152.0
+# 的 Weights_Effective/{0_Speed,1_Direction,2_Avoidance,3_Exploration,4_Turn} 时间均值。
+parser.add_argument('--proxy_use_timeavg_pref_weights', dest='proxy_use_timeavg_pref_weights', action='store_true',
+                    help='Replace all proxy preference weights with fixed time-average values instead of LGN dynamic outputs')
+parser.add_argument('--no_proxy_use_timeavg_pref_weights', dest='proxy_use_timeavg_pref_weights', action='store_false',
+                    help='Disable fixed time-average replacement and use fully dynamic LGN weights for all proxy preferences')
+# 兼容旧参数名（旧语义: 仅非速度固定；新语义: 五项全部固定）
+parser.add_argument('--proxy_use_timeavg_non_speed_weights', dest='proxy_use_timeavg_pref_weights', action='store_true',
+                    help=argparse.SUPPRESS)
+parser.add_argument('--no_proxy_use_timeavg_non_speed_weights', dest='proxy_use_timeavg_pref_weights', action='store_false',
+                    help=argparse.SUPPRESS)
+parser.set_defaults(proxy_use_timeavg_pref_weights=True)
+parser.add_argument('--proxy_timeavg_w_speed', type=float, default=0.7182250648409456,
+                    help='Fixed time-average weight for speed preference when replacement is enabled')
+parser.add_argument('--proxy_timeavg_w_direction', type=float, default=0.8079223947865622,
+                    help='Fixed time-average weight for direction preference when replacement is enabled')
+parser.add_argument('--proxy_timeavg_w_avoidance', type=float, default=0.4292064057929175,
+                    help='Fixed time-average weight for avoidance preference when replacement is enabled')
+parser.add_argument('--proxy_timeavg_w_exploration', type=float, default=0.7496270746975154,
+                    help='Fixed time-average weight for exploration preference when replacement is enabled')
+parser.add_argument('--proxy_timeavg_w_turn', type=float, default=0.7941697308977882,
+                    help='Fixed time-average weight for turn preference when replacement is enabled')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
                     help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
@@ -3406,13 +3430,44 @@ for i in pbar:
             f"dir={loss_direction_seq.requires_grad}, avoid={loss_avoidance_seq.requires_grad}, "
             f"expl={loss_exploration_seq.requires_grad}, turn={loss_turn_seq.requires_grad}"
         )
-    # LGN 输出已做非负约束，这里直接使用，避免双重 softplus 压缩动态范围。
-    effective_weights_seq = weights_seq_raw
+    # 对照实验：代理损失偏好权重全部使用时间平均固定值。
+    if args.proxy_use_timeavg_pref_weights:
+        fixed_pref_weights = torch.as_tensor(
+            [
+                args.proxy_timeavg_w_speed,
+                args.proxy_timeavg_w_direction,
+                args.proxy_timeavg_w_avoidance,
+                args.proxy_timeavg_w_exploration,
+                args.proxy_timeavg_w_turn,
+            ],
+            device=weights_seq_raw.device,
+            dtype=weights_seq_raw.dtype,
+        ).view(1, 1, 5)
+        fixed_pref_seq = fixed_pref_weights.expand(
+            weights_seq_raw.shape[0],
+            weights_seq_raw.shape[1],
+            5,
+        )
+        effective_weights_seq = fixed_pref_seq
+    else:
+        fixed_pref_weights = None
+        # LGN 输出已做非负约束，这里直接使用，避免双重 softplus 压缩动态范围。
+        effective_weights_seq = weights_seq_raw
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
             f"grad_fn={type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else 'None'}"
         )
+        if fixed_pref_weights is not None:
+            fixed_pref = fixed_pref_weights.view(-1).detach().cpu()
+            print(
+                f"[DIAG iter={i}] proxy_weight_mode=timeavg_all_preferences, "
+                f"fixed_pref=[speed={float(fixed_pref[0]):.6f}, "
+                f"dir={float(fixed_pref[1]):.6f}, "
+                f"avoid={float(fixed_pref[2]):.6f}, "
+                f"expl={float(fixed_pref[3]):.6f}, "
+                f"turn={float(fixed_pref[4]):.6f}]"
+            )
 
     # 2. Step-wise 加权 (Broadcasting: [T, B] * [T, B])
     weighted_loss_map = (
@@ -3795,6 +3850,7 @@ for i in pbar:
             # === 主要Loss ===
             'Loss/1_Proxy_Total': proxy_loss,
             'Loss/2_Meta_Total': meta_loss,
+            'Experiment/Proxy_TimeAvg_Pref_Enabled': 1.0 if args.proxy_use_timeavg_pref_weights else 0.0,
 
             # === [增强] 5个权重均值 (实际使用) ===
             'Weights/0_Speed': avg_weights[0],
@@ -3940,6 +3996,15 @@ for i in pbar:
             'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
             'Grad_ProxyWorker/4_Turn_GradElem': proxy_grad_turn_elems
         }
+        if fixed_pref_weights is not None:
+            fixed_vals = fixed_pref_weights.view(-1)
+            log_data.update({
+                'Experiment/Proxy_TimeAvg_Pref/0_Speed': fixed_vals[0],
+                'Experiment/Proxy_TimeAvg_Pref/1_Direction': fixed_vals[1],
+                'Experiment/Proxy_TimeAvg_Pref/2_Avoidance': fixed_vals[2],
+                'Experiment/Proxy_TimeAvg_Pref/3_Exploration': fixed_vals[3],
+                'Experiment/Proxy_TimeAvg_Pref/4_Turn': fixed_vals[4],
+            })
 
         if train_lgn_phase:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss

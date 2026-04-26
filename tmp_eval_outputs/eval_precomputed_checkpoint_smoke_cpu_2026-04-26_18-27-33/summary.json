@@ -1,0 +1,54 @@
+{
+  "checkpoint": "/home/robot/transformer/multi_pub/checkpoint0004.pth",
+  "precomputed_map_dir": "/home/robot/transformer/precomputed_maps_compact",
+  "save_dir": "/home/robot/transformer/multi_pub/tmp_eval_outputs/eval_precomputed_checkpoint_smoke_cpu_2026-04-26_18-27-33",
+  "video_dir": "/home/robot/transformer/multi_pub/tmp_eval_outputs/eval_precomputed_checkpoint_smoke_cpu_2026-04-26_18-27-33/videos",
+  "metrics": {
+    "num_eval_episodes": 1,
+    "num_eval_agents": 1,
+    "no_collision_rate": 1.0,
+    "reach_goal_rate": 0.0,
+    "success_rate_product": 0.0,
+    "success_rate_and": 0.0,
+    "avg_speed_mean": 1.8181818723678589,
+    "fastest_speed": 5.0,
+    "max_speed_mean": 5.0,
+    "final_dist_to_goal_mean": 14.055143356323242,
+    "final_dist_to_goal_median": 14.055143356323242,
+    "collision_step_ratio_mean": 0.0,
+    "collision_depth_max_mean": 0.0,
+    "min_clearance_mean": 5.669099807739258,
+    "path_length_mean": 3.4382834434509277,
+    "progress_ratio_mean": 0.06403146684169769,
+    "time_to_goal_sec_mean": 0.6876567006111145,
+    "yaw_error_abs_deg_mean": 0.0
+  },
+  "checkpoint_load": {
+    "missing_keys": [],
+    "unexpected_keys": [],
+    "resized_keys": [],
+    "skipped_keys": []
+  },
+  "per_agent_records": [
+    {
+      "episode_index": 0,
+      "map_index": 0,
+      "map_path": "/home/robot/transformer/precomputed_maps_compact/map_000.pt",
+      "batch_index": 0,
+      "collision_free": true,
+      "reached_goal": false,
+      "success_and": false,
+      "avg_speed": 1.8181818723678589,
+      "max_speed": 5.0,
+      "final_dist_to_goal": 14.055143356323242,
+      "collision_step_ratio": 0.0,
+      "collision_depth_max": 0.0,
+      "min_clearance": 5.669099807739258,
+      "path_length": 3.4382834434509277,
+      "progress_ratio": 0.06403146684169769,
+      "time_to_goal_step": 11.0,
+      "time_to_goal_sec": 0.6876567006111145,
+      "yaw_error_abs_deg": 0.0
+    }
+  ]
+}

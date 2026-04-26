@@ -1,0 +1,54 @@
+{
+  "checkpoint": "/home/robot/transformer/multi_pub/checkpoint0004.pth",
+  "precomputed_map_dir": "/home/robot/transformer/precomputed_maps_compact",
+  "save_dir": "/home/robot/transformer/multi_pub/tmp_eval_outputs/eval_precomputed_checkpoint_smoke_fixed_specs_2026-04-26_18-31-47",
+  "video_dir": "/home/robot/transformer/multi_pub/tmp_eval_outputs/eval_precomputed_checkpoint_smoke_fixed_specs_2026-04-26_18-31-47/videos",
+  "metrics": {
+    "num_eval_episodes": 1,
+    "num_eval_agents": 1,
+    "no_collision_rate": 1.0,
+    "reach_goal_rate": 0.0,
+    "success_rate_product": 0.0,
+    "success_rate_and": 0.0,
+    "avg_speed_mean": 0.10386231541633606,
+    "fastest_speed": 0.4524053633213043,
+    "max_speed_mean": 0.4524053633213043,
+    "final_dist_to_goal_mean": 13.909945487976074,
+    "final_dist_to_goal_median": 13.909945487976074,
+    "collision_step_ratio_mean": 0.0,
+    "collision_depth_max_mean": 0.0,
+    "min_clearance_mean": 8.65446662902832,
+    "path_length_mean": 1.4487221240997314,
+    "progress_ratio_mean": 0.07370056957006454,
+    "time_to_goal_sec_mean": 0.35833996534347534,
+    "yaw_error_abs_deg_mean": 0.0
+  },
+  "checkpoint_load": {
+    "missing_keys": [],
+    "unexpected_keys": [],
+    "resized_keys": [],
+    "skipped_keys": []
+  },
+  "per_agent_records": [
+    {
+      "episode_index": 0,
+      "map_index": 0,
+      "map_path": "/home/robot/transformer/precomputed_maps_compact/map_000.pt",
+      "batch_index": 0,
+      "collision_free": true,
+      "reached_goal": false,
+      "success_and": false,
+      "avg_speed": 0.10386231541633606,
+      "max_speed": 0.4524053633213043,
+      "final_dist_to_goal": 13.909945487976074,
+      "collision_step_ratio": 0.0,
+      "collision_depth_max": 0.0,
+      "min_clearance": 8.65446662902832,
+      "path_length": 1.4487221240997314,
+      "progress_ratio": 0.07370056957006454,
+      "time_to_goal_step": 6.0,
+      "time_to_goal_sec": 0.35833996534347534,
+      "yaw_error_abs_deg": 0.0
+    }
+  ]
+}

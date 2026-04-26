@@ -636,6 +636,7 @@ for i in pbar:
             collision_free = torch.all(distance.flatten(0, 1) > 0, dim=0)
         dist_to_goal = torch.norm(p_history - env.p_target.unsqueeze(0), 2, -1)
         final_dist_to_goal = dist_to_goal[-1]
+        last_step_dist_to_goal = final_dist_to_goal.mean()
         if len(yaw_error_history) > 0:
             yaw_error_abs_deg = torch.stack(yaw_error_history).abs().mean() * (180.0 / math.pi)
             yaw_rate_env_abs_deg = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)).abs().mean() * (180.0 / math.pi)
@@ -672,6 +673,8 @@ for i in pbar:
             'Heading/Yaw_Rate_Abs_Deg': yaw_rate_env_abs_deg,
             'Heading/Yaw_Blend': min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters))) if use_attitude_v2 else 0.0,
             'ar': (success.float() * avg_speed).mean()})
+        # 逐轮记录“最后一个时间步到终点距离”，确保 TensorBoard 横轴为训练轮次（i+1）。
+        writer.add_scalar('Metrics/LastStep_Dist_To_Goal', float(last_step_dist_to_goal.item()), i + 1)
         log_dict = {}
         if is_save_trajectory_iter(i):
             # vid = torch.stack(vid).cpu().div(10).clamp(0, 1)[None, :, None]

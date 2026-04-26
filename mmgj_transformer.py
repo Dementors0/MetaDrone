@@ -312,7 +312,7 @@ parser.add_argument('--resume_worker', default="", help='Path to pretrained work
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
 parser.add_argument('--batch_size', type=int, default=8)
-parser.add_argument('--num_iters', type=int, default=20000)
+parser.add_argument('--num_iters', type=int, default=50000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)

@@ -385,13 +385,29 @@ class Env(BaseEnv):
         placed.extend(attached)
         return placed
 
-    def _place_scatter_specs(self, specs, bounds, pair_gap):
+    def _overlaps_reserved_corridor(self, spec, x, y, segments, clearance):
+        if not segments:
+            return False
+        extent_x = float(spec.get("extent_x", spec.get("footprint_r", 0.0)))
+        extent_y = float(spec.get("extent_y", spec.get("footprint_r", 0.0)))
+        for seg_y0, seg_y1, seg_center, seg_half in segments:
+            if y + extent_y < seg_y0 or y - extent_y > seg_y1:
+                continue
+            if abs(x - seg_center) <= seg_half + extent_x + clearance:
+                return True
+        return False
+
+    def _place_scatter_specs(self, specs, bounds, pair_gap, avoid_segments=None):
         placed = []
         for spec in specs:
             obs = dict(spec)
-            if self._try_place_forest_obstacle(obs, placed, bounds, pair_gap, max_tries=56):
+            if self._try_place_forest_obstacle(
+                obs, placed, bounds, pair_gap, max_tries=56, avoid_segments=avoid_segments
+            ):
                 continue
-            if self._try_place_forest_obstacle(obs, placed, bounds, pair_gap * 0.75, max_tries=28):
+            if self._try_place_forest_obstacle(
+                obs, placed, bounds, pair_gap * 0.75, max_tries=28, avoid_segments=avoid_segments
+            ):
                 continue
 
             # Fallback: still place uniformly to keep per-batch obstacle tensor shape stable.
@@ -407,6 +423,21 @@ class Env(BaseEnv):
                 obs["y"] = 0.5 * (bounds["y_lo"] + bounds["y_hi"])
             else:
                 obs["y"] = random.uniform(y_min, y_max)
+            if avoid_segments:
+                for _ in range(24):
+                    y_try = 0.5 * (bounds["y_lo"] + bounds["y_hi"]) if y_max <= y_min else random.uniform(y_min, y_max)
+                    x_try = self._sample_x_outside_corridor(
+                        obs["extent_x"],
+                        y_try,
+                        obs["extent_y"],
+                        avoid_segments,
+                        clearance=0.18,
+                        hug_boundary=False,
+                    )
+                    if not self._overlaps_reserved_corridor(obs, x_try, y_try, avoid_segments, clearance=0.08):
+                        obs["x"] = x_try
+                        obs["y"] = y_try
+                        break
             placed.append(obs)
         return placed
 
@@ -512,7 +543,17 @@ class Env(BaseEnv):
         random.shuffle(specs)
         return specs
 
-    def _try_place_forest_obstacle(self, spec, placed, bounds, pair_gap, max_tries=48, anchor=None, anchor_jitter=0.9):
+    def _try_place_forest_obstacle(
+        self,
+        spec,
+        placed,
+        bounds,
+        pair_gap,
+        max_tries=48,
+        anchor=None,
+        anchor_jitter=0.9,
+        avoid_segments=None,
+    ):
         x_min = bounds["x_lo"] + spec["extent_x"]
         x_max = bounds["x_hi"] - spec["extent_x"]
         y_min = bounds["y_lo"] + spec["extent_y"]
@@ -529,6 +570,9 @@ class Env(BaseEnv):
             else:
                 x = random.uniform(x_min, x_max)
                 y = random.uniform(y_min, y_max)
+
+            if self._overlaps_reserved_corridor(spec, x, y, avoid_segments, clearance=0.08):
+                continue
 
             nearest_margin = 10.0
             valid = True
@@ -809,6 +853,11 @@ class Env(BaseEnv):
             "y_lo": y0 + self.blank_length + 0.20,
             "y_hi": y1 - self.blank_length - 0.20,
         }
+        corridor_segments = (
+            self._easy_corridor_segments(y0, y1)
+            if difficulty == "easy"
+            else self._hard_corridor_segments(y0, y1)
+        )
         pair_gap = 0.24
         nav_inflate = 0.5 * self.two_drone_passage_width
         # easy/hard only differ in density target.
@@ -819,7 +868,7 @@ class Env(BaseEnv):
         best_score = -1e9
         for _ in range(18):
             specs = self._build_scatter_specs(difficulty)
-            placed = self._place_scatter_specs(specs, bounds, pair_gap)
+            placed = self._place_scatter_specs(specs, bounds, pair_gap, avoid_segments=corridor_segments)
             placed = self._attach_objects_to_cylinders(placed, bounds, mode="scatter", difficulty=difficulty)
             occ = self._build_scatter_nav_grid(placed, y0, y1, resolution=0.35, inflate=nav_inflate)
             connected = self._easy_nav_has_connection(occ)

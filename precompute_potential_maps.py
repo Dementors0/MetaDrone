@@ -87,6 +87,28 @@ def _spawn_band_valid_ratio(
     return float(band.mean())
 
 
+def _spawn_band_reachable_ratio(
+    potential: np.ndarray,
+    occupancy: np.ndarray,
+    origin: np.ndarray,
+    resolution: float,
+    y_world: float,
+    x_center: float,
+    z_center: float,
+    half_span: float,
+) -> float:
+    reachable_mask = np.isfinite(potential) & (occupancy == 0)
+    return _spawn_band_valid_ratio(
+        valid_mask=reachable_mask,
+        origin=origin,
+        resolution=resolution,
+        y_world=y_world,
+        x_center=x_center,
+        z_center=z_center,
+        half_span=half_span,
+    )
+
+
 def _collect_goal_band_sources(
     occupancy: np.ndarray,
     origin: np.ndarray,
@@ -210,6 +232,16 @@ def _build_single_map(task: Dict):
             z_center=float(env.spawn_z_center),
             half_span=spawn_half_span,
         )
+        goal_reachable_ratio = _spawn_band_reachable_ratio(
+            potential=potential,
+            occupancy=occupancy,
+            origin=origin,
+            resolution=float(task["resolution"]),
+            y_world=float(env.spawn_goal_y),
+            x_center=float(env.spawn_x_center),
+            z_center=float(env.spawn_z_center),
+            half_span=spawn_half_span,
+        )
 
         save_obj = {
             "map_id": map_id,
@@ -241,6 +273,7 @@ def _build_single_map(task: Dict):
             "global_valid_ratio": float(global_valid_ratio),
             "start_band_valid_ratio": float(start_valid_ratio),
             "goal_band_valid_ratio": float(goal_valid_ratio),
+            "goal_band_reachable_ratio": float(goal_reachable_ratio),
         }
 
         reachable = int(np.isfinite(potential).sum())
@@ -251,7 +284,7 @@ def _build_single_map(task: Dict):
         quality_ok = (
             global_valid_ratio >= min_global
             and start_valid_ratio >= min_start
-            and goal_valid_ratio >= min_goal
+            and goal_reachable_ratio >= min_goal
         )
         if not quality_ok:
             return {
@@ -263,12 +296,13 @@ def _build_single_map(task: Dict):
                 "global_valid_ratio": global_valid_ratio,
                 "start_valid_ratio": start_valid_ratio,
                 "goal_valid_ratio": goal_valid_ratio,
+                "goal_reachable_ratio": goal_reachable_ratio,
                 "goal_source_count": int(len(goal_sources)),
                 "error": (
                     "map quality check failed: "
                     f"global_valid_ratio={global_valid_ratio:.6f} (<{min_global:.6f}) or "
                     f"start_valid_ratio={start_valid_ratio:.6f} (<{min_start:.6f}) or "
-                    f"goal_valid_ratio={goal_valid_ratio:.6f} (<{min_goal:.6f})"
+                    f"goal_reachable_ratio={goal_reachable_ratio:.6f} (<{min_goal:.6f})"
                 ),
             }
 
@@ -283,6 +317,7 @@ def _build_single_map(task: Dict):
             "global_valid_ratio": global_valid_ratio,
             "start_valid_ratio": start_valid_ratio,
             "goal_valid_ratio": goal_valid_ratio,
+            "goal_reachable_ratio": goal_reachable_ratio,
             "goal_source_count": int(len(goal_sources)),
             "error": "",
         }
@@ -296,6 +331,7 @@ def _build_single_map(task: Dict):
             "global_valid_ratio": 0.0,
             "start_valid_ratio": 0.0,
             "goal_valid_ratio": 0.0,
+            "goal_reachable_ratio": 0.0,
             "goal_source_count": 0,
             "error": traceback.format_exc(),
         }
@@ -439,6 +475,7 @@ def main():
                     f"reachable={out['reachable']}/{out['total']} "
                     f"valid(global/start/goal)=({out.get('global_valid_ratio', 0.0):.4f}/"
                     f"{out.get('start_valid_ratio', 0.0):.4f}/{out.get('goal_valid_ratio', 0.0):.4f}) "
+                    f"goal_reachable={out.get('goal_reachable_ratio', 0.0):.4f} "
                     f"goal_sources={int(out.get('goal_source_count', 0))}"
                 )
             else:
@@ -450,6 +487,7 @@ def main():
                     "global_valid_ratio": float(out.get("global_valid_ratio", 0.0)),
                     "start_valid_ratio": float(out.get("start_valid_ratio", 0.0)),
                     "goal_valid_ratio": float(out.get("goal_valid_ratio", 0.0)),
+                    "goal_reachable_ratio": float(out.get("goal_reachable_ratio", 0.0)),
                     "goal_source_count": int(out.get("goal_source_count", 0)),
                     "error": out["error"],
                 }
@@ -459,6 +497,7 @@ def main():
                     f"[FAIL] map={out['map_id']:03d} "
                     f"valid(global/start/goal)=({out.get('global_valid_ratio', 0.0):.4f}/"
                     f"{out.get('start_valid_ratio', 0.0):.4f}/{out.get('goal_valid_ratio', 0.0):.4f}) "
+                    f"goal_reachable={out.get('goal_reachable_ratio', 0.0):.4f} "
                     f"goal_sources={int(out.get('goal_source_count', 0))} "
                     f"(logged to {fail_log_path})"
                 )

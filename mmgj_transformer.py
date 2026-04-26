@@ -1,5 +1,5 @@
-#9.2.2
-#修改无人机坐标系
+#9.2.4
+#上交测试
 
 import argparse
 import atexit

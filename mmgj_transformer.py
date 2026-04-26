@@ -1,10 +1,10 @@
 #9.2.3
-#时间权重替代
+#时间权重替代，删除LGN训练过程
 
 import argparse
 import atexit
 import math
-from collections import defaultdict, deque
+from collections import defaultdict
 from random import normalvariate
 import os
 import datetime
@@ -18,7 +18,6 @@ matplotlib.use('Agg', force=True)
 
 import torch
 import torch.nn as nn
-from torch.func import functional_call
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -58,10 +57,8 @@ except ModuleNotFoundError:
 from env import probe_update_state_vec_common_upstream
 try:
     from WorkNet_transformer import WorkNet
-    from LossGenNet_transformer import LossGenNet
 except ModuleNotFoundError:
     from WorkNet import WorkNet
-    from LossGenNet import LossGenNet
 from turn_loss_utils import compute_turn_preference_loss_xy_unit
 
 ########### 0. 工具类：动态归一化 ##########
@@ -271,7 +268,7 @@ parser.add_argument('--resume_worker', default="", help='Path to pretrained work
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--num_iters', type=int, default=2000)
+parser.add_argument('--num_iters', type=int, default=20000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)
@@ -509,6 +506,10 @@ parser.add_argument('--terminal_log_interval', type=int, default=500,
 
 args = parser.parse_args()
 
+# Worker-only training path: LGN training is removed from this script.
+# Keep fixed proxy preference weights for stable/fast rollout behavior.
+args.proxy_use_timeavg_pref_weights = True
+
 # 统一 guidance 开关生效：根据 guidance_backend 映射为旧布尔参数，保持后续逻辑兼容。
 if args.guidance_backend == 'dijkstra_potential':
     args.use_precomputed_potential_maps = True
@@ -653,18 +654,6 @@ else:
     except TypeError:
         worknet = WorkNet(7 + 3, 6)
 worknet = worknet.to(device)
-
-try:
-    lgn = LossGenNet(
-        state_dim=state_dim,
-        geom_dim=geom_dim,
-        progress_dim=progress_dim,
-        max_seq_len=args.lgn_max_seq_len,
-        output_temperature=args.lgn_output_temperature,
-        weight_floor=args.lgn_weight_floor,
-    ).to(device)
-except TypeError:
-    lgn = LossGenNet(state_dim=state_dim).to(device)
 state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
 geom_normalizer = RunningMeanStd(shape=(geom_dim,)).to(device)
 progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
@@ -678,7 +667,6 @@ progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
 #         print(f"Warning: {name} path provided but file not found: {path}")
 
 # load_checkpoint(worknet, args.resume_worker, "Worker")
-# load_checkpoint(lgn, args.resume_lgn, "LGN")
 # if args.resume_norm:
 #     load_checkpoint(state_normalizer, args.resume_norm, "Norm Stats")
 # elif args.resume_worker:
@@ -687,7 +675,6 @@ progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
 
 ########## 5. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
-optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 
 ########## 6. 辅助函数 ##########
@@ -3067,142 +3054,6 @@ def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement
     return loss_stuck, loss_collision_duration, stuck_ratio
 
 
-def unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device):
-    """
-    Validation rollout with virtually-updated worker params (via functional_call).
-    Computes and returns meta_loss (position + collision + height) plus components.
-    Control effort is tracked for monitoring but is not included in optimization target.
-    LGN is NOT needed here; this meta loss is task-performance based.
-    Reuses the same maze layout for consistent LGN signal.
-    """
-    # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
-    env.reset_drone_only()
-
-    p_list, v_list, a_list, vec_list = [], [], [], []
-    act_buf = [env.act.detach()] * 2
-    v_preds_val = []
-    h_val = None
-
-    for t in range(args.lgn_timesteps):
-        ctl_dt = 1.0 / 15.0
-        depth, flow = env.render(ctl_dt)
-        depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
-
-        p_list.append(env.p)
-        v_list.append(env.v)
-        a_list.append(env.a)
-        vec_list.append(env.find_vec_to_nearest_pt())
-
-        target_v_raw = env.p_target - env.p.detach()
-        target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
-        max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device,
-                                    dtype=target_v_norm.dtype)
-        target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
-
-        R = env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom:
-            state_list.insert(0, local_v)
-
-        raw_state = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        state_t = state_normalizer(raw_state, update=False)  # 不更新统计量
-        state_t = sanitize_tensor(state_t, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
-        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        # Worker forward with virtually-updated params
-        act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, state_t, h_val))
-        act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
-        v_preds_val.append(v_pred)
-        real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
-        real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
-        act_buf.append(real_act)
-
-        env.run(real_act, ctl_dt, target_v_raw)
-
-        # Early termination when all drones reach their goals
-        with torch.no_grad():
-            _dist_to_goal_val = torch.norm(env.p - env.p_target, 2, -1)
-            if t >= 10 and (_dist_to_goal_val < args.goal_radius).all():
-                break
-
-        # 周期性截断以限制显存
-        if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
-            if h_val is not None:
-                h_val = h_val.detach()
-
-    # --- 计算 Meta Loss ---
-    p_val = torch.stack(p_list)
-    a_val = torch.stack(a_list)
-    act_val = torch.stack(act_buf)
-    vec_val = torch.stack(vec_list)
-    if vec_val.dim() == 4:
-        vec_val = vec_val.mean(1)
-
-    dist_val = sanitize_tensor(safe_l2_norm(vec_val, dim=-1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
-
-    collision_depth_val = F.relu(-dist_val)
-    loss_stuck_val, loss_collision_duration_val, stuck_ratio = compute_stuck_loss(
-        p_val, collision_depth_val,
-        stuck_window=args.stuck_window,
-        displacement_threshold=args.stuck_displacement_threshold,
-    )
-
-    m_pos  = safe_l2_norm(p_val[-1] - env.p_target, dim=-1).mean()
-    with torch.no_grad():
-        v_to_pt = torch.ones_like(dist_val)
-        if dist_val.shape[0] > 1:
-            v_to_pt[1:] = (-torch.diff(dist_val, 1, 0) * 135.0).clamp_min(1.0)
-    m_coll = (F.softplus(dist_val.mul(-32.0)) * v_to_pt).mean()
-    m_ctrl = safe_l2_norm(act_val, dim=-1).sum()
-    m_jerk = act_val.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
-    m_snap = (F.normalize(act_val - env.g_std, dim=-1)
-              .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
-    # Meta rollout 的高度惩罚，与主训练分支保持一致
-    m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
-               + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
-               + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
-
-    v_preds_val_tensor = torch.stack(v_preds_val)  # [T, B, 3]
-    v_val = torch.stack(v_list)  # [T, B, 3]
-    m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
-    m_stuck = loss_stuck_val.mean()
-
-    # 全局规划引导损失：始终进入 unrolled 二阶链路
-    m_guidance, _ = compute_global_guidance_meta_loss(
-        env, p_val, v_val, env.p_target, vec_val, dist_val,
-        a_history=a_val,
-        sample_count=args.guide_sample_count,
-        strategy=args.guide_sample_strategy,
-        max_speed=float(env.max_speed),
-        max_accel=args.guide_max_accel,
-        max_decel=args.guide_max_decel,
-        dir_weight=args.guide_dir_weight,
-        speed_weight=args.guide_speed_weight,
-        lateral_weight=args.guide_lateral_weight,
-        escape_weight=args.guide_escape_weight,
-        collision_threshold=args.guide_collision_threshold,
-        accel_weight=args.guide_accel_weight,
-        speed_diff_weight=args.guide_speed_diff_weight,
-        recovery_speed_weight=args.guide_recovery_speed_weight,
-    )
-
-    meta_val = (
-        m_pos
-        + m_coll
-        + m_height
-        + args.meta_guidance_weight * m_guidance
-        + args.meta_smooth_jerk_weight * m_jerk
-        + args.meta_smooth_snap_weight * m_snap
-        + args.meta_smooth_v_pred_weight * m_v_pred
-        + args.stuck_loss_weight * m_stuck
-    )
-    return meta_val, m_pos, m_coll, m_ctrl
-
 ########## 7. 训练主循环 ##########
 
 # 使用命令行参数重新初始化全局规划器
@@ -3218,18 +3069,14 @@ current_precomputed_map_idx = -1
 terminal_log_interval = max(1, int(args.terminal_log_interval))
 pbar = tqdm(range(args.num_iters), ncols=120, miniters=terminal_log_interval)
 B = args.batch_size
-cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
-meta_lgn_grad_window = deque(maxlen=20)
 
 state_normalizer.train()
 
 for i in pbar:
     term_log_now = ((i + 1) % terminal_log_interval == 0)
-    cycle_pos = i % cycle_len
-    train_lgn_phase = cycle_pos < args.lgn_steps
-    phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
-    env.set_meta_differentiable_mode(train_lgn_phase)
+    phase_str = "Work"
+    env.set_meta_differentiable_mode(False)
 
     if args.use_precomputed_potential_maps:
         if maze_update_counter % args.maze_update_interval == 0:
@@ -3258,13 +3105,21 @@ for i in pbar:
     v_preds = []
     act_for_diag = None
     dist_obj_history = []
-    geom_feat_last = None
-    progress_feat_last = None
 
     h = None
-    lgn_hx = None
+    fixed_pref_rollout = torch.as_tensor(
+        [
+            args.proxy_timeavg_w_speed,
+            args.proxy_timeavg_w_direction,
+            args.proxy_timeavg_w_avoidance,
+            args.proxy_timeavg_w_exploration,
+            args.proxy_timeavg_w_turn,
+        ],
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 5)
     do_save_viz = is_save_trajectory_iter(i)
-    rollout_steps = args.lgn_timesteps if train_lgn_phase else args.timesteps
+    rollout_steps = args.timesteps
 
     ###### A. Rollout ######
     for t in range(rollout_steps):
@@ -3303,30 +3158,12 @@ for i in pbar:
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        geom_feat_raw = extract_depth_geometry_features(depth)
-        geom_feat = geom_normalizer(geom_feat_raw, update=True)
-        geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        progress_feat_raw = extract_progress_features(
-            p_history_list=p_history,
-            v_history_list=v_history,
-            dist_obj_history_list=dist_obj_history,
-            p_target=env.p_target,
-            window=8,
-        )
-        progress_feat = progress_normalizer(progress_feat_raw, update=True)
-        progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-        geom_feat_last = geom_feat
-        progress_feat_last = progress_feat
-
-        # LGN Forward (训练侧执行正值非归一化约束)
-        current_weights, lgn_hx = lgn(x_pooled, state_tensor, geom_feat, progress_feat, lgn_hx)
+        current_weights = fixed_pref_rollout.to(dtype=state_tensor.dtype).expand(B, 5)
 
         if t == 0 and _diag_should_log(i):
             first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
             print(
                 f"[DIAG iter={i} t=0] current_weights={_diag_grad_meta(current_weights)}, "
-                f"lgn_hx={_diag_grad_meta(lgn_hx)}, "
                 f"first_lgn_weight={_diag_grad_meta(first_lgn_weight)}"
             )
         trajectory_lgn_weights.append(current_weights)
@@ -3353,9 +3190,6 @@ for i in pbar:
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
             if h is not None:
                 h = h.detach()
-            # LGN phase 时保留 lgn_hx 梯度，Worker phase 时截断
-            if lgn_hx is not None and not train_lgn_phase:
-                lgn_hx = lgn_hx.detach()
 
     ###### B. Loss Calculation (Step-wise) ######
     p_history = torch.stack(p_history)     # [T, B, 3]
@@ -3517,50 +3351,31 @@ for i in pbar:
     loss_meta_v_pred = F.mse_loss(v_preds_tensor, v_history.detach())
 
     # --- 全局规划引导损失 ---
-    # planner guidance 仅在 LGN phase 计算，worker phase 跳过以降低规划开销
-    if train_lgn_phase:
-        loss_meta_guidance, guidance_components = compute_global_guidance_meta_loss(
-            env, p_history, v_history, env.p_target, vec_to_pt, dist_obj,
-            a_history=a_history,
-            sample_count=args.guide_sample_count,
-            strategy=args.guide_sample_strategy,
-            max_speed=float(env.max_speed),
-            max_accel=args.guide_max_accel,
-            max_decel=args.guide_max_decel,
-            dir_weight=args.guide_dir_weight,
-            speed_weight=args.guide_speed_weight,
-            lateral_weight=args.guide_lateral_weight,
-            escape_weight=args.guide_escape_weight,
-            collision_threshold=args.guide_collision_threshold,
-            accel_weight=args.guide_accel_weight,
-            speed_diff_weight=args.guide_speed_diff_weight,
-            recovery_speed_weight=args.guide_recovery_speed_weight,
-        )
-    else:
-        zero = torch.tensor(0.0, device=p_history.device)
-        loss_meta_guidance = zero
-        guidance_components = {
-            'dir_align': zero,
-            'speed_diff': zero,
-            'overspeed': zero,
-            'underspeed': zero,
-            'lateral_error': zero,
-            'accel_mismatch': zero,
-            'escape': zero,
-            'depth': zero,
-            'recovery_speed': zero,
-            'valid_ratio': zero,
-            'invalid_ratio': zero,
-            'collision_ratio': zero,
-            'sample_count': 0.0,
-            'avg_curvature': 0.0,
-            'avg_path_progress': 0.0,
-            'avg_lateral_error': 0.0,
-            'max_lateral_error': 0.0,
-            'planner_success_ratio': 0.0,
-            'avg_ref_speed': 0.0,
-            'sampled_astar_paths': [],
-        }
+    # Worker-only 模式下不计算规划引导，减少每步开销。
+    zero = torch.tensor(0.0, device=p_history.device)
+    loss_meta_guidance = zero
+    guidance_components = {
+        'dir_align': zero,
+        'speed_diff': zero,
+        'overspeed': zero,
+        'underspeed': zero,
+        'lateral_error': zero,
+        'accel_mismatch': zero,
+        'escape': zero,
+        'depth': zero,
+        'recovery_speed': zero,
+        'valid_ratio': zero,
+        'invalid_ratio': zero,
+        'collision_ratio': zero,
+        'sample_count': 0.0,
+        'avg_curvature': 0.0,
+        'avg_path_progress': 0.0,
+        'avg_lateral_error': 0.0,
+        'max_lateral_error': 0.0,
+        'planner_success_ratio': 0.0,
+        'avg_ref_speed': 0.0,
+        'sampled_astar_paths': [],
+    }
 
     # 训练目标仅使用位置/碰撞/高度/引导; 控制项仅用于日志监控
     loss_meta_stuck = loss_stuck_seq.mean()
@@ -3580,8 +3395,6 @@ for i in pbar:
 
     ###### C. Optimization ######
     optim_worker.zero_grad()
-    optim_lgn.zero_grad()
-    lgn_update_loss = 0.0
     worker_grad_norm = 0.0
     worker_grad_max = 0.0
     worker_grad_nonfinite = 0.0
@@ -3602,19 +3415,6 @@ for i in pbar:
     proxy_grad_avoid_elems = 0.0
     proxy_grad_expl_elems = 0.0
     proxy_grad_turn_elems = 0.0
-    lgn_grad_norm = 0.0
-    lgn_grad_max = 0.0
-    lgn_grad_nonfinite = 0.0
-    lgn_grad_elems = 0.0
-    lgn_clip_pre = 0.0
-    meta_grad_window_mean = 0.0
-    meta_grad_window_min = 0.0
-    meta_grad_window_max = 0.0
-    meta_grad_window_finite_ratio = 0.0
-    meta_grad_window_nonzero_ratio = 0.0
-    lgn_meta_probe_norm = 0.0
-    lgn_meta_probe_nonfinite = 0.0
-    lgn_meta_probe_elems = 0.0
 
     rollout_is_finite = bool(
         torch.isfinite(proxy_loss).all()
@@ -3650,185 +3450,16 @@ for i in pbar:
             f"turn={proxy_grad_turn:.6f} (NonFinite={proxy_grad_turn_nonfinite}/{proxy_grad_turn_elems})"
         )
 
-    if train_lgn_phase:
-        # ===== Unrolled Bilevel: 可微内循环 =====
-        # Step 1: 用 proxy_loss 对 worker 做可微梯度下降
-        fast_params = dict(worknet.named_parameters())
-        inner_update_is_finite = True
-
-        for _inner in range(args.inner_steps):
-            inner_grads = torch.autograd.grad(
-                proxy_loss, tuple(fast_params.values()),
-                create_graph=True, allow_unused=True, retain_graph=True,
-            )
-
-            inner_sq_terms = [(g * g).sum() for g in inner_grads if g is not None]
-            if inner_sq_terms:
-                inner_grad_norm_tensor = torch.sqrt(torch.stack(inner_sq_terms).sum() + 1e-12)
-                if not bool(torch.isfinite(inner_grad_norm_tensor).item()):
-                    inner_update_is_finite = False
-                    break
-                inner_scale = (args.inner_grad_clip / (inner_grad_norm_tensor + 1e-6)).clamp(max=1.0)
-                inner_grads = tuple((g * inner_scale) if g is not None else None for g in inner_grads)
-
-            if _inner == 0 and _diag_should_log(i):
-                fast_param_values = tuple(fast_params.values())
-
-                if args.diag_second_order:
-                    # Probe weighted per-term proxy components so each branch truly depends on LGN weights.
-                    weighted_speed = (effective_weights_seq[:, :, 0] * loss_speed_seq).mean()
-                    weighted_dir = (effective_weights_seq[:, :, 1] * loss_direction_seq).mean()
-                    weighted_avoid = (effective_weights_seq[:, :, 2] * loss_avoidance_seq).mean()
-                    weighted_expl = (effective_weights_seq[:, :, 3] * loss_exploration_seq).mean()
-                    weighted_turn = (effective_weights_seq[:, :, 4] * loss_turn_seq).mean()
-
-                    g_speed = _grad_or_none_tuple(weighted_speed, fast_param_values)
-                    g_dir = _grad_or_none_tuple(weighted_dir, fast_param_values)
-                    g_avoid = _grad_or_none_tuple(weighted_avoid, fast_param_values)
-                    g_expl = _grad_or_none_tuple(weighted_expl, fast_param_values)
-                    g_turn = _grad_or_none_tuple(weighted_turn, fast_param_values)
-
-                    lgn_param_list = list(lgn.parameters())
-                    _diag_grad_tuple_to_params("speed(weighted) second_order(worker_grad)->lgn", g_speed, lgn_param_list, i)
-                    _diag_grad_tuple_to_params("direction(weighted) second_order(worker_grad)->lgn", g_dir, lgn_param_list, i)
-                    _diag_grad_tuple_to_params("avoidance(weighted) second_order(worker_grad)->lgn", g_avoid, lgn_param_list, i)
-                    _diag_grad_tuple_to_params("exploration(weighted) second_order(worker_grad)->lgn", g_expl, lgn_param_list, i)
-                    _diag_grad_tuple_to_params("turn(weighted) second_order(worker_grad)->lgn", g_turn, lgn_param_list, i)
-                    _diag_grad_tuple_to_params("proxy_total second_order(worker_grad)->lgn", inner_grads, lgn_param_list, i)
-
-                    act_only_loss = (act_for_diag.pow(2).mean() if act_for_diag is not None else torch.tensor(0.0, device=device))
-                    act_only_weighted = effective_weights_seq[:, :, 0].mean() * act_only_loss
-                    g_act_only = torch.autograd.grad(
-                        act_only_weighted, fast_param_values,
-                        create_graph=True, allow_unused=True, retain_graph=True,
-                    )
-                    _diag_grad_tuple_to_params("act_only(weighted) second_order(worker_grad)->lgn", g_act_only, lgn_param_list, i)
-
-                    _diag_grad_tuple_to_params("inner_grads(sum) -> lgn", inner_grads, lgn_param_list, i)
-                    toy_grad = tuple((g.pow(2) if g is not None else None) for g in inner_grads)
-                    _diag_grad_tuple_to_params("toy_grad(sqsum) -> lgn", toy_grad, lgn_param_list, i)
-
-                inner_norm, inner_nonfinite, inner_elems = get_grad_norm_from_grads(inner_grads)
-                print(f"[DIAG iter={i}] inner_grads finite: nonfinite={inner_nonfinite}/{inner_elems}")
-
-            fast_params = {
-                name: (p - args.inner_lr * g
-                       if g is not None else p)
-                for (name, p), g in zip(fast_params.items(), inner_grads)
-            }
-
-        if not inner_update_is_finite:
-            if term_log_now:
-                pbar.set_description(f"[{phase_str}] non-finite inner-update skipped")
-            continue
-
-        if _diag_should_log(i):
-            fast_param_vals = list(fast_params.values())
-            if len(fast_param_vals) > 0:
-                _diag_tensor_finite("first_fast_param", fast_param_vals[0], i)
-                _diag_output_to_params_count("fast_params(sum) -> lgn", sum(fp.sum() for fp in fast_param_vals), lgn.parameters(), i)
-
-        # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
-        meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_ctrl_ur = \
-            unrolled_meta_rollout(env, worknet, fast_params, state_normalizer, args, B, device)
-        if not torch.isfinite(meta_loss_unrolled):
-            if term_log_now:
-                pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
-            continue
-
-        if _diag_should_log(i):
-            print(
-                f"[DIAG iter={i}] meta_loss_unrolled: requires_grad={meta_loss_unrolled.requires_grad}, "
-                f"grad_fn={type(meta_loss_unrolled.grad_fn).__name__ if meta_loss_unrolled.grad_fn else 'None'}"
-            )
-            _diag_tensor_finite("meta_loss_unrolled", meta_loss_unrolled, i)
-            _diag_output_to_params_count("meta_loss_unrolled -> lgn", meta_loss_unrolled, lgn.parameters(), i)
-            _diag_output_to_params("meta_loss_unrolled -> fast_params", meta_loss_unrolled, fast_params.values(), i)
-            _diag_output_to_params("proxy_loss -> lgn", proxy_loss, lgn.parameters(), i)
-            _diag_output_to_params("meta_loss -> lgn", meta_loss, lgn.parameters(), i)
-
-        # Step 3: 反向传播贯穿整条链路
-        #   meta_loss → fast_params → ∇proxy_loss → LGN weights → LGN params
-        # LGN 更新仅使用 unrolled meta loss，不再混入 proxy aux 或 fallback。
-        meta_probe_grads = torch.autograd.grad(
-            meta_loss_unrolled,
-            tuple(lgn.parameters()),
-            allow_unused=True,
-            retain_graph=True,
-            create_graph=False,
-        )
-        lgn_meta_probe_norm, lgn_meta_probe_nonfinite, lgn_meta_probe_elems = get_grad_norm_from_grads(meta_probe_grads)
-        meta_grad_usable = (
-            lgn_meta_probe_elems > 0
-            and lgn_meta_probe_nonfinite == 0
-            and lgn_meta_probe_norm > 0.0
-            and math.isfinite(lgn_meta_probe_norm)
-        )
-        scaled_meta = scale_scalar_objective(meta_loss_unrolled)
-        if not meta_grad_usable:
-            if _diag_should_log(i):
-                print(
-                    f"[DIAG iter={i}] skip LGN step: unusable meta gradients "
-                    f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
-                    f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
-                )
-            if term_log_now:
-                pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
-            continue
-
-        lgn_total = scaled_meta
-
-        lgn_total.backward()
-        lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
-        if _diag_should_log(i):
-            print(
-                f"[DIAG iter={i}] lgn_grads: norm={lgn_grad_norm:.6f}, "
-                f"nonfinite={int(lgn_grad_nonfinite)}/{int(lgn_grad_elems)}, max={lgn_grad_max:.6f}"
-            )
-        if math.isfinite(lgn_grad_norm):
-            meta_lgn_grad_window.append(float(lgn_grad_norm))
-        else:
-            meta_lgn_grad_window.append(float('nan'))
-
-        valid_meta_grad = [g for g in meta_lgn_grad_window if math.isfinite(g)]
-        if valid_meta_grad:
-            meta_grad_window_mean = float(sum(valid_meta_grad) / len(valid_meta_grad))
-            meta_grad_window_min = float(min(valid_meta_grad))
-            meta_grad_window_max = float(max(valid_meta_grad))
-        meta_grad_window_finite_ratio = float(
-            sum(1 for g in meta_lgn_grad_window if math.isfinite(g)) / max(1, len(meta_lgn_grad_window))
-        )
-        meta_grad_window_nonzero_ratio = float(
-            sum(1 for g in meta_lgn_grad_window if math.isfinite(g) and g > 0.0) / max(1, len(meta_lgn_grad_window))
-        )
-
-        if _diag_should_log(i):
-            print(
-                f"[DIAG iter={i}] meta_loss_unrolled->LGN grad window "
-                f"len={len(meta_lgn_grad_window)}, finite_ratio={meta_grad_window_finite_ratio:.3f}, "
-                f"nonzero_ratio={meta_grad_window_nonzero_ratio:.3f}, mean={meta_grad_window_mean:.6g}, "
-                f"min={meta_grad_window_min:.6g}, max={meta_grad_window_max:.6g}"
-            )
-
-        lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
-        optim_lgn.step()
-        sanitize_module_(lgn, clamp_value=5.0)
-
-        lgn_update_loss = meta_loss_unrolled.detach()
-    else:
-        proxy_loss.backward()
-        worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
-        worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 1.0).item())
-        optim_worker.step()
-        sanitize_module_(worknet, clamp_value=10.0)
-        sched.step()
+    proxy_loss.backward()
+    worker_grad_norm, worker_grad_max, worker_grad_nonfinite, worker_grad_elems = get_grad_stats(worknet)
+    worker_clip_pre = float(nn.utils.clip_grad_norm_(worknet.parameters(), 1.0).item())
+    optim_worker.step()
+    sanitize_module_(worknet, clamp_value=10.0)
+    sched.step()
 
     ###### D. Logging & Saving (Enhanced) ######
     if term_log_now:
-        if train_lgn_phase:
-            pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Unroll: {lgn_update_loss:.3f}")
-        else:
-            pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
+        pbar.set_description(f"[{phase_str}] P-Loss: {proxy_loss:.3f} | M-Loss: {meta_loss:.3f}")
     
     with torch.no_grad():
         collision_free = torch.all(dist_obj > 0, dim=0)
@@ -3925,7 +3556,7 @@ for i in pbar:
             'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
             'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
             'Guidance/Field_Dir_Align': guidance_components.get('field_dir_align', 0.0),
-            'Guidance/Applied_In_Current_Phase': 1.0 if train_lgn_phase else 0.0,
+            'Guidance/Applied_In_Current_Phase': 0.0,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -3965,19 +3596,6 @@ for i in pbar:
             'Grad/Worker_NonFinite_Count': worker_grad_nonfinite,
             'Grad/Worker_GradElem_Count': worker_grad_elems,
             'Grad/Worker_Clip_PreNorm': worker_clip_pre,
-            'Grad/LGN_Global_Norm': lgn_grad_norm,
-            'Grad/LGN_Max_Abs': lgn_grad_max,
-            'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
-            'Grad/LGN_GradElem_Count': lgn_grad_elems,
-            'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
-            'Grad/LGN_MetaWindow_Mean': meta_grad_window_mean,
-            'Grad/LGN_MetaWindow_Min': meta_grad_window_min,
-            'Grad/LGN_MetaWindow_Max': meta_grad_window_max,
-            'Grad/LGN_MetaWindow_FiniteRatio': meta_grad_window_finite_ratio,
-            'Grad/LGN_MetaWindow_NonZeroRatio': meta_grad_window_nonzero_ratio,
-            'Grad/LGN_MetaProbe_Norm': lgn_meta_probe_norm,
-            'Grad/LGN_MetaProbe_NonFinite_Count': lgn_meta_probe_nonfinite,
-            'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
 
             # === [新增] 五个代理损失对 Worker 梯度的 norm ===
             'Grad_ProxyWorker/0_Speed_Norm': proxy_grad_speed,
@@ -4006,36 +3624,17 @@ for i in pbar:
                 'Experiment/Proxy_TimeAvg_Pref/4_Turn': fixed_vals[4],
             })
 
-        if train_lgn_phase:
-            log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss
-            log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
-            log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
-            log_data['Meta_Unrolled/3_Control'] = meta_ctrl_ur
-
-        if geom_feat_last is not None and progress_feat_last is not None:
-            log_data['LGN_Input/Geom_Mean'] = geom_feat_last.mean()
-            log_data['LGN_Input/Geom_Std'] = geom_feat_last.std(unbiased=False)
-            log_data['LGN_Input/Geom_Norm'] = geom_feat_last.norm(dim=-1).mean()
-            log_data['LGN_Input/Progress_Mean'] = progress_feat_last.mean()
-            log_data['LGN_Input/Progress_Std'] = progress_feat_last.std(unbiased=False)
-            log_data['LGN_Input/Progress_Norm'] = progress_feat_last.norm(dim=-1).mean()
-            for feat_idx in range(min(4, geom_feat_last.shape[-1])):
-                log_data[f'LGN_Input/Geom_{feat_idx}'] = geom_feat_last[:, feat_idx].mean()
-            for feat_idx in range(min(4, progress_feat_last.shape[-1])):
-                log_data[f'LGN_Input/Progress_{feat_idx}'] = progress_feat_last[:, feat_idx].mean()
-
         smooth_dict(log_data)
 
         if (i + 1) % 25 == 0:
             for k, v in scaler_q.items():
                 writer.add_scalar(k, sum(v) / len(v), i + 1)
             scaler_q.clear()
-            writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
+            writer.add_scalar('Status/Train_Mode', 0.0, i + 1)
             writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
 
         if is_save_iter(i):
             torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
-            torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
             torch.save(state_normalizer.state_dict(), os.path.join(save_dir, f'norm_ckpt_{i:06d}.pth'))
 
         if is_save_trajectory_iter(i):

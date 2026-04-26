@@ -3304,15 +3304,35 @@ def unrolled_meta_rollout(
                + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
 
     m_stuck = loss_stuck_val.mean()
+    v_val = torch.stack(v_list)
+    a_val = torch.stack(a_list)
+    m_guidance, _ = compute_global_guidance_meta_loss(
+        env, p_val, v_val, env.p_target, vec_val, dist_val,
+        a_history=a_val,
+        sample_count=args.guide_sample_count,
+        strategy=args.guide_sample_strategy,
+        max_speed=float(env.max_speed),
+        max_accel=args.guide_max_accel,
+        max_decel=args.guide_max_decel,
+        dir_weight=args.guide_dir_weight,
+        speed_weight=args.guide_speed_weight,
+        lateral_weight=args.guide_lateral_weight,
+        escape_weight=args.guide_escape_weight,
+        collision_threshold=args.guide_collision_threshold,
+        accel_weight=args.guide_accel_weight,
+        speed_diff_weight=args.guide_speed_diff_weight,
+        recovery_speed_weight=args.guide_recovery_speed_weight,
+    )
 
     meta_val = (
         m_pos
         + m_coll
         + m_height
+        + args.meta_guidance_weight * m_guidance
         + args.stuck_loss_weight * m_stuck
         + args.meta_smooth_weight * m_smooth
     )
-    return meta_val, m_pos, m_coll
+    return meta_val, m_pos, m_coll, m_guidance
 
 ########## 7. 训练主循环 ##########
 
@@ -3670,10 +3690,64 @@ for i in pbar:
         loss_ref_smooth = torch.tensor(0.0, device=p_history.device, dtype=p_history.dtype)
 
     loss_meta_stuck = loss_stuck_seq.mean()
+    if train_lgn_phase:
+        loss_meta_guidance, guidance_components = compute_global_guidance_meta_loss(
+            env, p_history, v_history, env.p_target, vec_to_pt, dist_obj,
+            a_history=a_history,
+            sample_count=args.guide_sample_count,
+            strategy=args.guide_sample_strategy,
+            max_speed=float(env.max_speed),
+            max_accel=args.guide_max_accel,
+            max_decel=args.guide_max_decel,
+            dir_weight=args.guide_dir_weight,
+            speed_weight=args.guide_speed_weight,
+            lateral_weight=args.guide_lateral_weight,
+            escape_weight=args.guide_escape_weight,
+            collision_threshold=args.guide_collision_threshold,
+            accel_weight=args.guide_accel_weight,
+            speed_diff_weight=args.guide_speed_diff_weight,
+            recovery_speed_weight=args.guide_recovery_speed_weight,
+        )
+    else:
+        zero = torch.tensor(0.0, device=p_history.device, dtype=p_history.dtype)
+        loss_meta_guidance = zero
+        guidance_components = {
+            'dir_align': zero,
+            'speed_diff': zero,
+            'overspeed': zero,
+            'underspeed': zero,
+            'lateral_error': zero,
+            'accel_mismatch': zero,
+            'escape': zero,
+            'depth': zero,
+            'recovery_speed': zero,
+            'valid_ratio': zero,
+            'valid_guidance_ratio': zero,
+            'invalid_ratio': zero,
+            'collision_ratio': zero,
+            'sample_count': 0.0,
+            'avg_curvature': 0.0,
+            'avg_path_progress': 0.0,
+            'avg_lateral_error': 0.0,
+            'max_lateral_error': 0.0,
+            'planner_success_ratio': 0.0,
+            'avg_ref_speed': 0.0,
+            'sampled_astar_paths': [],
+            'field_dir_align': zero,
+            'guidance_valid_mean': zero,
+            'guidance_recovery_mean': zero,
+            'guidance_boost': 1.0,
+            'potential_mean': zero,
+            'potential_decrease': zero,
+            'potential_abs': zero,
+            'potential_step_penalty': zero,
+            'potential_valid_ratio': zero,
+        }
     meta_loss = (
         loss_meta_pos +
         loss_meta_coll +
         loss_meta_height +
+        args.meta_guidance_weight * loss_meta_guidance +
         args.stuck_loss_weight * loss_meta_stuck +
         args.meta_smooth_weight * loss_meta_smooth +
         args.meta_ref_smooth_weight * loss_ref_smooth
@@ -3819,7 +3893,7 @@ for i in pbar:
                 _diag_output_to_params_count("fast_params(sum) -> lgn", sum(fp.sum() for fp in fast_param_vals), lgn.parameters(), i)
 
         # Step 2: 用虚拟更新后的 worker 做验证 rollout → meta_loss
-        meta_loss_unrolled, meta_pos_ur, meta_coll_ur = \
+        meta_loss_unrolled, meta_pos_ur, meta_coll_ur, meta_guidance_ur = \
             unrolled_meta_rollout(
                 env, worknet, fast_params, state_normalizer, geom_normalizer, progress_normalizer, args, B, device
             )
@@ -3990,9 +4064,42 @@ for i in pbar:
             'Meta_Comp/1_Position': loss_meta_pos,
             'Meta_Comp/2_Collision': loss_meta_coll,
             'Meta_Comp/4_Height': loss_meta_height,
+            'Meta_Comp/5_Guidance': loss_meta_guidance,
             'Meta_Comp/6_Stuck': loss_meta_stuck,
             'Meta_Comp/7_Smooth_Weak': loss_meta_smooth,
             'Meta_Comp/8_Ref_Smooth': loss_ref_smooth,
+
+            # === 全局/势场引导损失分项 ===
+            'Guidance/Dir_Align': guidance_components['dir_align'],
+            'Guidance/Overspeed': guidance_components['overspeed'],
+            'Guidance/Underspeed': guidance_components.get('underspeed', 0.0),
+            'Guidance/Speed_Diff': guidance_components.get('speed_diff', 0.0),
+            'Guidance/Lateral_Error': guidance_components.get('lateral_error', 0.0),
+            'Guidance/Accel_Mismatch': guidance_components.get('accel_mismatch', 0.0),
+            'Guidance/Escape': guidance_components['escape'],
+            'Guidance/Depth': guidance_components['depth'],
+            'Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
+            'Guidance/Valid_Ratio': guidance_components['valid_ratio'],
+            'Guidance/Valid_Guidance_Ratio': guidance_components.get('valid_guidance_ratio', 0.0),
+            'Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
+            'Guidance/Collision_Ratio': guidance_components['collision_ratio'],
+            'Guidance/Valid_Mean': guidance_components.get('guidance_valid_mean', 0.0),
+            'Guidance/Recovery_Mean': guidance_components.get('guidance_recovery_mean', 0.0),
+            'Guidance/Boost': guidance_components.get('guidance_boost', 1.0),
+            'Guidance/Sample_Count': guidance_components['sample_count'],
+            'Guidance/Avg_Curvature': guidance_components.get('avg_curvature', 0.0),
+            'Guidance/Avg_Path_Progress': guidance_components.get('avg_path_progress', 0.0),
+            'Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
+            'Guidance/Avg_Lateral_Error': guidance_components.get('avg_lateral_error', 0.0),
+            'Guidance/Max_Lateral_Error': guidance_components.get('max_lateral_error', 0.0),
+            'Guidance/Planner_Success_Ratio': guidance_components.get('planner_success_ratio', 0.0),
+            'Guidance/Field_Dir_Align': guidance_components.get('field_dir_align', 0.0),
+            'Guidance/Potential_Mean': guidance_components.get('potential_mean', 0.0),
+            'Guidance/Potential_Decrease': guidance_components.get('potential_decrease', 0.0),
+            'Guidance/Potential_Abs': guidance_components.get('potential_abs', 0.0),
+            'Guidance/Potential_Step_Penalty': guidance_components.get('potential_step_penalty', 0.0),
+            'Guidance/Potential_Valid_Ratio': guidance_components.get('potential_valid_ratio', 0.0),
+            'Guidance/Applied_In_Current_Phase': 1.0 if train_lgn_phase else 0.0,
 
             # === 性能指标 ===
             'Metrics/Success_Rate': success.float().mean(),
@@ -4067,6 +4174,7 @@ for i in pbar:
             log_data['Loss/3_LGN_Unrolled_Meta'] = lgn_update_loss
             log_data['Meta_Unrolled/1_Position'] = meta_pos_ur
             log_data['Meta_Unrolled/2_Collision'] = meta_coll_ur
+            log_data['Meta_Unrolled/5_Guidance'] = meta_guidance_ur
 
         if geom_feat_last is not None and progress_feat_last is not None:
             log_data['LGN_Input/Geom_Mean'] = geom_feat_last.mean()

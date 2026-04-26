@@ -969,7 +969,7 @@ class Env(BaseEnv):
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.n_drones_per_group = 1 if self.single else random.choice([4, 8])
-        self.drone_radius = random.uniform(0.10, 0.15)
+        self.drone_radius = 0.13
         self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
         self._obstacle_scale = torch.ones((B, 1), device=device)
 
@@ -1123,7 +1123,7 @@ class Env(BaseEnv):
         ).reshape(B, 3, 3)
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
-        self.drone_radius = random.uniform(0.10, 0.15)
+        self.drone_radius = 0.13
         self.max_speed = float(min(5.0 * self.speed_mtp, self.max_speed_ceiling))
         self._reset_drone_state(getattr(self, "_obstacle_scale", None))
 
@@ -1165,7 +1165,7 @@ class Env(BaseEnv):
         )
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+        self.margin = torch.full((B,), 0.07, device=device)
         self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
         self.drag_2[:, 0] = 0
         self.z_drag_coef = torch.ones((B, 1), device=device)

@@ -2,3 +2,8 @@
 1	10993	1775361027858416527	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/quadsim.o	51f527ca0fffb5a2
 1	21894	1775361027858416527	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/quadsim_kernel.o	53661ae3c11d1efc
 0	22631	1775361027854416552	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/dynamics_kernel.o	2e91947a4234ff32
+0	11914	1777262554335730962	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/quadsim.o	b65eef0a9dd0e77d
+0	24208	1777262566615680688	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/dynamics_kernel.o	a5d53bf9e3fdac42
+0	25271	1777262567679676381	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/quadsim_kernel.o	48484c825387219f
+6	31705	1777262697215204358	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/dynamics_kernel.o	1054335c07109af2
+6	33326	1777262698843199032	/home/robot/transformer/multi_pub/src/build/temp.linux-x86_64-cpython-311/quadsim_kernel.o	648bdab2b361b448

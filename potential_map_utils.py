@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+PLANNER_DRONE_RADIUS = 0.13
+_DIJKSTRA_EPS = 1e-12
+
 
 def build_occupancy_grid_from_obstacles(
     voxels: np.ndarray,
@@ -13,7 +16,8 @@ def build_occupancy_grid_from_obstacles(
     cyl: np.ndarray,
     cyl_h: np.ndarray,
     resolution: float = 0.3,
-    margin: float = 0.15,
+    margin: float = 0.07,
+    drone_radius: float = PLANNER_DRONE_RADIUS,
     bounds: Optional[Dict[str, float]] = None,
     z_min: float = 0.0,
     z_max: float = 5.0,
@@ -39,7 +43,7 @@ def build_occupancy_grid_from_obstacles(
     grid = np.zeros((nx, ny, nz), dtype=np.uint8)
     origin = np.asarray([x_min, y_min, z_min], dtype=np.float32)
     shape = (nx, ny, nz)
-    total_margin = float(margin) + 0.15
+    total_margin = max(0.0, float(margin)) + max(0.0, float(drone_radius))
 
     # Voxels
     if voxels is not None and voxels.size > 0:
@@ -162,19 +166,20 @@ def compute_dijkstra_potential(
 ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
     """Compute shortest-path distance field from goal over free voxels."""
     nx, ny, nz = occupancy.shape
-    potential = np.full((nx, ny, nz), np.inf, dtype=np.float32)
+    # Use float64 during propagation to reduce precision loss on large grids.
+    potential64 = np.full((nx, ny, nz), np.inf, dtype=np.float64)
 
     g = _find_nearest_free(occupancy, goal_idx)
     if g is None:
-        return potential, goal_idx
+        return potential64.astype(np.float32), goal_idx
 
     pq: List[Tuple[float, Tuple[int, int, int]]] = []
-    potential[g] = 0.0
+    potential64[g] = 0.0
     heapq.heappush(pq, (0.0, g))
 
     while pq:
         cur_d, (x, y, z) = heapq.heappop(pq)
-        if cur_d > float(potential[x, y, z]):
+        if cur_d > float(potential64[x, y, z]) + _DIJKSTRA_EPS:
             continue
         for dx, dy, dz, cost in _NEI26:
             nx_i = x + dx
@@ -185,12 +190,12 @@ def compute_dijkstra_potential(
             if occupancy[nx_i, ny_i, nz_i] != 0:
                 continue
             nd = cur_d + float(cost) * float(resolution)
-            if nd < float(potential[nx_i, ny_i, nz_i]):
-                potential[nx_i, ny_i, nz_i] = nd
+            if nd + _DIJKSTRA_EPS < float(potential64[nx_i, ny_i, nz_i]):
+                potential64[nx_i, ny_i, nz_i] = nd
                 heapq.heappush(pq, (nd, (nx_i, ny_i, nz_i)))
 
-    potential[occupancy != 0] = np.inf
-    return potential, g
+    potential64[occupancy != 0] = np.inf
+    return potential64.astype(np.float32), g
 
 
 def compute_descending_vector_field(potential: np.ndarray, occupancy: np.ndarray) -> np.ndarray:
@@ -345,8 +350,37 @@ class PotentialMapCache:
         if not os.path.isdir(map_dir):
             return []
         files = []
-        for name in sorted(os.listdir(map_dir)):
-            if name.startswith("map_") and name.endswith(".pt"):
+
+        type_order = {
+            "hard": 0,
+            "easy": 1,
+            "u_min": 2,
+            "hairpin": 3,
+        }
+
+        def sort_key(name: str):
+            if not name.endswith(".pt"):
+                return (9, name)
+            stem = name[:-3]
+
+            # Unified dataset naming: <type_prefix>_<idx>.pt
+            if "_" in stem:
+                prefix, idx_str = stem.rsplit("_", 1)
+                if prefix in type_order and idx_str.isdigit():
+                    return (0, type_order[prefix], int(idx_str), name)
+
+            # Legacy naming: map_<idx>.pt
+            if stem.startswith("map_"):
+                idx_str = stem[4:]
+                if idx_str.isdigit():
+                    return (1, int(idx_str), name)
+                return (1, 10**9, name)
+
+            # Fallback for any other .pt maps.
+            return (9, name)
+
+        for name in sorted(os.listdir(map_dir), key=sort_key):
+            if sort_key(name)[0] < 9:
                 files.append(os.path.join(map_dir, name))
         if num_maps > 0:
             files = files[:num_maps]

@@ -5,7 +5,7 @@ nvcc = /usr/local/cuda/bin/nvcc
 cflags = -pthread -B /home/robot/.conda/envs/DiffPhysDrone/compiler_compat -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/robot/.conda/envs/DiffPhysDrone/include -fPIC -O2 -isystem /home/robot/.conda/envs/DiffPhysDrone/include -fPIC -I/home/robot/.conda/envs/DiffPhysDrone/lib/python3.11/site-packages/torch/include -I/home/robot/.conda/envs/DiffPhysDrone/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/robot/.conda/envs/DiffPhysDrone/include/python3.11 -c
 post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=quadsim_cuda -std=c++17
 cuda_cflags = -I/home/robot/.conda/envs/DiffPhysDrone/lib/python3.11/site-packages/torch/include -I/home/robot/.conda/envs/DiffPhysDrone/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/robot/.conda/envs/DiffPhysDrone/include/python3.11 -c
-cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=quadsim_cuda -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -std=c++17
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=quadsim_cuda -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=compute_80 -gencode=arch=compute_80,code=sm_80 -std=c++17
 cuda_dlink_post_cflags = 
 sycl_dlink_post_cflags = 
 ldflags = 

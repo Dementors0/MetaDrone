@@ -88,8 +88,9 @@ class LossGenNet(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, 5),  # [Vel, Dir, Obs, Expl, Turn]
+            nn.Linear(hidden_dim, 6),  # [Vel, Dir, Obs, Expl, Turn, VRef]
         )
+        self.vref_head = nn.Linear(hidden_dim, 3)
 
     def forward(self, depth_feat, state, geom_feat, progress_feat, hx=None):
         """
@@ -100,7 +101,8 @@ class LossGenNet(nn.Module):
             progress_feat: [B, progress_dim] 近期进展/卡住统计特征
             hx: [B, T_mem, hidden_dim] 历史记忆 token (如果是第一步则为 None)
         返回:
-            weights: [B, 5]
+            weights: [B, 6]
+            vref_body: [B, 3]
             hx: [B, T_mem, hidden_dim] 更新后的记忆序列
         """
         # 1. 提取视觉特征
@@ -146,6 +148,8 @@ class LossGenNet(nn.Module):
         # 6. 生成非负权重（不做归一化，仅约束 >= 0）
         raw = self.head(last_token)
         weights = F.softplus(raw)
+        vref_body = torch.tanh(self.vref_head(last_token))
+        vref_body = F.normalize(vref_body, dim=-1, eps=1e-6)
 
-        # 返回 weights 和 Transformer 编码后的记忆序列
-        return weights, x_out
+        # 返回 weights、局部参考方向和 Transformer 编码后的记忆序列
+        return weights, vref_body, x_out

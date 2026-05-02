@@ -40,12 +40,9 @@ parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='control je
 parser.add_argument('--coef_d_snap', type=float, default=0.0, help='legacy')
 parser.add_argument('--coef_ground_affinity', type=float, default=0., help='legacy')
 parser.add_argument('--coef_bias', type=float, default=0.0, help='legacy')
-parser.add_argument('--attitude_model', type=str, default='legacy', choices=['legacy', 'v2'],
+parser.add_argument('--attitude_model', type=str, default='v2', choices=['legacy', 'v2'],
                     help='legacy uses v_pred-projected heading; v2 uses explicit yaw-rate dynamics')
-parser.add_argument('--yaw_control_source', type=str, default='rule', choices=['rule', 'model'],
-                    help='rule lets the dynamics compute yaw-rate from heading_ref; model uses act[...,6]')
 parser.add_argument('--yaw_rate_max_deg', type=float, default=150.0)
-parser.add_argument('--yaw_cmd_warmup_iters', type=int, default=2000)
 parser.add_argument('--coef_yaw_cmd', type=float, default=0.2)
 parser.add_argument('--coef_yaw_smooth', type=float, default=0.01)
 parser.add_argument('--lr', type=float, default=1e-3)
@@ -202,7 +199,7 @@ def build_yaw_frame(R):
     return torch.stack([fwd_h, left, up], -1)
 
 
-def compute_heading_reference(env, R_yaw, yaw_rate_max_value, yaw_ref_kp=3.0):
+def compute_heading_reference(env, R_yaw):
     target_vec = env.p_target - env.p.detach()
     zeros = torch.zeros_like(target_vec[:, 2])
     heading_ref_world = torch.stack([target_vec[:, 0], target_vec[:, 1], zeros], dim=-1)
@@ -215,8 +212,7 @@ def compute_heading_reference(env, R_yaw, yaw_rate_max_value, yaw_ref_kp=3.0):
     )
     heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
     yaw_error = torch.atan2(heading_ref_local[:, 1], heading_ref_local[:, 0]).unsqueeze(-1)
-    yaw_rate_ref = torch.clamp(float(yaw_ref_kp) * yaw_error, -float(yaw_rate_max_value), float(yaw_rate_max_value))
-    return heading_ref_world, heading_ref_local[:, :2], yaw_rate_ref, yaw_error
+    return heading_ref_world, heading_ref_local[:, :2], yaw_error
 
 
 def decode_worker_action(act, R_yaw, yaw_rate_max_value):
@@ -419,7 +415,6 @@ for i in pbar:
     act_cmd_history = []
     target_v_history = []
     yaw_rate_cmd_history = []
-    yaw_rate_ref_history = []
     yaw_error_history = []
     vec_to_pt_history = []
     act_diff_history = []
@@ -467,8 +462,8 @@ for i in pbar:
         ####仿真器执行一个时间步####
         if use_attitude_v2:
             R_yaw_pre = build_yaw_frame(env.R)
-            heading_ref_world_pre, _, _, _ = compute_heading_reference(env, R_yaw_pre, yaw_rate_max)
-            yaw_rate_step = yaw_rate_buffer[t] if args.yaw_control_source == 'model' else None
+            heading_ref_world_pre, _, _ = compute_heading_reference(env, R_yaw_pre)
+            yaw_rate_step = yaw_rate_buffer[t]
             env.run(
                 act_buffer[t], ctl_dt,
                 heading_ref=heading_ref_world_pre,
@@ -500,7 +495,7 @@ for i in pbar:
             ##安全半径##
             env.margin[:, None]]
         if use_attitude_v2:
-            heading_ref_world, heading_ref_local_xy, yaw_rate_ref, yaw_error = compute_heading_reference(env, R, yaw_rate_max)
+            heading_ref_world, heading_ref_local_xy, yaw_error = compute_heading_reference(env, R)
             yaw_rate_norm = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)) / float(yaw_rate_max)
             state.extend([heading_ref_local_xy, yaw_rate_norm])
         ####计算 无人机相对于自身机头方向的飞行速度####
@@ -527,13 +522,8 @@ for i in pbar:
         act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
         act_buffer.append(act)
         if use_attitude_v2:
-            if args.yaw_control_source == 'model':
-                blend = min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters)))
-                yaw_rate_used = (1.0 - blend) * yaw_rate_ref.detach() + blend * yaw_rate_cmd
-                yaw_rate_cmd_history.append(yaw_rate_cmd)
-                yaw_rate_ref_history.append(yaw_rate_ref)
-            else:
-                yaw_rate_used = yaw_rate_ref.detach()
+            yaw_rate_used = yaw_rate_cmd
+            yaw_rate_cmd_history.append(yaw_rate_cmd)
             yaw_rate_buffer.append(yaw_rate_used)
             yaw_error_history.append(yaw_error.detach())
         act_cmd_history.append(act_buffer[t])
@@ -578,10 +568,9 @@ for i in pbar:
     loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
     loss_d_snap = snap_history.pow(2).sum(-1).mean()
     zero_loss = loss_d_acc.new_tensor(0.0)
-    if use_attitude_v2 and args.yaw_control_source == 'model' and len(yaw_rate_cmd_history) > 0:
+    if use_attitude_v2 and len(yaw_rate_cmd_history) > 0:
         yaw_rate_cmd_tensor = torch.stack(yaw_rate_cmd_history)
-        yaw_rate_ref_tensor = torch.stack(yaw_rate_ref_history)
-        loss_yaw_cmd = F.smooth_l1_loss(yaw_rate_cmd_tensor, yaw_rate_ref_tensor.detach())
+        loss_yaw_cmd = zero_loss
         if yaw_rate_cmd_tensor.shape[0] > 1:
             loss_yaw_smooth = yaw_rate_cmd_tensor.diff(1, 0).pow(2).mean()
         else:
@@ -671,7 +660,6 @@ for i in pbar:
             'avg_speed': avg_speed.mean(),
             'Heading/Yaw_Error_Abs_Deg': yaw_error_abs_deg,
             'Heading/Yaw_Rate_Abs_Deg': yaw_rate_env_abs_deg,
-            'Heading/Yaw_Blend': min(1.0, float(i + 1) / max(1, int(args.yaw_cmd_warmup_iters))) if use_attitude_v2 else 0.0,
             'ar': (success.float() * avg_speed).mean()})
         # 逐轮记录“最后一个时间步到终点距离”，确保 TensorBoard 横轴为训练轮次（i+1）。
         writer.add_scalar('Metrics/LastStep_Dist_To_Goal', float(last_step_dist_to_goal.item()), i + 1)

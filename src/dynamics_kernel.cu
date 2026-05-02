@@ -69,9 +69,7 @@ __global__ void update_state_vec_v2_cuda_kernel(
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> yaw_rate_cmd,
     torch::PackedTensorAccessor<scalar_t,2,torch::RestrictPtrTraits,size_t> alpha,
     float ctl_dt,
-    float yaw_rate_max,
-    float yaw_ref_kp,
-    bool use_yaw_rate_cmd) {
+    float yaw_rate_max) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int B = R.size(0);
     if (b >= B) return;
@@ -118,15 +116,7 @@ __global__ void update_state_vec_v2_cuda_kernel(
         cur_y = ref_y;
     }
 
-    scalar_t cross_z = cur_x * ref_y - cur_y * ref_x;
-    scalar_t dot_xy = cur_x * ref_x + cur_y * ref_y;
-    dot_xy = dot_xy > static_cast<scalar_t>(1.0 - 1e-6) ? static_cast<scalar_t>(1.0 - 1e-6) : dot_xy;
-    dot_xy = dot_xy < static_cast<scalar_t>(-1.0 + 1e-6) ? static_cast<scalar_t>(-1.0 + 1e-6) : dot_xy;
-    scalar_t yaw_error = atan2(cross_z, dot_xy);
-    scalar_t cmd = static_cast<scalar_t>(yaw_ref_kp) * yaw_error;
-    if (use_yaw_rate_cmd) {
-        cmd = yaw_rate_cmd[b][0];
-    }
+    scalar_t cmd = yaw_rate_cmd[b][0];
     const scalar_t max_yaw = static_cast<scalar_t>(yaw_rate_max);
     cmd = cmd > max_yaw ? max_yaw : cmd;
     cmd = cmd < -max_yaw ? -max_yaw : cmd;
@@ -523,9 +513,7 @@ std::vector<torch::Tensor> update_state_vec_v2_cuda(
     torch::Tensor yaw_rate_cmd,
     torch::Tensor alpha,
     float ctl_dt,
-    float yaw_rate_max,
-    float yaw_ref_kp,
-    bool use_yaw_rate_cmd) {
+    float yaw_rate_max) {
     const int threads = a_thr.size(0);
     const dim3 blocks(1);
     torch::Tensor R_new = torch::empty_like(R);
@@ -541,9 +529,7 @@ std::vector<torch::Tensor> update_state_vec_v2_cuda(
             yaw_rate_cmd.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
             alpha.packed_accessor<scalar_t,2,torch::RestrictPtrTraits,size_t>(),
             ctl_dt,
-            yaw_rate_max,
-            yaw_ref_kp,
-            use_yaw_rate_cmd);
+            yaw_rate_max);
     }));
     return {R_new, yaw_rate_new};
 }

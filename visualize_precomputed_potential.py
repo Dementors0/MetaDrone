@@ -14,10 +14,72 @@ def _collect_map_files(map_dir):
     files = []
     if not os.path.isdir(map_dir):
         return files
-    for name in sorted(os.listdir(map_dir)):
-        if name.startswith("map_") and name.endswith(".pt"):
+    type_order = {
+        "hard": 0,
+        "easy": 1,
+        "u_min": 2,
+        "hairpin": 3,
+    }
+
+    def _sort_key(name):
+        if not name.endswith(".pt"):
+            return (9, name)
+        stem = name[:-3]
+        if "_" in stem:
+            prefix, idx_str = stem.rsplit("_", 1)
+            if prefix in type_order and idx_str.isdigit():
+                return (0, type_order[prefix], int(idx_str), name)
+        if stem.startswith("map_"):
+            idx_str = stem[4:]
+            if idx_str.isdigit():
+                return (1, int(idx_str), name)
+            return (1, 10**9, name)
+        return (9, name)
+
+    for name in sorted(os.listdir(map_dir), key=_sort_key):
+        if _sort_key(name)[0] < 9:
             files.append(os.path.join(map_dir, name))
     return files
+
+
+def _map_type_from_file(path_or_name):
+    stem = os.path.splitext(os.path.basename(path_or_name))[0]
+    if stem.startswith("hard_"):
+        return "hard"
+    if stem.startswith("easy_"):
+        return "easy"
+    if stem.startswith("u_min_"):
+        return "u_min"
+    if stem.startswith("hairpin_"):
+        return "hairpin"
+    return ""
+
+
+def _select_four_type_paths(files, per_type_index=0):
+    groups = {
+        "hard": [],
+        "easy": [],
+        "u_min": [],
+        "hairpin": [],
+    }
+    for path in files:
+        map_type = _map_type_from_file(path)
+        if map_type in groups:
+            groups[map_type].append(path)
+
+    missing = [k for k, v in groups.items() if len(v) == 0]
+    if missing:
+        raise ValueError(
+            "four_map_mode requires unified maps of all 4 types. Missing: "
+            + ",".join(missing)
+        )
+
+    idx = int(per_type_index)
+    selected = {}
+    for map_type in ("hard", "easy", "u_min", "hairpin"):
+        arr = groups[map_type]
+        selected[map_type] = arr[idx % len(arr)]
+    return selected
 
 
 def _pick_slice_z(z_world, origin_z, resolution, nz):
@@ -396,19 +458,36 @@ def _build_3d_figure(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize 3D potential field from precomputed map_XXX.pt"
+        description="Visualize 3D potential field from precomputed map files (.pt)"
     )
     parser.add_argument(
         "--map_dir",
         type=str,
-        default="/home/robot/transformer/precomputed_maps",
+        default="/home/robot/transformer/precomputed_maps_turn_encouragement",
         help="Directory containing map_XXX.pt",
     )
     parser.add_argument(
         "--map_index",
         type=int,
         default=0,
-        help="Index in sorted map_XXX.pt list",
+        help="Index in sorted map file list",
+    )
+    parser.add_argument(
+        "--four_map_mode",
+        action="store_true",
+        help="Render one map per type (hard/easy/u_min/hairpin) and save 4 HTML files",
+    )
+    parser.add_argument(
+        "--per_type_index",
+        type=int,
+        default=0,
+        help="In four-map mode, choose the N-th map within each type (mod by available count)",
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="",
+        help="In four-map mode, output directory of generated HTML files (default: <map_dir>/viz_four_maps)",
     )
     parser.add_argument(
         "--z_world",
@@ -476,7 +555,7 @@ def main():
 
     files = _collect_map_files(args.map_dir)
     if len(files) == 0:
-        raise FileNotFoundError(f"No map_XXX.pt found in: {args.map_dir}")
+        raise FileNotFoundError(f"No .pt map files found in: {args.map_dir}")
 
     idx = int(args.map_index) % len(files)
     path = files[idx]
@@ -484,6 +563,31 @@ def main():
 
     if go is None:
         raise ImportError("plotly is required for 3D HTML visualization. Please install plotly first.")
+
+    if bool(args.four_map_mode):
+        selected = _select_four_type_paths(files, per_type_index=args.per_type_index)
+        out_dir = args.save_dir if args.save_dir else os.path.join(args.map_dir, "viz_four_maps")
+        os.makedirs(out_dir, exist_ok=True)
+
+        for map_type in ("hard", "easy", "u_min", "hairpin"):
+            path = selected[map_type]
+            map_data = torch.load(path, map_location="cpu")
+            fig = _build_3d_figure(
+                map_data,
+                z_world=args.z_world,
+                z_band_layers=args.z_band_layers,
+                stride=args.stride,
+                arrow_stride=args.arrow_stride,
+                max_arrows=max(1, int(args.max_arrows)),
+                show_occupancy_points=bool(args.show_occupancy_points),
+                show_potential_points=bool(args.show_potential_points),
+                title_prefix=f"[{map_type}:{os.path.basename(path)}]",
+            )
+            out_name = f"{os.path.splitext(os.path.basename(path))[0]}_potential.html"
+            out_path = os.path.join(out_dir, out_name)
+            fig.write_html(out_path, include_plotlyjs="cdn")
+            print(f"[{map_type}] Saved: {out_path}")
+        return
 
     fig = _build_3d_figure(
         map_data,

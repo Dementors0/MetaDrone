@@ -136,7 +136,6 @@ def update_state_vec_torch_v2(
     yaw_rate_cmd=None,
     ctl_dt=1 / 15,
     yaw_rate_max=math.radians(150.0),
-    yaw_ref_kp=3.0,
     eps=1e-6,
 ):
     """Explicit yaw-rate attitude update.
@@ -155,16 +154,9 @@ def update_state_vec_torch_v2(
     ref_h_norm = torch.norm(ref_h, 2, -1, keepdim=True)
     cur_h = torch.where(cur_h_norm > eps, cur_h / cur_h_norm.clamp_min(eps), safe_normalize(ref_h, dim=-1, eps=eps))
     ref_h = torch.where(ref_h_norm > eps, ref_h / ref_h_norm.clamp_min(eps), cur_h)
-
-    cross_z = cur_h[:, 0] * ref_h[:, 1] - cur_h[:, 1] * ref_h[:, 0]
-    dot_xy = (cur_h[:, :2] * ref_h[:, :2]).sum(-1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-    yaw_error = torch.atan2(cross_z, dot_xy).unsqueeze(-1)
-    yaw_rate_ref = torch.clamp(float(yaw_ref_kp) * yaw_error, -float(yaw_rate_max), float(yaw_rate_max))
-
     if yaw_rate_cmd is None:
-        yaw_cmd = yaw_rate_ref
-    else:
-        yaw_cmd = torch.clamp(yaw_rate_cmd, -float(yaw_rate_max), float(yaw_rate_max))
+        yaw_rate_cmd = torch.zeros_like(yaw_rate)
+    yaw_cmd = torch.clamp(yaw_rate_cmd, -float(yaw_rate_max), float(yaw_rate_max))
     yaw_cmd = torch.nan_to_num(yaw_cmd, nan=0.0, posinf=float(yaw_rate_max), neginf=-float(yaw_rate_max))
 
     yaw_rate_next = yaw_rate * alpha + yaw_cmd * (1 - alpha)
@@ -698,7 +690,6 @@ class Env:
         heading_ref=None,
         yaw_rate_cmd=None,
         yaw_rate_max=None,
-        yaw_ref_kp=3.0,
     ):
         act_pred = torch.nan_to_num(act_pred, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         if v_pred is not None:
@@ -737,22 +728,22 @@ class Env:
             if not hasattr(self, "yaw_rate"):
                 self.yaw_rate = torch.zeros((self.batch_size, 1), device=self.device)
             max_yaw = math.radians(150.0) if yaw_rate_max is None else float(yaw_rate_max)
+            yaw_rate_cmd_arg = torch.zeros_like(self.yaw_rate) if yaw_rate_cmd is None else yaw_rate_cmd
             use_torch_attitude = (
                 self.use_meta_differentiable_dynamics
-                or (yaw_rate_cmd is not None and yaw_rate_cmd.requires_grad)
+                or yaw_rate_cmd_arg.requires_grad
                 or not hasattr(quadsim_cuda, "update_state_vec_v2")
             )
             if use_torch_attitude:
                 self.R, self.yaw_rate = update_state_vec_torch_v2(
                     self.R, self.act, heading_ref, alpha, self.yaw_rate,
-                    yaw_rate_cmd=yaw_rate_cmd, ctl_dt=ctl_dt,
-                    yaw_rate_max=max_yaw, yaw_ref_kp=yaw_ref_kp,
+                    yaw_rate_cmd=yaw_rate_cmd_arg, ctl_dt=ctl_dt,
+                    yaw_rate_max=max_yaw,
                 )
             else:
-                yaw_rate_cmd_arg = torch.zeros_like(self.yaw_rate) if yaw_rate_cmd is None else yaw_rate_cmd
                 self.R, self.yaw_rate = quadsim_cuda.update_state_vec_v2(
                     self.R, self.act, heading_ref, self.yaw_rate, yaw_rate_cmd_arg,
-                    alpha, float(ctl_dt), max_yaw, float(yaw_ref_kp), yaw_rate_cmd is not None)
+                    alpha, float(ctl_dt), max_yaw)
         elif self.use_meta_differentiable_dynamics:
             self.R = update_state_vec_torch(self.R, self.act, v_pred, alpha, 2)
         else:

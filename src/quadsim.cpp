@@ -49,9 +49,7 @@ std::vector<torch::Tensor> update_state_vec_v2_cuda(
     torch::Tensor yaw_rate_cmd,
     torch::Tensor alpha,
     float ctl_dt,
-    float yaw_rate_max,
-    float yaw_ref_kp,
-    bool use_yaw_rate_cmd);
+    float yaw_rate_max);
 
 std::vector<torch::Tensor> run_forward_cuda(
     torch::Tensor R,
@@ -142,12 +140,10 @@ std::vector<torch::Tensor> update_state_vec_v2_first_order_cuda(
         torch::Tensor yaw_rate_cmd,
         torch::Tensor alpha,
         float ctl_dt,
-        float yaw_rate_max,
-        float yaw_ref_kp,
-        bool use_yaw_rate_cmd) {
+        float yaw_rate_max) {
     return update_state_vec_v2_cuda(
             R, a_thr, heading_ref, yaw_rate, yaw_rate_cmd, alpha,
-            ctl_dt, yaw_rate_max, yaw_ref_kp, use_yaw_rate_cmd);
+            ctl_dt, yaw_rate_max);
 }
 
 // C++ interface

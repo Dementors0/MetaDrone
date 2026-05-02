@@ -1,4 +1,4 @@
-#9.2.5
+#9.2.6
 #增加感知、LGN输出指导速度
 
 import argparse

@@ -271,18 +271,25 @@ class Env(BaseEnv):
         map_type = str(getattr(self, "current_map_type", "")).strip().lower().replace("_", "-")
         return map_type in ("hairpin", "u-min", "u-minimal")
 
+    def _should_keep_side_walls_for_current_map(self) -> bool:
+        map_type = str(getattr(self, "current_map_type", "")).strip().lower().replace("_", "-")
+        return map_type in ("hairpin",)
+
     def _strip_side_walls_and_ceiling(
         self,
         voxels: torch.Tensor,
         keep_ceiling: bool = None,
+        keep_side_walls: bool = None,
         y_min: float = None,
         y_max: float = None,
     ) -> torch.Tensor:
-        """Remove enclosure voxels: four side walls; top ceiling can be retained by map type."""
+        """Remove enclosure voxels by map policy: side walls / ceiling can be retained by map type."""
         if not isinstance(voxels, torch.Tensor) or voxels.numel() == 0:
             return voxels
         if keep_ceiling is None:
             keep_ceiling = self._should_keep_ceiling_for_current_map()
+        if keep_side_walls is None:
+            keep_side_walls = self._should_keep_side_walls_for_current_map()
 
         squeeze_batch = False
         if voxels.dim() == 2:
@@ -309,7 +316,10 @@ class Env(BaseEnv):
             (cz - float(self.map_z_max)).abs() <= tol
         ) & ((hz - float(self.boundary_half)).abs() <= tol)
 
-        remove_mask = side_x | side_y
+        if bool(keep_side_walls):
+            remove_mask = torch.zeros_like(side_x, dtype=torch.bool)
+        else:
+            remove_mask = side_x | side_y
         if not bool(keep_ceiling):
             remove_mask = remove_mask | ceiling
         keep_mask = ~remove_mask

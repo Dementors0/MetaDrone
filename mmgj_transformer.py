@@ -1,5 +1,5 @@
 #9.2.5
-#修改无人机坐标系，鼓励无人机过弯
+#增加感知、LGN输出指导速度
 
 import argparse
 import atexit

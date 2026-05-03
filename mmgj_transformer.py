@@ -1,6 +1,6 @@
 #9.2.6
 #增加感知、LGN输出指导速度
-#三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向
+#三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向修正
 
 
 import argparse
@@ -179,6 +179,7 @@ def compute_velocity_heading_command(
         v_ref_world[:, 1],
         torch.zeros_like(v_ref_world[:, 2]),
     ], dim=-1)
+    speed_xy = safe_l2_norm(v_xy, dim=-1, keepdim=True)
     heading_ref_world = safe_normalize(v_xy, dim=-1)
 
     heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)

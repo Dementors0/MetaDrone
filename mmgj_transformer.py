@@ -1,6 +1,7 @@
 #9.2.6
 #增加感知、LGN输出指导速度
 #三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向修正
+#9.2.6多卡同步训练
 
 
 import argparse
@@ -21,8 +22,10 @@ matplotlib.use('Agg', force=True)
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.func import functional_call
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -70,6 +73,33 @@ from worker_context_features import (
     WORKER_CONTEXT_FEATURE_DIM,
     extract_worker_context_features,
 )
+
+
+class NoOpSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def add_scalars(self, *args, **kwargs):
+        return None
+
+    def add_text(self, *args, **kwargs):
+        return None
+
+    def add_figure(self, *args, **kwargs):
+        return None
+
+    def add_image(self, *args, **kwargs):
+        return None
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def unwrap_module(module):
+    return module.module if hasattr(module, "module") else module
 
 ########### 0. 工具类：动态归一化 ##########
 class RunningMeanStd(nn.Module):
@@ -736,30 +766,57 @@ _PLANNER_POOL_SIZE = 0
 POTENTIAL_MAP_CACHE = None
 
 ########## 2. 目录与日志初始化 ##########
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+RANK = int(os.environ.get("RANK", "0"))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+USE_DDP = WORLD_SIZE > 1
+IS_MAIN_PROCESS = (RANK == 0)
+
+if USE_DDP:
+    if not torch.cuda.is_available():
+        raise RuntimeError("DDP mode requires CUDA/NCCL for this script.")
+    torch.cuda.set_device(LOCAL_RANK)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    device = torch.device(f"cuda:{LOCAL_RANK}")
+else:
+    device = torch.device('cuda')
+
 current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 script_name = os.path.splitext(os.path.basename(__file__))[0]
 save_dir_name = f"{script_name}_{args.exp_name}_{current_time}"
+if USE_DDP:
+    save_dir_obj = [save_dir_name if IS_MAIN_PROCESS else None]
+    dist.broadcast_object_list(save_dir_obj, src=0)
+    save_dir_name = str(save_dir_obj[0])
 save_dir = os.path.join("..", "checkpoints", save_dir_name)
 video_dir = os.path.join(save_dir, 'videos')
 
 os.makedirs(save_dir, exist_ok=True)
 os.makedirs(video_dir, exist_ok=True)
-print(f"Training artifacts will be saved to: {save_dir}")
+if IS_MAIN_PROCESS:
+    print(f"Training artifacts will be saved to: {save_dir}")
 
-with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-    json.dump(vars(args), f, indent=4)
+if IS_MAIN_PROCESS:
+    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
+if USE_DDP:
+    dist.barrier()
 
-writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs'))
+writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs')) if IS_MAIN_PROCESS else NoOpSummaryWriter()
 MAP_SPLIT_LOG_TYPES = ("easy", "hairpin", "u_min")
 map_writers = {}
 for map_type in MAP_SPLIT_LOG_TYPES:
     map_log_dir = os.path.join(save_dir, f"logs_{map_type}")
-    os.makedirs(map_log_dir, exist_ok=True)
-    map_writers[map_type] = SummaryWriter(log_dir=map_log_dir)
-print(
-    "[TensorBoard] Split-by-map logs enabled: "
-    + ", ".join([f"{k}->{os.path.join(save_dir, f'logs_{k}')}" for k in MAP_SPLIT_LOG_TYPES])
-)
+    if IS_MAIN_PROCESS:
+        os.makedirs(map_log_dir, exist_ok=True)
+        map_writers[map_type] = SummaryWriter(log_dir=map_log_dir)
+    else:
+        map_writers[map_type] = NoOpSummaryWriter()
+if IS_MAIN_PROCESS:
+    print(
+        "[TensorBoard] Split-by-map logs enabled: "
+        + ", ".join([f"{k}->{os.path.join(save_dir, f'logs_{k}')}" for k in MAP_SPLIT_LOG_TYPES])
+    )
 
 
 def _resolve_map_log_key(map_type_name):
@@ -772,8 +829,6 @@ def _resolve_tb_writer(map_type_name):
     if key == "global":
         return writer
     return map_writers[key]
-
-device = torch.device('cuda')
 
 ########## 3. 环境初始化 ##########
 env = Env(args.batch_size, 64, 48, args.grad_decay, device,
@@ -1042,6 +1097,24 @@ if args.resume_norm:
 elif args.resume_worker:
     norm_path = args.resume_worker.replace('worker_', 'norm_')
     load_compatible_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats", zero_expanded=False)
+
+if USE_DDP:
+    worknet = DDP(
+        worknet,
+        device_ids=[LOCAL_RANK],
+        output_device=LOCAL_RANK,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+    lgn = DDP(
+        lgn,
+        device_ids=[LOCAL_RANK],
+        output_device=LOCAL_RANK,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+    if IS_MAIN_PROCESS:
+        print(f"[DDP] Enabled NCCL sync training on WORLD_SIZE={WORLD_SIZE}, LOCAL_RANK={LOCAL_RANK}")
 
 ########## 5. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
@@ -3898,7 +3971,7 @@ latest_viz_by_map_type = {map_type: None for map_type in VIZ_MAP_TYPES}
 
 terminal_log_interval = max(1, int(args.terminal_log_interval))
 tb_scalar_interval = int(args.debug_scalar_interval)
-pbar = tqdm(range(args.num_iters), ncols=120, miniters=terminal_log_interval)
+pbar = tqdm(range(args.num_iters), ncols=120, miniters=terminal_log_interval) if IS_MAIN_PROCESS else range(args.num_iters)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
@@ -3907,7 +3980,7 @@ meta_lgn_grad_window = deque(maxlen=20)
 state_normalizer.train()
 
 for i in pbar:
-    term_log_now = ((i + 1) % terminal_log_interval == 0)
+    term_log_now = IS_MAIN_PROCESS and ((i + 1) % terminal_log_interval == 0)
     tb_log_now = (
         tb_scalar_interval > 0 and (
             i == 0
@@ -3974,7 +4047,7 @@ for i in pbar:
         else:
             env.reset_drone_only()  # keep maze, reset drones only
     maze_update_counter += 1
-    worknet.reset()
+    unwrap_module(worknet).reset()
 
     p_history, v_history, a_history, vec_to_pt_history = [], [], [], []
     rpy_history = []
@@ -4589,7 +4662,8 @@ for i in pbar:
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
         # Step 1: 用 proxy_loss 对 worker 做可微梯度下降
-        fast_params = dict(worknet.named_parameters())
+        worknet_for_functional = unwrap_module(worknet)
+        fast_params = dict(worknet_for_functional.named_parameters())
         inner_update_is_finite = True
 
         for _inner in range(args.inner_steps):
@@ -4673,7 +4747,7 @@ for i in pbar:
              meta_arrival_reward_ur, meta_arrival_hit_rate_ur, meta_arrival_best_dist_ur) = \
                 unrolled_meta_rollout(
                     env,
-                    worknet,
+                    worknet_for_functional,
                     fast_params,
                     state_normalizer,
                     geom_normalizer,
@@ -5185,9 +5259,9 @@ for i in pbar:
             writer_q.clear()
             active_tb_writer.flush()
 
-        if is_save_iter(i):
-            torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
-            torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
+        if IS_MAIN_PROCESS and is_save_iter(i):
+            torch.save(unwrap_module(worknet).state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
+            torch.save(unwrap_module(lgn).state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
             torch.save(state_normalizer.state_dict(), os.path.join(save_dir, f'norm_ckpt_{i:06d}.pth'))
             try:
                 sync_stats = sync_multi_pub_to_checkpoint_dir(save_dir)
@@ -5201,7 +5275,7 @@ for i in pbar:
             except Exception as e:
                 print(f"[CheckpointSync][WARN] iter={i + 1} sync failed: {e}")
 
-        if current_precomputed_map_type in VIZ_MAP_TYPES:
+        if IS_MAIN_PROCESS and current_precomputed_map_type in VIZ_MAP_TYPES:
             idx = 0
             astar_paths_all = guidance_components.get('sampled_astar_paths', [])
             astar_paths_sampled = astar_paths_all[idx] if (isinstance(astar_paths_all, list) and idx < len(astar_paths_all)) else []
@@ -5235,7 +5309,7 @@ for i in pbar:
                     i + 1,
                 )
 
-        if is_save_trajectory_iter(i):
+        if IS_MAIN_PROCESS and is_save_trajectory_iter(i):
             available_types = [
                 map_type for map_type in VIZ_MAP_TYPES
                 if latest_viz_by_map_type.get(map_type) is not None
@@ -5266,9 +5340,13 @@ for i in pbar:
                 save_cached_viz_record(record, i + 1)
             writer.flush()
 
-print(f"Training Finished. Artifacts in: {save_dir}")
+if IS_MAIN_PROCESS:
+    print(f"Training Finished. Artifacts in: {save_dir}")
 for _map_writer in map_writers.values():
     _map_writer.flush()
     _map_writer.close()
 writer.flush()
 writer.close()
+if USE_DDP:
+    dist.barrier()
+    dist.destroy_process_group()

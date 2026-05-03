@@ -1,6 +1,7 @@
-#9.2.6
+#9.2.6-1
 #增加感知、LGN输出指导速度
 #三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向修正
+#只用u_min地图进行训练
 
 
 import argparse
@@ -793,8 +794,8 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           wall_physical_feedback=args.wall_physical_feedback)
 
 
-PRECOMPUTED_CURRICULUM_REQUIRED_TYPES = ("easy", "hairpin", "u_min")
-VIZ_MAP_TYPES = ("easy", "hairpin", "u_min")
+PRECOMPUTED_CURRICULUM_REQUIRED_TYPES = ("u_min",)
+VIZ_MAP_TYPES = ("u_min",)
 PRECOMPUTED_MAP_TYPE_CODES = {
     "none": -1,
     "easy": 0,
@@ -805,6 +806,7 @@ PRECOMPUTED_MAP_TYPE_CODES = {
 }
 PRECOMPUTED_CURRICULUM_STAGE_CODES = {
     "none": -1,
+    "u_min_only": 0,
     "easy_only": 0,
     "easy_hairpin": 1,
     "easy_hairpin_u_min": 2,
@@ -834,11 +836,8 @@ def _build_precomputed_map_type_indices(map_cache):
 
 
 def _precomputed_curriculum_stage(iter_idx):
-    if int(iter_idx) < 500:
-        return "easy_only", ("easy",)
-    if int(iter_idx) < 4000:
-        return "easy_hairpin", ("easy", "hairpin")
-    return "easy_hairpin_u_min", ("easy", "hairpin", "u_min")
+    _ = iter_idx
+    return "u_min_only", ("u_min",)
 
 
 def _select_precomputed_curriculum_map(active_types, stage_update_count, type_offsets, type_indices):
@@ -928,12 +927,12 @@ if args.use_precomputed_potential_maps:
             f"{k}={len(v)}" for k, v in sorted(PRECOMPUTED_MAP_TYPE_INDICES.items())
         )
         raise RuntimeError(
-            "Precomputed map curriculum requires easy, hairpin, and u_min maps. "
+            "Precomputed map setup for this run requires u_min maps. "
             f"Missing: {','.join(missing_types)}. loaded_counts: {counts_msg}. "
             "If --num_precomputed_maps is set, increase it or use 0 to load all maps."
         )
 
-    INITIAL_PRECOMPUTED_MAP_TYPE = "easy"
+    INITIAL_PRECOMPUTED_MAP_TYPE = "u_min"
     INITIAL_PRECOMPUTED_MAP_IDX = PRECOMPUTED_MAP_TYPE_INDICES[INITIAL_PRECOMPUTED_MAP_TYPE][0]
     INITIAL_PRECOMPUTED_MAP_FILE = os.path.basename(POTENTIAL_MAP_CACHE.map_files[INITIAL_PRECOMPUTED_MAP_IDX])
     first_map = POTENTIAL_MAP_CACHE.get_map(INITIAL_PRECOMPUTED_MAP_IDX)

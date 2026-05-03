@@ -1,5 +1,6 @@
-#9.2.5
+#9.2-1
 #修改无人机坐标系，鼓励无人机过弯
+#9.2.5的模型增加感知、LGN输出指导速度在compact地图中跑
 
 import argparse
 import atexit
@@ -674,9 +675,9 @@ parser.add_argument('--planner_pool_maxtasks', type=int, default=256,
 # - dijkstra_potential: 使用离线缓存 Dijkstra 势场引导（新方案）
 # 使用方法：
 # - 默认不写时为 dijkstra_potential（离线缓存势场 + 预计算地图）。
-# - 势场模式默认读取 /home/robot/transformer/precomputed_maps_turn_encouragement
+# - 势场模式默认读取 /home/robot/transformer/precomputed_maps_compact
 #   需要配合预计算地图目录，例如：
-#   --precomputed_map_dir /home/robot/transformer/precomputed_maps_turn_encouragement --num_precomputed_maps 0
+#   --precomputed_map_dir /home/robot/transformer/precomputed_maps_compact --num_precomputed_maps 0
 # - 切回 A* 模式：--guidance_backend astar
 # 说明：这是统一开关，优先于旧的 use_precomputed_potential_maps/use_astar_guidance 组合语义。
 parser.add_argument('--guidance_backend', type=str, default='dijkstra_potential',
@@ -684,7 +685,7 @@ parser.add_argument('--guidance_backend', type=str, default='dijkstra_potential'
                     help='Switch guidance backend between online A* and cached Dijkstra potential field')
 parser.add_argument('--use_precomputed_potential_maps', default=False, action='store_true',
                     help='Use precomputed Dijkstra potential-map guidance instead of online A* planning')
-parser.add_argument('--precomputed_map_dir', type=str, default='/home/robot/transformer/precomputed_maps_turn_encouragement',
+parser.add_argument('--precomputed_map_dir', type=str, default='/home/robot/transformer/precomputed_maps_compact',
                     help='Directory containing precomputed potential cache .pt files')
 parser.add_argument('--num_precomputed_maps', type=int, default=0,
                     help='Max number of precomputed maps to load from precomputed_map_dir (<=0 means all)')

@@ -273,7 +273,7 @@ class Env(BaseEnv):
 
     def _should_keep_side_walls_for_current_map(self) -> bool:
         map_type = str(getattr(self, "current_map_type", "")).strip().lower().replace("_", "-")
-        return map_type in ("hairpin",)
+        return map_type in ("hairpin", "u-min", "u-minimal")
 
     def _strip_side_walls_and_ceiling(
         self,

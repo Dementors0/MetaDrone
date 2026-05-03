@@ -1,5 +1,7 @@
 #9.2.6
 #增加感知、LGN输出指导速度
+#三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向
+
 
 import argparse
 import atexit
@@ -166,34 +168,18 @@ def compute_velocity_heading_command(
 
     逻辑：
     1. 只使用水平面速度方向，不让 z 方向影响 yaw；
-    2. 水平速度过低时保持当前机头方向，避免速度过零时 yaw 抖动；
+    2. 机头参考方向始终来自速度方向（不再做低速保持当前机头）；
     3. yaw_rate_cmd = yaw_kp * yaw_error，并限制在 [-yaw_rate_max, yaw_rate_max]；
     4. 即使 v_ref_world 反向，也不会让机头瞬间跳 180°，而是通过 yaw_rate_max 平滑转过去。
     """
-    current_heading = R_yaw[:, :, 0]
-
-    current_heading_xy = torch.stack([
-        current_heading[:, 0],
-        current_heading[:, 1],
-        torch.zeros_like(current_heading[:, 2]),
-    ], dim=-1)
-    current_heading_xy = safe_normalize(current_heading_xy, dim=-1)
+    _ = min_speed  # kept for call-site compatibility; no low-speed heading hold is applied.
 
     v_xy = torch.stack([
         v_ref_world[:, 0],
         v_ref_world[:, 1],
         torch.zeros_like(v_ref_world[:, 2]),
     ], dim=-1)
-
-    speed_xy = safe_l2_norm(v_xy, dim=-1, keepdim=True)
-    v_dir_xy = v_xy / speed_xy.clamp_min(1e-6)
-
-    heading_ref_world = torch.where(
-        speed_xy > float(min_speed),
-        v_dir_xy,
-        current_heading_xy,
-    )
-    heading_ref_world = safe_normalize(heading_ref_world, dim=-1)
+    heading_ref_world = safe_normalize(v_xy, dim=-1)
 
     heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
     yaw_error = torch.atan2(
@@ -460,7 +446,7 @@ parser.add_argument('--num_iters', type=int, default=50000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)
-parser.add_argument('--worker_steps', type=int, default=5)
+parser.add_argument('--worker_steps', type=int, default=1)
 
 # 基础物理参数
 parser.add_argument('--grad_decay', type=float, default=0.4)
@@ -488,21 +474,21 @@ parser.add_argument('--coef_yaw_smooth', type=float, default=0.01)
 # ===================== v2 机头跟踪参数（中文详解） =====================
 # 这些参数只在 attitude_model='v2' 的显式 yaw 动力学下生效，用于控制：
 # 1) 机头参考方向来自哪里；
-# 2) 机头低速时是否保持；
+# 2) 机头参考速度来源与低速退化策略；
 # 3) 机头追踪速度方向的“转头力度”；
 # 4) 是否允许网络输出的 yaw_rate 作为小幅残差；
 # 5) 对“倒飞/侧后飞”的惩罚强度。
 #
 # 调参建议（经验）：
 # - 机头转得慢：增大 heading_yaw_kp 或 yaw_rate_max_deg。
-# - 低速抖头：增大 heading_min_speed，必要时降低 heading_yaw_kp。
+# - 低速抖头：hybrid 模式可增大 heading_min_speed，或降低 heading_yaw_kp。
 # - 不希望倒飞：增大 coef_backward_penalty，必要时把 backward_cos_limit 调高到 0.1~0.3。
 # - 想保留少量学习型偏航微调：把 heading_residual_scale 从 0.0 提到 0.1/0.2。
 parser.add_argument('--heading_track_mode', type=str, default='actual_v',
                     choices=['v_pred', 'actual_v', 'hybrid'],
                     help='机头参考方向来源：v_pred=跟踪Worker预测速度；actual_v=跟踪环境实际速度（默认）；hybrid=低速时退回actual_v，降低过零抖动')
 parser.add_argument('--heading_min_speed', type=float, default=0.25,
-                    help='水平速度低于该阈值时保持当前机头方向（不强行对齐速度），用于避免速度过零/近零时机头抖动')
+                    help='仅用于 hybrid 模式的速度阈值（低于阈值时 v_pred 退回 actual_v）；不再用于“保持当前机头方向”')
 parser.add_argument('--heading_yaw_kp', type=float, default=4.0,
                     help='机头跟踪比例增益：yaw_rate_rule = heading_yaw_kp * yaw_error。越大转头越积极，但过大可能引起振荡')
 parser.add_argument('--heading_residual_scale', type=float, default=0.0,
@@ -717,7 +703,7 @@ parser.add_argument('--diag_proxy_worker_grads', dest='diag_proxy_worker_grads',
                     help='Enable diagnostic loss-to-worker gradient probes (extra autograd overhead)')
 parser.add_argument('--no_diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_false',
                     help='Disable diagnostic loss-to-worker gradient probes')
-parser.set_defaults(diag_proxy_worker_grads=False)
+parser.set_defaults(diag_proxy_worker_grads=True)
 parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 parser.add_argument('--debug_scalar_interval', type=int, default=25,
@@ -763,6 +749,28 @@ with open(os.path.join(save_dir, 'config.json'), 'w') as f:
     json.dump(vars(args), f, indent=4)
 
 writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs'))
+MAP_SPLIT_LOG_TYPES = ("easy", "hairpin", "u_min")
+map_writers = {}
+for map_type in MAP_SPLIT_LOG_TYPES:
+    map_log_dir = os.path.join(save_dir, f"logs_{map_type}")
+    os.makedirs(map_log_dir, exist_ok=True)
+    map_writers[map_type] = SummaryWriter(log_dir=map_log_dir)
+print(
+    "[TensorBoard] Split-by-map logs enabled: "
+    + ", ".join([f"{k}->{os.path.join(save_dir, f'logs_{k}')}" for k in MAP_SPLIT_LOG_TYPES])
+)
+
+
+def _resolve_map_log_key(map_type_name):
+    key = str(map_type_name).strip().lower().replace("-", "_")
+    return key if key in map_writers else "global"
+
+
+def _resolve_tb_writer(map_type_name):
+    key = _resolve_map_log_key(map_type_name)
+    if key == "global":
+        return writer
+    return map_writers[key]
 
 device = torch.device('cuda')
 
@@ -1040,13 +1048,14 @@ optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 
 ########## 6. 辅助函数 ##########
-scaler_q = defaultdict(list)
+scaler_q_by_map = defaultdict(lambda: defaultdict(list))
 
-def smooth_dict(ori_dict):
+def smooth_dict(ori_dict, map_log_key="global"):
+    q = scaler_q_by_map[map_log_key]
     for k, v in ori_dict.items():
         if isinstance(v, torch.Tensor):
             v = v.item()
-        scaler_q[k].append(float(v))
+        q[k].append(float(v))
 
 
 def _scalar_to_float(v):
@@ -2893,6 +2902,17 @@ def _is_ceiling_voxel(box_xyz_half, env):
     return bool(ceiling)
 
 
+def _is_top_ceiling_voxel_relaxed(box_xyz_half, env):
+    """Relaxed ceiling check: identify any top boundary slab near map_z_max."""
+    cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
+    if not all(hasattr(env, key) for key in ('map_z_max', 'boundary_half')):
+        return False
+    map_z_max = float(env.map_z_max)
+    boundary_half = float(env.boundary_half)
+    tol = max(0.08, boundary_half * 1.8)
+    return bool(abs(cz - map_z_max) <= tol and abs(hz - boundary_half) <= tol)
+
+
 def _is_boundary_wall_voxel(box_xyz_half, env):
     """Heuristic check for outer enclosure side walls (x/y boundaries)."""
     cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
@@ -2912,7 +2932,8 @@ def _is_boundary_wall_voxel(box_xyz_half, env):
 
 def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5,
                              astar_path=None, astar_paths_sampled=None,
-                             potential_map_data=None, show_potential_overlay=False):
+                             potential_map_data=None, show_potential_overlay=False,
+                             map_type=None):
     """保存交互式3D轨迹HTML，带有无人机姿态坐标系和A*全局引导轨迹
 
     Args:
@@ -2924,6 +2945,9 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
     """
     if go is None:
         return False
+
+    map_type_norm = str(map_type).strip().lower().replace("-", "_") if map_type is not None else ""
+    hide_relaxed_ceiling = map_type_norm in ("u_min", "u_minimal")
 
     traj_xyz = p_cpu.numpy()
     speed_cpu = v_cpu.norm(dim=-1).numpy()
@@ -3213,6 +3237,8 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
         vox = env.voxels[idx].detach().cpu().numpy()
         vox = vox[(vox[:, 3:6] < 20).all(axis=1)]
         for box in vox[:180]:
+            if hide_relaxed_ceiling and _is_top_ceiling_voxel_relaxed(box, env):
+                continue
             if _is_ceiling_voxel(box, env) or _is_boundary_wall_voxel(box, env):
                 continue
             cx, cy, cz, hx, hy, hz = box.tolist()
@@ -3392,22 +3418,11 @@ def save_cached_viz_record(record, save_step):
         astar_path=None, astar_paths_sampled=astar_paths_sampled,
         potential_map_data=potential_map_data,
         show_potential_overlay=potential_map_data is not None,
+        map_type=map_type,
     ):
         writer.add_text(f'{tag_prefix}/Interactive3D_HTML', interactive_html, save_step)
 
-    if potential_map_data is not None:
-        try:
-            z_world_dbg = float(p_cpu[:, 2].median().item())
-            fig_potential = build_potential_xy_debug_figure(
-                potential_map_data,
-                z_world=z_world_dbg,
-                stride=6,
-            )
-            if fig_potential is not None:
-                writer.add_figure(f'{debug_prefix}/Potential_XY_Slice', fig_potential, save_step)
-                plt.close(fig_potential)
-        except Exception as e:
-            writer.add_text(f'{debug_prefix}/Potential_XY_Slice_Status', f'failed: {e}', save_step)
+    # TensorBoard potential-field figure logging is intentionally disabled.
 
     fig_v, ax = plt.subplots()
     ax.plot(v_cpu[:, 0], label='vx')
@@ -3943,7 +3958,11 @@ for i in pbar:
                 f"type={current_precomputed_map_type}, file={current_precomputed_map_file}"
             )
             if tb_log_now or stage_changed:
-                writer.add_text("Map/Current_Precomputed_File", map_msg, i + 1)
+                _resolve_tb_writer(current_precomputed_map_type).add_text(
+                    "Map/Current_Precomputed_File",
+                    map_msg,
+                    i + 1,
+                )
             if term_log_now or stage_changed:
                 print(f"[PotentialMapCurriculum] {map_msg}")
         else:
@@ -4165,11 +4184,11 @@ for i in pbar:
     vref_body_seq = torch.stack(trajectory_lgn_vrefs)  # [T, B, 3]
     R_proxy_seq = torch.stack(R_proxy_history)         # [T, B, 3, 3]
     v_preds_tensor = torch.stack(v_preds)              # [T, B, 3], world frame
-    v_pred_body_seq = torch.squeeze(v_preds_tensor[:, :, None, :] @ R_proxy_seq, 2)
-    v_pred_body_dir = safe_normalize(v_pred_body_seq, dim=-1)
+    v_real_body_seq = torch.squeeze(v_history[:, :, None, :] @ R_proxy_seq, 2)
+    v_real_body_dir = safe_normalize(v_real_body_seq, dim=-1)
     vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
-    lgn_vref_worker_cos_seq = (v_pred_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
-    loss_lgn_vref_seq = (1.0 - lgn_vref_worker_cos_seq).clamp(0.0, 2.0)
+    lgn_vref_real_cos_seq = (v_real_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
+    loss_lgn_vref_seq = (1.0 - lgn_vref_real_cos_seq).clamp(0.0, 2.0)
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
         if train_lgn_phase and not weights_seq.requires_grad:
@@ -4824,7 +4843,8 @@ for i in pbar:
             'Loss/Proxy_LGN_VRef': loss_lgn_vref_seq.mean(),
             'LGN/VRef_Weight': weights_eff_mean_tb[5],
             'LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
-            'LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'LGN/VRef_Real_Cos': lgn_vref_real_cos_seq.mean(),
+            'LGN/VRef_Worker_Cos': lgn_vref_real_cos_seq.mean(),
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
             'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
@@ -5053,7 +5073,8 @@ for i in pbar:
             'Debug/Proxy/Height': loss_height_seq.mean(),
             'Debug/LGN/VRef_Weight': weights_eff_mean_tb[5],
             'Debug/LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
-            'Debug/LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'Debug/LGN/VRef_Real_Cos': lgn_vref_real_cos_seq.mean(),
+            'Debug/LGN/VRef_Worker_Cos': lgn_vref_real_cos_seq.mean(),
             'Debug/Yaw/Heading_Vel_Error_Deg': heading_vel_error_deg.mean(),
             'Debug/Yaw/Backward_Ratio': backward_ratio,
             'Debug/Yaw/Side_Backward_Ratio': side_backward_ratio,
@@ -5144,21 +5165,24 @@ for i in pbar:
                 'Debug/LGN_Input/Progress_Std': progress_feat_last.std(unbiased=False),
             })
 
-        smooth_dict(log_data)
+        active_map_log_key = _resolve_map_log_key(current_precomputed_map_type)
+        active_tb_writer = _resolve_tb_writer(current_precomputed_map_type)
+        smooth_dict(log_data, map_log_key=active_map_log_key)
         if tb_log_now:
-            writer.add_scalar("Status_Raw/Train_LGN_Phase", float(train_lgn_phase), i + 1)
+            writer_q = scaler_q_by_map[active_map_log_key]
+            active_tb_writer.add_scalar("Status_Raw/Train_LGN_Phase", float(train_lgn_phase), i + 1)
             if train_lgn_phase:
-                writer.add_scalar("Grad_LGN_Raw/Global_Norm", lgn_grad_norm, i + 1)
-                writer.add_scalar("Grad_LGN_Raw/MetaProbe_Norm", lgn_meta_probe_norm, i + 1)
-                writer.add_scalar("Grad_LGN_Raw/Step_Skipped", lgn_step_skipped, i + 1)
-                writer.add_scalar("Grad_LGN_Raw/Skip_Code", lgn_skip_code, i + 1)
-            writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
-            writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
-            write_scalar_dict(writer, debug_log_data, i + 1)
-            for k, v in scaler_q.items():
-                writer.add_scalar(k, sum(v) / len(v), i + 1)
-            scaler_q.clear()
-            writer.flush()
+                active_tb_writer.add_scalar("Grad_LGN_Raw/Global_Norm", lgn_grad_norm, i + 1)
+                active_tb_writer.add_scalar("Grad_LGN_Raw/MetaProbe_Norm", lgn_meta_probe_norm, i + 1)
+                active_tb_writer.add_scalar("Grad_LGN_Raw/Step_Skipped", lgn_step_skipped, i + 1)
+                active_tb_writer.add_scalar("Grad_LGN_Raw/Skip_Code", lgn_skip_code, i + 1)
+            active_tb_writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
+            active_tb_writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
+            write_scalar_dict(active_tb_writer, debug_log_data, i + 1)
+            for k, v in writer_q.items():
+                active_tb_writer.add_scalar(k, sum(v) / len(v), i + 1)
+            writer_q.clear()
+            active_tb_writer.flush()
 
         if is_save_iter(i):
             torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
@@ -5204,7 +5228,11 @@ for i in pbar:
                 f"idx={current_precomputed_map_idx}, file={current_precomputed_map_file}"
             )
             if tb_log_now:
-                writer.add_text(f'Debug/VizCache/Latest_{current_precomputed_map_type}', cache_msg, i + 1)
+                _resolve_tb_writer(current_precomputed_map_type).add_text(
+                    f'Debug/VizCache/Latest_{current_precomputed_map_type}',
+                    cache_msg,
+                    i + 1,
+                )
 
         if is_save_trajectory_iter(i):
             available_types = [
@@ -5238,3 +5266,8 @@ for i in pbar:
             writer.flush()
 
 print(f"Training Finished. Artifacts in: {save_dir}")
+for _map_writer in map_writers.values():
+    _map_writer.flush()
+    _map_writer.close()
+writer.flush()
+writer.close()

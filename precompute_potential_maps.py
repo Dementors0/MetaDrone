@@ -215,6 +215,53 @@ def _build_boundary_voxels_for_y_range(
     return voxels
 
 
+def _tile_xy_array(arr: np.ndarray, x_period: float, y_period: float) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        return arr.copy()
+
+    tiled = []
+    for dx in (-1.0, 0.0, 1.0):
+        for dy in (-1.0, 0.0, 1.0):
+            shifted = arr.copy()
+            shifted[:, 0] += float(dx) * float(x_period)
+            shifted[:, 1] += float(dy) * float(y_period)
+            tiled.append(shifted)
+    return np.concatenate(tiled, axis=0).astype(np.float32)
+
+
+def _tile_easy_hard_geometry_xy(env: Env, geom: Dict, x_period: float, y_period: float) -> Dict:
+    """Replicate easy/hard geometry as a 3x3 XY tiling around the center map."""
+    tiled = dict(geom)
+    tiled["balls"] = _tile_xy_array(_ensure_np(geom.get("balls", []), 4), x_period, y_period)
+    tiled["cyl"] = _tile_xy_array(_ensure_np(geom.get("cyl", []), 3), x_period, y_period)
+    tiled["voxels"] = _tile_xy_array(_ensure_np(geom.get("voxels", []), 6), x_period, y_period)
+    tiled["cyl_h"] = _tile_xy_array(_ensure_np(geom.get("cyl_h", []), 3), x_period, y_period)
+
+    base_x_min = float(geom.get("map_x_min", 0.0))
+    base_x_max = float(geom.get("map_x_max", env.map_x_max))
+    base_y_min = float(geom["map_y_min"])
+    base_y_max = float(geom["map_y_max"])
+    tiled["map_x_min"] = base_x_min - float(x_period)
+    tiled["map_x_max"] = base_x_max + float(x_period)
+    tiled["map_y_min"] = base_y_min - float(y_period)
+    tiled["map_y_max"] = base_y_max + float(y_period)
+    tiled["map_length"] = float(base_y_max - base_y_min) * 3.0
+
+    map_meta = dict(geom.get("map_meta", {}))
+    map_meta.update({
+        "xy_tiling": "3x3",
+        "tile_x_period": float(x_period),
+        "tile_y_period": float(y_period),
+        "center_map_x_min": base_x_min,
+        "center_map_x_max": base_x_max,
+        "center_map_y_min": base_y_min,
+        "center_map_y_max": base_y_max,
+    })
+    tiled["map_meta"] = map_meta
+    return tiled
+
+
 def _distance_point_to_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
     abx = bx - ax
     aby = by - ay
@@ -698,10 +745,15 @@ def _build_easy_or_hard_geometry(env: Env, map_type: str) -> Dict:
     if map_type == "hard":
         map_meta["base_style"] = "easy"
 
-    return {
+    base_x_min = float(getattr(env, "base_map_x_min", 0.0))
+    base_x_max = float(getattr(env, "base_map_x_max", 10.0))
+    x_period = base_x_max - base_x_min
+
+    geom = {
         "map_type": map_type,
         "map_length": map_length,
-        "map_x_max": float(env.map_x_max),
+        "map_x_min": base_x_min,
+        "map_x_max": base_x_max,
         "map_y_min": float(y_min),
         "map_y_max": float(y_max),
         "map_z_max": float(env.map_z_max),
@@ -719,6 +771,12 @@ def _build_easy_or_hard_geometry(env: Env, map_type: str) -> Dict:
         "spawn_start_z_half_span": float(env.fixed_spawn_half_span),
         "spawn_goal_z_half_span": float(env.fixed_spawn_half_span),
     }
+    return _tile_easy_hard_geometry_xy(
+        env,
+        geom,
+        x_period=float(x_period),
+        y_period=float(map_length),
+    )
 
 
 def _build_u_min_geometry(env: Env) -> Dict:
@@ -1095,13 +1153,6 @@ def _build_single_map_legacy(task: Dict):
             hard_density_scale=hard_density_scale,
         )
 
-        bounds = {
-            "x_min": -0.5,
-            "x_max": float(env.map_x_max) + 0.5,
-            "y_min": float(env.map_y_min) - 1.0,
-            "y_max": float(env.map_y_max) + 1.0,
-        }
-
         env.reset()
 
         voxels = env.voxels[0].detach().cpu().numpy().astype(np.float32)
@@ -1110,6 +1161,29 @@ def _build_single_map_legacy(task: Dict):
         cyl_h = env.cyl_h[0].detach().cpu().numpy().astype(np.float32)
         start_bounds = env._spawn_start_bounds[0].detach().cpu().numpy().astype(np.float32)
         goal_bounds = env._spawn_goal_bounds[0].detach().cpu().numpy().astype(np.float32)
+
+        center_map_x_min = float(getattr(env, "base_map_x_min", 0.0))
+        center_map_x_max = float(getattr(env, "base_map_x_max", env.map_x_max))
+        center_map_y_min = float(env.map_y_min)
+        center_map_y_max = float(env.map_y_max)
+        tile_x_period = center_map_x_max - center_map_x_min
+        tile_y_period = center_map_y_max - center_map_y_min
+        map_x_min = center_map_x_min - tile_x_period
+        map_x_max = center_map_x_max + tile_x_period
+        map_y_min = center_map_y_min - tile_y_period
+        map_y_max = center_map_y_max + tile_y_period
+
+        voxels = _tile_xy_array(voxels, tile_x_period, tile_y_period)
+        balls = _tile_xy_array(balls, tile_x_period, tile_y_period)
+        cyl = _tile_xy_array(cyl, tile_x_period, tile_y_period)
+        cyl_h = _tile_xy_array(cyl_h, tile_x_period, tile_y_period)
+
+        bounds = {
+            "x_min": float(map_x_min) - 0.5,
+            "x_max": float(map_x_max) + 0.5,
+            "y_min": float(map_y_min) - 1.0,
+            "y_max": float(map_y_max) + 1.0,
+        }
 
         start_x = float(getattr(env, "spawn_start_x", env.spawn_x_center))
         goal_x = float(getattr(env, "spawn_goal_x", env.spawn_x_center))
@@ -1200,6 +1274,21 @@ def _build_single_map_legacy(task: Dict):
             "spawn_goal_x_half_span": float(goal_x_half),
             "spawn_start_z_half_span": float(start_z_half),
             "spawn_goal_z_half_span": float(goal_z_half),
+            "map_x_min": float(map_x_min),
+            "map_x_max": float(map_x_max),
+            "map_y_min": float(map_y_min),
+            "map_y_max": float(map_y_max),
+            "map_z_max": float(env.map_z_max),
+            "map_meta": {
+                "map_type": "legacy",
+                "xy_tiling": "3x3",
+                "tile_x_period": float(tile_x_period),
+                "tile_y_period": float(tile_y_period),
+                "center_map_x_min": float(center_map_x_min),
+                "center_map_x_max": float(center_map_x_max),
+                "center_map_y_min": float(center_map_y_min),
+                "center_map_y_max": float(center_map_y_max),
+            },
         }
 
         out_path = os.path.join(save_dir, f"map_{map_id:03d}.pt")
@@ -1247,7 +1336,7 @@ def _build_single_map_unified(task: Dict):
         geom = _build_unified_geometry(env, map_type=map_type)
 
         bounds = {
-            "x_min": -0.5,
+            "x_min": float(geom.get("map_x_min", 0.0)) - 0.5,
             "x_max": float(geom["map_x_max"]) + 0.5,
             "y_min": float(geom["map_y_min"]) - 1.0,
             "y_max": float(geom["map_y_max"]) + 1.0,
@@ -1317,6 +1406,7 @@ def _build_single_map_unified(task: Dict):
             "bounds": bounds,
             "grid_origin": torch.from_numpy(origin),
             "grid_shape": torch.tensor(shape, dtype=torch.long),
+            "start_world": torch.from_numpy(start_world),
             "goal_world": torch.from_numpy(goal_world),
             "goal_idx": torch.tensor(goal_idx, dtype=torch.long),
             "goal_idx_used": torch.tensor(goal_idx_used, dtype=torch.long),
@@ -1345,6 +1435,7 @@ def _build_single_map_unified(task: Dict):
             "spawn_goal_x_half_span": float(geom["spawn_goal_x_half_span"]),
             "spawn_start_z_half_span": float(geom["spawn_start_z_half_span"]),
             "spawn_goal_z_half_span": float(geom["spawn_goal_z_half_span"]),
+            "map_x_min": float(geom.get("map_x_min", 0.0)),
             "map_x_max": float(geom["map_x_max"]),
             "map_y_min": float(geom["map_y_min"]),
             "map_y_max": float(geom["map_y_max"]),

@@ -1,6 +1,7 @@
 #9.2-1
 #修改无人机坐标系，鼓励无人机过弯
 #9.2.5的模型增加感知、LGN输出指导速度在compact地图中跑
+#compact复制地图中跑，修复LGN方向指导
 
 import argparse
 import atexit
@@ -632,6 +633,8 @@ parser.add_argument('--meta_smooth_v_pred_weight', type=float, default=0.1,
 # 全局规划引导元损失参数
 parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
                     help='Weight for global guidance meta loss (path-guiding dense supervision)')
+parser.add_argument('--lgn_potential_vref_weight', type=float, default=0.5,
+                    help='Direct LGN-phase auxiliary weight that aligns LGN vref direction with potential-field direction')
 parser.add_argument('--guide_sample_count', type=int, default=10,
                     help='Number of keypoints to sample for guidance loss computation')
 parser.add_argument('--guide_sample_strategy', type=str, default='random',
@@ -786,7 +789,8 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
 
 
 PRECOMPUTED_CURRICULUM_REQUIRED_TYPES = ("easy", "hairpin", "u_min")
-VIZ_MAP_TYPES = ("easy", "hairpin", "u_min")
+PRECOMPUTED_LEGACY_FALLBACK_TYPE = "legacy"
+VIZ_MAP_TYPES = ("easy", "hairpin", "u_min", "legacy")
 PRECOMPUTED_MAP_TYPE_CODES = {
     "none": -1,
     "easy": 0,
@@ -800,6 +804,7 @@ PRECOMPUTED_CURRICULUM_STAGE_CODES = {
     "easy_only": 0,
     "easy_hairpin": 1,
     "easy_hairpin_u_min": 2,
+    "legacy_only": 3,
 }
 
 
@@ -826,6 +831,13 @@ def _build_precomputed_map_type_indices(map_cache):
 
 
 def _precomputed_curriculum_stage(iter_idx):
+    has_required = all(
+        len(PRECOMPUTED_MAP_TYPE_INDICES.get(t, [])) > 0
+        for t in PRECOMPUTED_CURRICULUM_REQUIRED_TYPES
+    )
+    if not has_required and len(PRECOMPUTED_MAP_TYPE_INDICES.get(PRECOMPUTED_LEGACY_FALLBACK_TYPE, [])) > 0:
+        return "legacy_only", (PRECOMPUTED_LEGACY_FALLBACK_TYPE,)
+
     if int(iter_idx) < 500:
         return "easy_only", ("easy",)
     if int(iter_idx) < 4000:
@@ -915,17 +927,29 @@ if args.use_precomputed_potential_maps:
         map_type for map_type in PRECOMPUTED_CURRICULUM_REQUIRED_TYPES
         if len(PRECOMPUTED_MAP_TYPE_INDICES.get(map_type, [])) == 0
     ]
-    if missing_types:
+    has_required = len(missing_types) == 0
+    has_legacy_fallback = len(PRECOMPUTED_MAP_TYPE_INDICES.get(PRECOMPUTED_LEGACY_FALLBACK_TYPE, [])) > 0
+    if (not has_required) and (not has_legacy_fallback):
         counts_msg = ", ".join(
             f"{k}={len(v)}" for k, v in sorted(PRECOMPUTED_MAP_TYPE_INDICES.items())
         )
         raise RuntimeError(
-            "Precomputed map curriculum requires easy, hairpin, and u_min maps. "
+            "Precomputed map curriculum requires easy, hairpin, and u_min maps "
+            "or legacy map_*.pt fallback maps. "
             f"Missing: {','.join(missing_types)}. loaded_counts: {counts_msg}. "
             "If --num_precomputed_maps is set, increase it or use 0 to load all maps."
         )
-
-    INITIAL_PRECOMPUTED_MAP_TYPE = "easy"
+    if not has_required and has_legacy_fallback:
+        counts_msg = ", ".join(
+            f"{k}={len(v)}" for k, v in sorted(PRECOMPUTED_MAP_TYPE_INDICES.items())
+        )
+        print(
+            "[PotentialMap] Curriculum typed maps (easy/hairpin/u_min) are incomplete; "
+            f"fallback to legacy-only mode. counts=({counts_msg})"
+        )
+        INITIAL_PRECOMPUTED_MAP_TYPE = PRECOMPUTED_LEGACY_FALLBACK_TYPE
+    else:
+        INITIAL_PRECOMPUTED_MAP_TYPE = "easy"
     INITIAL_PRECOMPUTED_MAP_IDX = PRECOMPUTED_MAP_TYPE_INDICES[INITIAL_PRECOMPUTED_MAP_TYPE][0]
     INITIAL_PRECOMPUTED_MAP_FILE = os.path.basename(POTENTIAL_MAP_CACHE.map_files[INITIAL_PRECOMPUTED_MAP_IDX])
     first_map = POTENTIAL_MAP_CACHE.get_map(INITIAL_PRECOMPUTED_MAP_IDX)
@@ -1079,7 +1103,7 @@ def is_save_iter(i):
 
 def is_save_trajectory_iter(i):
     interval = int(args.trajectory_save_interval)
-    return interval > 0 and (i + 1) % interval == 0
+    return interval > 0 and (i == 0 or (i + 1) % interval == 0)
 
 
 def rotation_matrix_to_rpy_deg(R):
@@ -2333,6 +2357,45 @@ def compute_guidance_reference_from_potential_map(p_history, map_data, interpola
     return potential_value, ref_dir, valid_mask
 
 
+def compute_lgn_potential_vref_sync_loss(env, p_history, vref_body_seq, R_proxy_seq):
+    """Align LGN body-frame reference direction with cached potential-field descent direction."""
+    zero = torch.tensor(0.0, device=vref_body_seq.device, dtype=vref_body_seq.dtype)
+    if (
+        not args.use_precomputed_potential_maps
+        or args.use_astar_guidance
+        or POTENTIAL_MAP_CACHE is None
+        or query_potential_guidance is None
+    ):
+        return zero, {
+            'loss': zero,
+            'cos': zero,
+            'valid_ratio': zero,
+        }
+
+    map_idx = int(getattr(env, 'current_map_idx', 0))
+    map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
+    _, ref_dir_world, valid_mask = compute_guidance_reference_from_potential_map(
+        p_history=p_history.detach(),
+        map_data=map_data,
+        interpolation=args.potential_interpolation,
+    )
+    ref_dir_world = sanitize_tensor(ref_dir_world, nan=0.0, posinf=0.0, neginf=0.0)
+    ref_dir_body = torch.squeeze(ref_dir_world[:, :, None, :] @ R_proxy_seq.detach(), 2)
+    ref_dir_body = safe_normalize(ref_dir_body, dim=-1)
+
+    vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
+    cos_align = (vref_body_dir * ref_dir_body).sum(dim=-1).clamp(-1.0, 1.0)
+    valid_mask = valid_mask & torch.isfinite(cos_align)
+    loss_map = (1.0 - cos_align).clamp(0.0, 2.0)
+    loss = _masked_mean(loss_map, valid_mask)
+    cos_mean = _masked_mean(cos_align, valid_mask)
+    return loss, {
+        'loss': loss,
+        'cos': cos_mean,
+        'valid_ratio': valid_mask.float().mean(),
+    }
+
+
 def compute_potential_guidance_meta_loss(env, p_history, v_history, vec_to_pt, dist_obj,
                                          map_data,
                                          max_speed=5.0,
@@ -2871,6 +2934,40 @@ def _plotly_add_cylinder_y(fig, cx, zc, r, y0, y1, color='darkorange', opacity=0
                              opacity=opacity, hoverinfo='skip'))
 
 
+def _map_tensor_to_numpy(map_data, key, cols):
+    if map_data is None:
+        return None
+    val = map_data.get(key, None)
+    if val is None:
+        return None
+    if isinstance(val, torch.Tensor):
+        arr = val.detach().cpu().numpy()
+    else:
+        arr = np.asarray(val)
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim != 2 or arr.shape[1] < cols:
+        return None
+    return arr[:, :cols]
+
+
+def _prioritize_xy_near_trajectory(arr, traj_xyz, max_items):
+    if arr is None or arr.size <= 0:
+        return arr
+    max_items = int(max_items)
+    if max_items <= 0 or arr.shape[0] <= max_items:
+        return arr
+    xy = arr[:, :2].astype(np.float32)
+    traj_xy = traj_xyz[:, :2].astype(np.float32)
+    if traj_xy.shape[0] > 80:
+        pick = np.linspace(0, traj_xy.shape[0] - 1, 80).astype(np.int64)
+        traj_xy = traj_xy[pick]
+    d2 = ((xy[:, None, :] - traj_xy[None, :, :]) ** 2).sum(axis=-1).min(axis=1)
+    keep = np.argsort(d2)[:max_items]
+    return arr[keep]
+
+
 def _is_ceiling_voxel(box_xyz_half, env):
     """Return True if a voxel is the top ceiling slab."""
     cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
@@ -3230,18 +3327,31 @@ def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, ax
             y_vals.extend([[by - br], [by + br]])
             z_vals.extend([[bz - br], [bz + br]])
 
-    z0_vis, z1_vis = 0.0, 5.0
-    if hasattr(env, 'cyl') and env.cyl.numel() > 0:
+    z0_vis = float(getattr(env, 'map_z_min', 0.0))
+    z1_vis = float(getattr(env, 'map_z_max', 5.0))
+    cyl = _map_tensor_to_numpy(potential_map_data, 'cyl', 3)
+    if cyl is None and hasattr(env, 'cyl') and env.cyl.numel() > 0:
         cyl = env.cyl[idx].detach().cpu().numpy()
-        for cx, cy, cr in cyl[:100]:
+    if cyl is not None and cyl.size > 0:
+        cyl = _prioritize_xy_near_trajectory(cyl, traj_xyz, max_items=260)
+        for cx, cy, cr in cyl:
             _plotly_add_cylinder_z(fig, float(cx), float(cy), float(cr), z0_vis, z1_vis, color='teal', opacity=0.76)
             x_vals.extend([[cx - cr], [cx + cr]])
             y_vals.extend([[cy - cr], [cy + cr]])
 
-    y0_vis, y1_vis = -9.5, 9.5
-    if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
+    if potential_map_data is not None:
+        bounds = potential_map_data.get('bounds', {}) or {}
+        y0_vis = float(bounds.get('y_min', getattr(env, 'map_y_min', -9.5)))
+        y1_vis = float(bounds.get('y_max', getattr(env, 'map_y_max', 9.5)))
+    else:
+        y0_vis = float(getattr(env, 'map_y_min', -9.5))
+        y1_vis = float(getattr(env, 'map_y_max', 9.5))
+    cyl_h = _map_tensor_to_numpy(potential_map_data, 'cyl_h', 3)
+    if cyl_h is None and hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
         cyl_h = env.cyl_h[idx].detach().cpu().numpy()
-        for cx, cz, cr in cyl_h[:100]:
+    if cyl_h is not None and cyl_h.size > 0:
+        cyl_h = _prioritize_xy_near_trajectory(cyl_h, traj_xyz, max_items=180)
+        for cx, cz, cr in cyl_h:
             _plotly_add_cylinder_y(fig, float(cx), float(cz), float(cr), y0_vis, y1_vis, color='darkorange', opacity=0.76)
             x_vals.extend([[cx - cr], [cx + cr]])
             z_vals.extend([[cz - cr], [cz + cr]])
@@ -3395,20 +3505,6 @@ def save_cached_viz_record(record, save_step):
         show_potential_overlay=potential_map_data is not None,
     ):
         writer.add_text(f'{tag_prefix}/Interactive3D_HTML', interactive_html, save_step)
-
-    if potential_map_data is not None:
-        try:
-            z_world_dbg = float(p_cpu[:, 2].median().item())
-            fig_potential = build_potential_xy_debug_figure(
-                potential_map_data,
-                z_world=z_world_dbg,
-                stride=6,
-            )
-            if fig_potential is not None:
-                writer.add_figure(f'{debug_prefix}/Potential_XY_Slice', fig_potential, save_step)
-                plt.close(fig_potential)
-        except Exception as e:
-            writer.add_text(f'{debug_prefix}/Potential_XY_Slice_Status', f'failed: {e}', save_step)
 
     fig_v, ax = plt.subplots()
     ax.plot(v_cpu[:, 0], label='vx')
@@ -4171,6 +4267,12 @@ for i in pbar:
     vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
     lgn_vref_worker_cos_seq = (v_pred_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
     loss_lgn_vref_seq = (1.0 - lgn_vref_worker_cos_seq).clamp(0.0, 2.0)
+    loss_lgn_potential_vref, lgn_potential_vref_components = compute_lgn_potential_vref_sync_loss(
+        env=env,
+        p_history=p_history,
+        vref_body_seq=vref_body_seq,
+        R_proxy_seq=R_proxy_seq,
+    )
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
         if train_lgn_phase and not weights_seq.requires_grad:
@@ -4334,6 +4436,7 @@ for i in pbar:
         _diag_tensor_finite("loss_exploration_seq", loss_exploration_seq, i)
         _diag_tensor_finite("loss_turn_seq", loss_turn_seq, i)
         _diag_tensor_finite("loss_lgn_vref_seq", loss_lgn_vref_seq, i)
+        _diag_tensor_finite("loss_lgn_potential_vref", loss_lgn_potential_vref, i)
         _diag_tensor_finite("loss_yaw_smooth", loss_yaw_smooth, i)
         _diag_tensor_finite("loss_heading_safety", loss_heading_safety, i)
         _diag_tensor_finite("weights_seq_raw", weights_seq_raw, i)
@@ -4699,19 +4802,30 @@ for i in pbar:
                     and math.isfinite(lgn_meta_probe_norm)
                 )
                 scaled_meta = scale_scalar_objective(meta_loss_unrolled)
-                if not meta_grad_usable:
+                lgn_potential_vref_usable = (
+                    float(args.lgn_potential_vref_weight) != 0.0
+                    and loss_lgn_potential_vref.requires_grad
+                    and bool(torch.isfinite(loss_lgn_potential_vref).all().item())
+                    and float(lgn_potential_vref_components['valid_ratio'].detach().item()) > 0.0
+                )
+                if not (meta_grad_usable or lgn_potential_vref_usable):
                     lgn_step_skipped = 1.0
-                    lgn_skip_code = 3.0  # meta probe unusable
+                    lgn_skip_code = 3.0  # no usable LGN gradient source
                     if _diag_should_log(i):
                         print(
-                            f"[DIAG iter={i}] skip LGN step: unusable meta gradients "
+                            f"[DIAG iter={i}] skip LGN step: no usable LGN gradients "
                             f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
-                            f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)})"
+                            f"meta_probe_nonfinite={int(lgn_meta_probe_nonfinite)}/{int(lgn_meta_probe_elems)}, "
+                            f"potential_vref_usable={lgn_potential_vref_usable})"
                         )
                     if term_log_now:
-                        pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
+                        pbar.set_description(f"[{phase_str}] LGN grad unusable, step skipped")
                 else:
-                    lgn_total = scaled_meta
+                    lgn_total = torch.tensor(0.0, device=device, dtype=meta_loss_unrolled.dtype)
+                    if meta_grad_usable:
+                        lgn_total = lgn_total + scaled_meta
+                    if lgn_potential_vref_usable:
+                        lgn_total = lgn_total + float(args.lgn_potential_vref_weight) * loss_lgn_potential_vref
 
                     lgn_total.backward()
                     lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
@@ -4826,6 +4940,10 @@ for i in pbar:
             'LGN/VRef_Weight': weights_eff_mean_tb[5],
             'LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
             'LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
+            'LGN/Potential_VRef_Cos': lgn_potential_vref_components['cos'],
+            'LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],
+            'LGN/Potential_VRef_Weight': args.lgn_potential_vref_weight,
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
             'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
@@ -5055,6 +5173,9 @@ for i in pbar:
             'Debug/LGN/VRef_Weight': weights_eff_mean_tb[5],
             'Debug/LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
             'Debug/LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'Debug/LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
+            'Debug/LGN/Potential_VRef_Cos': lgn_potential_vref_components['cos'],
+            'Debug/LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],
             'Debug/Yaw/Heading_Vel_Error_Deg': heading_vel_error_deg.mean(),
             'Debug/Yaw/Backward_Ratio': backward_ratio,
             'Debug/Yaw/Side_Backward_Ratio': side_backward_ratio,

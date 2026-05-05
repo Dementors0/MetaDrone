@@ -113,11 +113,16 @@ class Env(BaseEnv):
         unified_map_hairpin_count=1,
         wall_physical_feedback=False,
     ):
+        self.map_x_min = 0.0
         self.map_x_max = 10.0
+        self.base_map_x_min = self.map_x_min
+        self.base_map_x_max = self.map_x_max
         self.compact_two_zone_map = bool(compact_two_zone_map) or bool(unified_four_maps)
         self.map_y_half = 8.0 if self.compact_two_zone_map else 12.0
         self.map_y_min = -self.map_y_half
         self.map_y_max = self.map_y_half
+        self.base_map_y_min = self.map_y_min
+        self.base_map_y_max = self.map_y_max
         self.map_z_max = 5.0
         self.ground_z = 0.0
         self.ceiling_z = self.map_z_max
@@ -294,13 +299,15 @@ class Env(BaseEnv):
             return voxels
 
         tol = max(0.08, float(self.boundary_half) * 1.8)
+        local_x_min = float(getattr(self, "map_x_min", 0.0))
+        local_x_max = float(self.map_x_max)
         local_y_min = float(self.map_y_min) if y_min is None else float(y_min)
         local_y_max = float(self.map_y_max) if y_max is None else float(y_max)
         cx, cy, cz = vox[..., 0], vox[..., 1], vox[..., 2]
         hx, hy, hz = vox[..., 3], vox[..., 4], vox[..., 5]
 
         side_x = (
-            ((cx - 0.0).abs() <= tol) | ((cx - float(self.map_x_max)).abs() <= tol)
+            ((cx - local_x_min).abs() <= tol) | ((cx - local_x_max).abs() <= tol)
         ) & ((hx - float(self.boundary_half)).abs() <= tol)
         side_y = (
             ((cy - local_y_min).abs() <= tol) | ((cy - local_y_max).abs() <= tol)
@@ -1223,6 +1230,13 @@ class Env(BaseEnv):
         self.current_map_type = str(map_type)
         builder = self._get_unified_builder()
         geom = builder(self, map_type)
+        self.map_x_min = float(geom.get("map_x_min", 0.0))
+        self.map_x_max = float(geom.get("map_x_max", self.map_x_max))
+        self.map_y_min = float(geom.get("map_y_min", self.map_y_min))
+        self.map_y_max = float(geom.get("map_y_max", self.map_y_max))
+        self.map_y_half = 0.5 * (self.map_y_max - self.map_y_min)
+        self.scene_x_half = max(abs(float(self.map_x_min)), abs(float(self.map_x_max)))
+        self.scene_y_half = self.map_y_half
 
         self.balls = self._expand_obs_to_batch(geom.get("balls", []), 4, B, device)
         self.cyl = self._expand_obs_to_batch(geom.get("cyl", []), 3, B, device)
@@ -1400,6 +1414,11 @@ class Env(BaseEnv):
         if not map_type_raw:
             map_type_raw = map_data.get("map_meta", {}).get("map_type", None) if isinstance(map_data.get("map_meta", None), dict) else None
         self.current_map_type = str(map_type_raw or "").strip().lower().replace("_", "-")
+        self.map_x_min = float(map_data.get("map_x_min", 0.0))
+        self.map_x_max = float(map_data.get("map_x_max", self.map_x_max))
+        self.map_y_min = float(map_data.get("map_y_min", self.map_y_min))
+        self.map_y_max = float(map_data.get("map_y_max", self.map_y_max))
+        self.map_y_half = 0.5 * (self.map_y_max - self.map_y_min)
 
         def _to_device_tensor(key, fallback_shape):
             val = map_data.get(key, None)
@@ -1454,7 +1473,7 @@ class Env(BaseEnv):
         self.spawn_goal_z_half_span = float(map_data.get("spawn_goal_z_half_span", self.fixed_spawn_half_span))
 
         self._obstacle_scale = torch.ones((B, 1), device=device)
-        self.scene_x_half = self.map_x_max
+        self.scene_x_half = max(abs(float(getattr(self, "map_x_min", 0.0))), abs(float(self.map_x_max)))
         self.scene_y_half = self.map_y_half
         self._maze_rotation = None
 

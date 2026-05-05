@@ -474,7 +474,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
 parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--num_iters', type=int, default=50000)
 
 # [优化策略参数]
@@ -618,6 +618,8 @@ parser.add_argument('--lgn_weight_floor', type=float, default=0.01,
                     help='Compatibility arg (unused): no extra floor is applied beyond non-negative constraint')
 parser.add_argument('--lgn_weight_ceiling', type=float, default=100.0,
                     help='Compatibility arg (unused): no ceiling constraint is applied to LGN weights')
+parser.add_argument('--lgn_potential_vref_weight', type=float, default=0.5,
+                    help='Weight for LGN potential-field vref alignment loss (LGN phase only)')
 parser.add_argument('--speed_goal_slow_dist', type=float, default=2.5,
                     help='Distance-to-goal (m) where speed target starts linearly reducing to prevent straight-line rushing')
 parser.add_argument('--meta_coll_soft_weight', type=float, default=5.0,
@@ -736,7 +738,7 @@ parser.add_argument('--diag_proxy_worker_grads', dest='diag_proxy_worker_grads',
                     help='Enable diagnostic loss-to-worker gradient probes (extra autograd overhead)')
 parser.add_argument('--no_diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_false',
                     help='Disable diagnostic loss-to-worker gradient probes')
-parser.set_defaults(diag_proxy_worker_grads=True)
+parser.set_defaults(diag_proxy_worker_grads=False)
 parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 parser.add_argument('--debug_scalar_interval', type=int, default=25,
@@ -4263,6 +4265,21 @@ for i in pbar:
     vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
     lgn_vref_real_cos_seq = (v_real_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
     loss_lgn_vref_seq = (1.0 - lgn_vref_real_cos_seq).clamp(0.0, 2.0)
+    loss_lgn_potential_vref = torch.tensor(0.0, device=device, dtype=vref_body_seq.dtype)
+    lgn_potential_vref_valid_ratio = torch.tensor(0.0, device=device, dtype=vref_body_seq.dtype)
+    if train_lgn_phase and args.use_precomputed_potential_maps and POTENTIAL_MAP_CACHE is not None:
+        map_idx = int(getattr(env, 'current_map_idx', 0))
+        map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
+        _, ref_dir_world, valid_mask = compute_guidance_reference_from_potential_map(
+            p_history=p_history.detach(),
+            map_data=map_data,
+            interpolation=args.potential_interpolation,
+        )
+        ref_dir_body = torch.squeeze(ref_dir_world[:, :, None, :] @ R_proxy_seq.detach(), 2)
+        cos_align = (safe_normalize(vref_body_seq, dim=-1) * safe_normalize(ref_dir_body, dim=-1)).sum(-1)
+        loss_map = (1.0 - cos_align).clamp(0.0, 2.0)
+        loss_lgn_potential_vref = _masked_mean(loss_map, valid_mask)
+        lgn_potential_vref_valid_ratio = valid_mask.float().mean()
     if _diag_should_log(i):
         print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
         if train_lgn_phase and not weights_seq.requires_grad:
@@ -4804,7 +4821,7 @@ for i in pbar:
                     if term_log_now:
                         pbar.set_description(f"[{phase_str}] meta-grad unusable, LGN step skipped")
                 else:
-                    lgn_total = scaled_meta
+                    lgn_total = scaled_meta + float(args.lgn_potential_vref_weight) * loss_lgn_potential_vref
 
                     lgn_total.backward()
                     lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
@@ -4920,6 +4937,9 @@ for i in pbar:
             'LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
             'LGN/VRef_Real_Cos': lgn_vref_real_cos_seq.mean(),
             'LGN/VRef_Worker_Cos': lgn_vref_real_cos_seq.mean(),
+            'LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
+            'LGN/Potential_VRef_Weight': float(args.lgn_potential_vref_weight),
+            'LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_valid_ratio,
             'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
             'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
             'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
@@ -5150,6 +5170,9 @@ for i in pbar:
             'Debug/LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
             'Debug/LGN/VRef_Real_Cos': lgn_vref_real_cos_seq.mean(),
             'Debug/LGN/VRef_Worker_Cos': lgn_vref_real_cos_seq.mean(),
+            'Debug/LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
+            'Debug/LGN/Potential_VRef_Weight': float(args.lgn_potential_vref_weight),
+            'Debug/LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_valid_ratio,
             'Debug/Yaw/Heading_Vel_Error_Deg': heading_vel_error_deg.mean(),
             'Debug/Yaw/Backward_Ratio': backward_ratio,
             'Debug/Yaw/Side_Backward_Ratio': side_backward_ratio,

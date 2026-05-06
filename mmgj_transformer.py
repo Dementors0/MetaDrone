@@ -1,7 +1,7 @@
 #9.2-1
 #修改无人机坐标系，鼓励无人机过弯
 #9.2.5的模型增加感知、LGN输出指导速度在compact地图中跑
-#compact复制地图中跑，修复LGN方向指导
+#compact复制地图中跑，修复LGN方向指导、proxy loss
 
 import argparse
 import atexit
@@ -4063,6 +4063,7 @@ for i in pbar:
     trajectory_lgn_weights = []
     trajectory_lgn_vrefs = []
     R_proxy_history = []
+    v_actual_for_vref_history = []
     v_preds = []
     yaw_rate_cmd_history = []
     yaw_error_history = []
@@ -4244,6 +4245,8 @@ for i in pbar:
         else:
             env.run(real_act, ctl_dt, target_v_raw_curr)
 
+        v_actual_for_vref_history.append(env.v)
+
         # Keep full horizon so in-goal staying can continuously accumulate arrival reward.
 
         if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
@@ -4261,12 +4264,13 @@ for i in pbar:
     weights_seq = torch.stack(trajectory_lgn_weights)  # [T, B, 6]
     vref_body_seq = torch.stack(trajectory_lgn_vrefs)  # [T, B, 3]
     R_proxy_seq = torch.stack(R_proxy_history)         # [T, B, 3, 3]
+    v_actual_for_vref_tensor = torch.stack(v_actual_for_vref_history)  # [T, B, 3], world frame after env.run
     v_preds_tensor = torch.stack(v_preds)              # [T, B, 3], world frame
-    v_pred_body_seq = torch.squeeze(v_preds_tensor[:, :, None, :] @ R_proxy_seq, 2)
-    v_pred_body_dir = safe_normalize(v_pred_body_seq, dim=-1)
+    v_actual_body_seq = torch.squeeze(v_actual_for_vref_tensor[:, :, None, :] @ R_proxy_seq, 2)
+    v_actual_body_dir = safe_normalize(v_actual_body_seq, dim=-1)
     vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
-    lgn_vref_worker_cos_seq = (v_pred_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
-    loss_lgn_vref_seq = (1.0 - lgn_vref_worker_cos_seq).clamp(0.0, 2.0)
+    lgn_vref_actual_v_cos_seq = (v_actual_body_dir * vref_body_dir).sum(dim=-1).clamp(-1.0, 1.0)
+    loss_lgn_vref_seq = (1.0 - lgn_vref_actual_v_cos_seq).clamp(0.0, 2.0)
     loss_lgn_potential_vref, lgn_potential_vref_components = compute_lgn_potential_vref_sync_loss(
         env=env,
         p_history=p_history,
@@ -4413,7 +4417,8 @@ for i in pbar:
     )
 
     # 3. 最终 Proxy Loss
-    proxy_loss = weighted_loss_map.mean() + loss_heading_safety
+    loss_proxy_lgn_potential_vref = float(args.lgn_potential_vref_weight) * loss_lgn_potential_vref
+    proxy_loss = weighted_loss_map.mean() + loss_heading_safety + loss_proxy_lgn_potential_vref
     if _diag_should_log(i):
         print(
             f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
@@ -4437,6 +4442,7 @@ for i in pbar:
         _diag_tensor_finite("loss_turn_seq", loss_turn_seq, i)
         _diag_tensor_finite("loss_lgn_vref_seq", loss_lgn_vref_seq, i)
         _diag_tensor_finite("loss_lgn_potential_vref", loss_lgn_potential_vref, i)
+        _diag_tensor_finite("loss_proxy_lgn_potential_vref", loss_proxy_lgn_potential_vref, i)
         _diag_tensor_finite("loss_yaw_smooth", loss_yaw_smooth, i)
         _diag_tensor_finite("loss_heading_safety", loss_heading_safety, i)
         _diag_tensor_finite("weights_seq_raw", weights_seq_raw, i)
@@ -4939,8 +4945,9 @@ for i in pbar:
             'Loss/Proxy_LGN_VRef': loss_lgn_vref_seq.mean(),
             'LGN/VRef_Weight': weights_eff_mean_tb[5],
             'LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
-            'LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'LGN/VRef_ActualV_Cos': lgn_vref_actual_v_cos_seq.mean(),
             'LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
+            'LGN/Potential_VRef_Proxy_Loss': loss_proxy_lgn_potential_vref,
             'LGN/Potential_VRef_Cos': lgn_potential_vref_components['cos'],
             'LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],
             'LGN/Potential_VRef_Weight': args.lgn_potential_vref_weight,
@@ -5172,7 +5179,7 @@ for i in pbar:
             'Debug/Proxy/Height': loss_height_seq.mean(),
             'Debug/LGN/VRef_Weight': weights_eff_mean_tb[5],
             'Debug/LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
-            'Debug/LGN/VRef_Worker_Cos': lgn_vref_worker_cos_seq.mean(),
+            'Debug/LGN/VRef_ActualV_Cos': lgn_vref_actual_v_cos_seq.mean(),
             'Debug/LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
             'Debug/LGN/Potential_VRef_Cos': lgn_potential_vref_components['cos'],
             'Debug/LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],

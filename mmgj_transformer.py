@@ -738,6 +738,8 @@ parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 parser.add_argument('--debug_scalar_interval', type=int, default=25,
                     help='Unified TensorBoard scalar logging interval in iterations (<=0 disables periodic scalar writes)')
+parser.add_argument('--debug_tb_interval', type=int, default=500,
+                    help='TensorBoard Debug/* logging interval in iterations (<=0 disables Debug tag writes)')
 parser.add_argument('--trajectory_save_interval', type=int, default=100,
                     help='Save cached trajectory/video visualizations every N iterations (<=0 disables)')
 
@@ -767,7 +769,7 @@ POTENTIAL_MAP_CACHE = None
 ########## 2. 目录与日志初始化 ##########
 current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 script_name = os.path.splitext(os.path.basename(__file__))[0]
-save_dir_name = f"{script_name}_{args.exp_name}_{current_time}"
+save_dir_name = "代码9.2.7自己决定速度"
 save_dir = os.path.join("..", "checkpoints", save_dir_name)
 video_dir = os.path.join(save_dir, 'videos')
 
@@ -1118,6 +1120,15 @@ def is_save_iter(i):
 def is_save_trajectory_iter(i):
     interval = int(args.trajectory_save_interval)
     return interval > 0 and (i + 1) % interval == 0
+
+
+def is_debug_tb_step(step):
+    interval = int(args.debug_tb_interval)
+    return interval > 0 and (step % interval == 0 or step == args.num_iters)
+
+
+def is_debug_tb_iter(i):
+    return is_debug_tb_step(i + 1)
 
 
 def rotation_matrix_to_rpy_deg(R):
@@ -3475,15 +3486,17 @@ def save_cached_viz_record(record, save_step):
     writer.add_figure(f'{tag_prefix}/Control_Accel_Cmd_Series', fig_act, save_step)
     plt.close(fig_act)
 
-    labels = ['SpeedPref_Signed', 'SpeedPref_Strength', 'Direction', 'Avoidance', 'Exploration', 'Turn', 'VRef']
-    tag_suffix = ['0_SpeedPref_Signed', '0_1_SpeedPref_Strength', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn', '5_VRef']
-    for wi in range(min(len(labels), w_cpu.shape[-1])):
-        fig_wi, ax = plt.subplots()
-        ax.plot(w_cpu[:, wi], label=labels[wi])
-        ax.legend()
-        ax.set_title(f"{map_type} source iter {source_iter} Weight - {labels[wi]}")
-        writer.add_figure(f'{debug_prefix}/Weights_StepWise_{tag_suffix[wi]}', fig_wi, save_step)
-        plt.close(fig_wi)
+    write_debug_tb = is_debug_tb_step(save_step)
+    if write_debug_tb:
+        labels = ['SpeedPref_Signed', 'SpeedPref_Strength', 'Direction', 'Avoidance', 'Exploration', 'Turn', 'VRef']
+        tag_suffix = ['0_SpeedPref_Signed', '0_1_SpeedPref_Strength', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn', '5_VRef']
+        for wi in range(min(len(labels), w_cpu.shape[-1])):
+            fig_wi, ax = plt.subplots()
+            ax.plot(w_cpu[:, wi], label=labels[wi])
+            ax.legend()
+            ax.set_title(f"{map_type} source iter {source_iter} Weight - {labels[wi]}")
+            writer.add_figure(f'{debug_prefix}/Weights_StepWise_{tag_suffix[wi]}', fig_wi, save_step)
+            plt.close(fig_wi)
 
     depth_stack = record.get('depth_stack', None)
     if depth_stack is not None:
@@ -3491,27 +3504,28 @@ def save_cached_viz_record(record, save_step):
         gif_path = os.path.join(video_dir, f'depth_{file_prefix}.gif')
         _depth_frames_to_video(depth_stack, mp4_path, gif_path, save_step, f'Video/{map_type}')
 
-    weights_snapshot = record['weights_snapshot']
-    raw_snapshot = record['raw_snapshot']
-    write_scalar_dict(
-        writer,
-        {
-            f'{debug_prefix}/Source_Iter': source_iter,
-            f'{debug_prefix}/Map_Index': map_idx,
-            f'{debug_prefix}/Weights_Snapshot/0_SpeedPref_Signed': weights_snapshot[0],
-            f'{debug_prefix}/Weights_Snapshot/0_1_SpeedPref_Strength': weights_snapshot[1],
-            f'{debug_prefix}/Weights_Snapshot/1_Direction': weights_snapshot[2],
-            f'{debug_prefix}/Weights_Snapshot/2_Avoidance': weights_snapshot[3],
-            f'{debug_prefix}/Weights_Snapshot/3_Exploration': weights_snapshot[4],
-            f'{debug_prefix}/Weights_Snapshot/4_Turn': weights_snapshot[5],
-            f'{debug_prefix}/Weights_Snapshot/5_VRef': weights_snapshot[6],
-            f'{debug_prefix}/Weights_Snapshot/Std': weights_snapshot.std(unbiased=False),
-            f'{debug_prefix}/Weights_Snapshot/Raw_Min': raw_snapshot.min(),
-            f'{debug_prefix}/Weights_Snapshot/Raw_Max': raw_snapshot.max(),
-            f'{debug_prefix}/Weights_Snapshot/Raw_Mean': raw_snapshot.mean(),
-        },
-        save_step,
-    )
+    if write_debug_tb:
+        weights_snapshot = record['weights_snapshot']
+        raw_snapshot = record['raw_snapshot']
+        write_scalar_dict(
+            writer,
+            {
+                f'{debug_prefix}/Source_Iter': source_iter,
+                f'{debug_prefix}/Map_Index': map_idx,
+                f'{debug_prefix}/Weights_Snapshot/0_SpeedPref_Signed': weights_snapshot[0],
+                f'{debug_prefix}/Weights_Snapshot/0_1_SpeedPref_Strength': weights_snapshot[1],
+                f'{debug_prefix}/Weights_Snapshot/1_Direction': weights_snapshot[2],
+                f'{debug_prefix}/Weights_Snapshot/2_Avoidance': weights_snapshot[3],
+                f'{debug_prefix}/Weights_Snapshot/3_Exploration': weights_snapshot[4],
+                f'{debug_prefix}/Weights_Snapshot/4_Turn': weights_snapshot[5],
+                f'{debug_prefix}/Weights_Snapshot/5_VRef': weights_snapshot[6],
+                f'{debug_prefix}/Weights_Snapshot/Std': weights_snapshot.std(unbiased=False),
+                f'{debug_prefix}/Weights_Snapshot/Raw_Min': raw_snapshot.min(),
+                f'{debug_prefix}/Weights_Snapshot/Raw_Max': raw_snapshot.max(),
+                f'{debug_prefix}/Weights_Snapshot/Raw_Mean': raw_snapshot.mean(),
+            },
+            save_step,
+        )
 
 
 @torch.no_grad()
@@ -3938,6 +3952,7 @@ for i in pbar:
             or ((i + 1) == args.num_iters)
         )
     )
+    debug_tb_log_now = is_debug_tb_iter(i)
     cycle_pos = i % cycle_len
     train_lgn_phase = cycle_pos < args.lgn_steps
     phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
@@ -5222,10 +5237,11 @@ for i in pbar:
                 active_tb_writer.add_scalar("Grad_LGN_Raw/Skip_Code", lgn_skip_code, i + 1)
             active_tb_writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
             active_tb_writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
-            write_scalar_dict(active_tb_writer, debug_log_data, i + 1)
             for k, v in writer_q.items():
                 active_tb_writer.add_scalar(k, sum(v) / len(v), i + 1)
             writer_q.clear()
+        if debug_tb_log_now:
+            write_scalar_dict(active_tb_writer, debug_log_data, i + 1)
             active_tb_writer.flush()
 
         if is_save_iter(i):
@@ -5271,7 +5287,7 @@ for i in pbar:
                 f"iter={i + 1}, type={current_precomputed_map_type}, "
                 f"idx={current_precomputed_map_idx}, file={current_precomputed_map_file}"
             )
-            if tb_log_now:
+            if debug_tb_log_now:
                 _resolve_tb_writer(current_precomputed_map_type).add_text(
                     f'Debug/VizCache/Latest_{current_precomputed_map_type}',
                     cache_msg,
@@ -5291,17 +5307,18 @@ for i in pbar:
                 f"save_iter={i + 1}, available={','.join(available_types) or 'none'}, "
                 f"missing={','.join(missing_types) or 'none'}"
             )
-            writer.add_text('Debug/VizCache/Save_Status', status_msg, i + 1)
-            write_scalar_dict(
-                writer,
-                {
-                    'Debug/VizCache/Has_Easy': 1.0 if latest_viz_by_map_type.get('easy') is not None else 0.0,
-                    'Debug/VizCache/Has_Hairpin': 1.0 if latest_viz_by_map_type.get('hairpin') is not None else 0.0,
-                    'Debug/VizCache/Has_U_Min': 1.0 if latest_viz_by_map_type.get('u_min') is not None else 0.0,
-                    'Debug/VizCache/Available_Count': len(available_types),
-                },
-                i + 1,
-            )
+            if debug_tb_log_now:
+                writer.add_text('Debug/VizCache/Save_Status', status_msg, i + 1)
+                write_scalar_dict(
+                    writer,
+                    {
+                        'Debug/VizCache/Has_Easy': 1.0 if latest_viz_by_map_type.get('easy') is not None else 0.0,
+                        'Debug/VizCache/Has_Hairpin': 1.0 if latest_viz_by_map_type.get('hairpin') is not None else 0.0,
+                        'Debug/VizCache/Has_U_Min': 1.0 if latest_viz_by_map_type.get('u_min') is not None else 0.0,
+                        'Debug/VizCache/Available_Count': len(available_types),
+                    },
+                    i + 1,
+                )
             for map_type in VIZ_MAP_TYPES:
                 record = latest_viz_by_map_type.get(map_type)
                 if record is None:

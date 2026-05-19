@@ -88,7 +88,7 @@ class LossGenNet(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim, 6),  # [Vel, Dir, Obs, Expl, Turn, VRef]
+            nn.Linear(hidden_dim, 7),  # [SpeedPrefSign, SpeedPrefStrength, Dir, Obs, Expl, Turn, VRef]
         )
         self.vref_head = nn.Linear(hidden_dim, 3)
 
@@ -101,7 +101,7 @@ class LossGenNet(nn.Module):
             progress_feat: [B, progress_dim] 近期进展/卡住统计特征
             hx: [B, T_mem, hidden_dim] 历史记忆 token (如果是第一步则为 None)
         返回:
-            weights: [B, 6]
+            weights: [B, 7]
             vref_body: [B, 3]
             hx: [B, T_mem, hidden_dim] 更新后的记忆序列
         """
@@ -145,9 +145,12 @@ class LossGenNet(nn.Module):
             x_out = self.transformer(x_in, mask=causal_mask)
         last_token = self.out_norm(x_out[:, -1])
         
-        # 6. 生成非负权重（不做归一化，仅约束 >= 0）
+        # 6. 生成权重：第0维为有符号加/减速偏好，其余维度非负。
         raw = self.head(last_token)
-        weights = F.softplus(raw)
+        weights = torch.cat([
+            torch.tanh(raw[:, :1]),
+            F.softplus(raw[:, 1:]),
+        ], dim=-1)
         vref_body = torch.tanh(self.vref_head(last_token))
         vref_body = F.normalize(vref_body, dim=-1, eps=1e-6)
 

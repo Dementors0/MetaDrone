@@ -1,46 +1,28 @@
 #9.2.7
-#增加感知、LGN输出指导速度
-#三种地图的log分开，LGN输出的方向指导直接指导真实速度，去掉低速保持机头方向修正
-#增加LGN输出的指导速度约束
+# 增加感知与 LGN 动态参考方向
+# LGN 输出方向直接指导真实速度；Worker 直接输出三维加速度动作，不再预测速度
+# 三种地图的 log 分开，去掉低速保持机头方向修正
 #变速偏好自己决定速度
 
 
 import argparse
-import atexit
 import math
-from collections import defaultdict, deque
-from random import normalvariate
+from collections import defaultdict
 import os
 import datetime
 import json
 import sys
-import multiprocessing as mp
-import shutil
-import numpy as np
 import matplotlib
 
 matplotlib.use('Agg', force=True)
 
 import torch
 import torch.nn as nn
-from torch.func import functional_call
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from matplotlib import pyplot as plt
-from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize
-try:
-    import imageio.v2 as imageio
-except Exception:
-    imageio = None
-
-try:
-    import plotly.graph_objects as go
-except Exception:
-    go = None
 
 if torch.cuda.is_available():
     torch.backends.cuda.enable_flash_sdp(False)
@@ -67,410 +49,70 @@ try:
 except ModuleNotFoundError:
     from WorkNet import WorkNet
     from LossGenNet import LossGenNet
-from turn_loss_utils import compute_turn_preference_loss_xy_windowed
 from worker_context_features import (
     WORKER_CONTEXT_FEATURE_DIM,
     extract_worker_context_features,
 )
+from utils.io_utils import (
+    create_unique_experiment_dir,
+    load_compatible_checkpoint,
+    sync_multi_pub_to_checkpoint_dir,
+)
+from utils.logging_utils import (
+    _diag_grad_meta,
+    _diag_grad_tuple_to_params,
+    _diag_output_to_params,
+    _diag_output_to_params_count,
+    _diag_should_log,
+    _diag_tensor_finite,
+    _grad_or_none_tuple,
+    _resolve_map_log_key,
+    _resolve_tb_writer,
+    get_grad_norm_from_grads,
+    get_grad_stats,
+    is_artifact_save_iter,
+    scale_scalar_objective,
+    smooth_dict,
+)
+from utils.map_utils import (
+    _align_env_goal_planes_to_precomputed_map,
+    _build_precomputed_map_type_indices,
+    _precomputed_curriculum_stage,
+    _select_precomputed_curriculum_map,
+)
+from utils.planner_utils import (
+    GlobalPlanner,
+    configure_planner_pool,
+    compute_global_guidance_meta_loss,
+    compute_lgn_potential_vref_sync_loss,
+)
+from utils.rollout_utils import unrolled_meta_rollout
+from utils.tensor_utils import (
+    build_yaw_frame,
+    compute_arrival_reward,
+    compute_heading_reference,
+    compute_overlap_loss_per_step,
+    compute_stuck_loss,
+    compute_turn_preference_loss,
+    compute_velocity_heading_command,
+    decode_worker_action,
+    extract_depth_geometry_features,
+    extract_progress_features,
+    rotation_matrix_to_rpy_deg,
+    safe_l2_norm,
+    safe_normalize,
+    sanitize_module_,
+    sanitize_tensor,
+)
+from utils.visualization_utils import save_cached_viz_record, snapshot_env_for_viz
 
-########### 0. 工具类：动态归一化 ##########
-class RunningMeanStd(nn.Module):
-    def __init__(self, shape, epsilon=1e-5):
-        super().__init__()
-        self.register_buffer('mean', torch.zeros(shape))
-        self.register_buffer('var', torch.ones(shape))
-        self.register_buffer('count', torch.tensor(1e-4))
-        self.epsilon = epsilon
-
-    def forward(self, x, update=True):
-        x = sanitize_tensor(x, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        if update:
-            with torch.no_grad():
-                batch_mean = x.mean(dim=0)
-                batch_var = x.var(dim=0, unbiased=False)
-                batch_count = x.shape[0]
-
-                delta = batch_mean - self.mean
-                tot_count = self.count + batch_count
-
-                new_mean = self.mean + delta * batch_count / tot_count
-                m_a = self.var * self.count
-                m_b = batch_var * batch_count
-                M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
-                new_var = M2 / tot_count
-
-                self.mean.copy_(new_mean)
-                self.var.copy_(new_var)
-                self.count.copy_(tot_count)
-        return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
-
-def safe_normalize(x, dim=-1, eps=1e-6):
-    return F.normalize(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dim=dim, eps=eps)
-
-
-def safe_l2_norm(x, dim=-1, keepdim=False, eps=1e-6):
-    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.sqrt((x * x).sum(dim=dim, keepdim=keepdim) + eps)
-
-
-def compute_arrival_reward(p_history, p_target, radius=0.5):
-    """Per-step positive reward inside goal ball; longer stay yields larger total reward."""
-    radius = max(float(radius), 1e-6)
-    target = p_target.unsqueeze(0) if p_history.dim() == 3 else p_target
-    dist_to_goal = safe_l2_norm(p_history - target, dim=-1)
-    reward_per_step = F.relu(radius - dist_to_goal) / radius
-    # Time-average reward per agent so every in-goal step contributes.
-    reward_per_agent = reward_per_step.mean(dim=0)
-    reward = reward_per_agent.mean()
-    with torch.no_grad():
-        hit_rate = (dist_to_goal <= radius).any(dim=0).float().mean()
-        best_dist = dist_to_goal.min(dim=0).values.mean()
-    return reward, hit_rate, best_dist
-
-
-def build_yaw_frame(R):
-    fwd = R[:, :, 0]
-    zeros = torch.zeros_like(fwd)
-    up = zeros.clone()
-    up[:, 2] = 1.0
-    fwd_h_raw = torch.stack([fwd[:, 0], fwd[:, 1], torch.zeros_like(fwd[:, 2])], dim=-1)
-    fwd_h_norm = safe_l2_norm(fwd_h_raw, dim=-1, keepdim=True)
-    fallback = zeros.clone()
-    fallback[:, 0] = 1.0
-    fwd_h = torch.where(fwd_h_norm > 1e-6, fwd_h_raw / fwd_h_norm.clamp_min(1e-6), fallback)
-    left = safe_normalize(torch.cross(up, fwd_h, dim=-1), dim=-1)
-    return torch.stack([fwd_h, left, up], -1)
-
-
-def compute_heading_reference(env, R_yaw):
-    target_vec = env.p_target - env.p.detach()
-    zeros = torch.zeros_like(target_vec[:, 2])
-    heading_ref_world = torch.stack([target_vec[:, 0], target_vec[:, 1], zeros], dim=-1)
-    heading_norm = safe_l2_norm(heading_ref_world, dim=-1, keepdim=True)
-    fallback = R_yaw[:, :, 0]
-    heading_ref_world = torch.where(
-        heading_norm > 1e-6,
-        heading_ref_world / heading_norm.clamp_min(1e-6),
-        fallback,
-    )
-    heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
-    yaw_error = torch.atan2(heading_ref_local[:, 1], heading_ref_local[:, 0]).unsqueeze(-1)
-    return heading_ref_world, heading_ref_local[:, :2], yaw_error
-
-
-def compute_velocity_heading_command(
-    R_yaw,
-    v_ref_world,
-    yaw_rate_max_value,
-    yaw_kp=4.0,
-    min_speed=0.25,
-):
-    """
-    根据期望速度方向计算机头参考方向和 yaw_rate_cmd。
-
-    逻辑：
-    1. 只使用水平面速度方向，不让 z 方向影响 yaw；
-    2. 机头参考方向始终来自速度方向（不再做低速保持当前机头）；
-    3. yaw_rate_cmd = yaw_kp * yaw_error，并限制在 [-yaw_rate_max, yaw_rate_max]；
-    4. 即使 v_ref_world 反向，也不会让机头瞬间跳 180°，而是通过 yaw_rate_max 平滑转过去。
-    """
-    _ = min_speed  # kept for call-site compatibility; no low-speed heading hold is applied.
-
-    v_xy = torch.stack([
-        v_ref_world[:, 0],
-        v_ref_world[:, 1],
-        torch.zeros_like(v_ref_world[:, 2]),
-    ], dim=-1)
-    speed_xy = safe_l2_norm(v_xy, dim=-1, keepdim=True)
-    heading_ref_world = safe_normalize(v_xy, dim=-1)
-
-    heading_ref_local = torch.squeeze(heading_ref_world[:, None] @ R_yaw, 1)
-    yaw_error = torch.atan2(
-        heading_ref_local[:, 1],
-        heading_ref_local[:, 0],
-    ).unsqueeze(-1)
-
-    yaw_rate_cmd = torch.clamp(
-        float(yaw_kp) * yaw_error,
-        -float(yaw_rate_max_value),
-        float(yaw_rate_max_value),
-    )
-
-    return heading_ref_world, heading_ref_local[:, :2], yaw_error, yaw_rate_cmd, speed_xy
-
-
-def decode_worker_action(act, R_yaw, yaw_rate_max_value):
-    B_local = act.shape[0]
-    act6 = act[:, :6]
-    a_pred, v_pred = (R_yaw @ act6.reshape(B_local, 3, 2)).unbind(-1)
-    yaw_rate_cmd = None
-    if act.shape[-1] > 6:
-        yaw_rate_cmd = torch.tanh(act[:, 6:7]) * float(yaw_rate_max_value)
-    return a_pred, v_pred, yaw_rate_cmd
-
-
-def sanitize_tensor(x, nan=0.0, posinf=1e3, neginf=-1e3):
-    return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
-
-
-def compute_lgn_potential_vref_sync_loss(env, p_history, vref_body_seq, R_proxy_seq):
-    loss = torch.tensor(0.0, device=vref_body_seq.device, dtype=vref_body_seq.dtype)
-    components = {
-        'valid_ratio': torch.tensor(0.0, device=vref_body_seq.device, dtype=vref_body_seq.dtype),
-    }
-    if (not args.use_precomputed_potential_maps) or POTENTIAL_MAP_CACHE is None:
-        return loss, components
-
-    map_idx = int(getattr(env, 'current_map_idx', 0))
-    map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
-    _, ref_dir_world, valid_mask = compute_guidance_reference_from_potential_map(
-        p_history=p_history.detach(),
-        map_data=map_data,
-        interpolation=args.potential_interpolation,
-    )
-    ref_dir_body = torch.squeeze(ref_dir_world[:, :, None, :] @ R_proxy_seq.detach(), 2)
-    cos_align = (
-        safe_normalize(vref_body_seq, dim=-1) * safe_normalize(ref_dir_body, dim=-1)
-    ).sum(-1).clamp(-1.0, 1.0)
-    loss_map = (1.0 - cos_align).clamp(0.0, 2.0)
-    loss = _masked_mean(loss_map, valid_mask)
-    components['valid_ratio'] = valid_mask.float().mean()
-    return loss, components
-
-
-def sync_multi_pub_to_checkpoint_dir(save_dir):
-    """
-    Mirror current multi_pub workspace into <save_dir>/multi_pub.
-    Best-effort sync for experiment reproducibility.
-    """
-    src_root = os.path.abspath(os.path.dirname(__file__))
-    dst_root = os.path.abspath(os.path.join(save_dir, "multi_pub"))
-
-    ignore_names = {
-        ".git",
-        "__pycache__",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".idea",
-        ".vscode",
-    }
-
-    os.makedirs(dst_root, exist_ok=True)
-
-    files_copied = 0
-    files_deleted = 0
-    dirs_deleted = 0
-
-    for root, dirs, files in os.walk(src_root):
-        rel = os.path.relpath(root, src_root)
-        dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
-
-        dirs[:] = [d for d in dirs if d not in ignore_names]
-        files = [f for f in files if f not in ignore_names]
-
-        os.makedirs(dst_dir, exist_ok=True)
-
-        src_entries = set(dirs) | set(files)
-        try:
-            dst_entries = os.listdir(dst_dir)
-        except FileNotFoundError:
-            dst_entries = []
-
-        for name in dst_entries:
-            if name in src_entries:
-                continue
-            stale_path = os.path.join(dst_dir, name)
-            if os.path.isdir(stale_path):
-                shutil.rmtree(stale_path)
-                dirs_deleted += 1
-            else:
-                os.remove(stale_path)
-                files_deleted += 1
-
-        for fname in files:
-            src_file = os.path.join(root, fname)
-            dst_file = os.path.join(dst_dir, fname)
-            if (
-                (not os.path.exists(dst_file))
-                or (os.path.getsize(src_file) != os.path.getsize(dst_file))
-                or (int(os.path.getmtime(src_file)) != int(os.path.getmtime(dst_file)))
-            ):
-                shutil.copy2(src_file, dst_file)
-                files_copied += 1
-
-    return {
-        "src_root": src_root,
-        "dst_root": dst_root,
-        "files_copied": int(files_copied),
-        "files_deleted": int(files_deleted),
-        "dirs_deleted": int(dirs_deleted),
-    }
-
-
-def extract_depth_geometry_features(depth, near_threshold=1.5):
-    """
-    从原始深度图提取显式几何/风险统计特征。
-
-    输入:
-        depth: [B, H, W]
-    输出:
-        geom_feat: [B, 19]
-    """
-    d = depth.clamp(0.3, 24.0)
-    B, H, W = d.shape
-
-    w1 = max(1, W // 3)
-    w2 = max(w1 + 1, (2 * W) // 3)
-    w2 = min(w2, W - 1) if W > 2 else w2
-
-    h1 = max(1, H // 3)
-    h2 = max(h1 + 1, (2 * H) // 3)
-    h2 = min(h2, H - 1) if H > 2 else h2
-
-    left = d[:, :, :w1]
-    center = d[:, :, w1:w2]
-    right = d[:, :, w2:]
-
-    upper = d[:, :h1, :]
-    middle = d[:, h1:h2, :]
-    lower = d[:, h2:, :]
-
-    def _mean_min_ratio(region):
-        flat = region.reshape(B, -1)
-        mean_v = flat.mean(dim=-1)
-        min_v = flat.min(dim=-1).values
-        near_ratio = (flat < near_threshold).float().mean(dim=-1)
-        return mean_v, min_v, near_ratio
-
-    def _mean_ratio(region):
-        flat = region.reshape(B, -1)
-        mean_v = flat.mean(dim=-1)
-        near_ratio = (flat < near_threshold).float().mean(dim=-1)
-        return mean_v, near_ratio
-
-    l_mean, l_min, l_ratio = _mean_min_ratio(left)
-    c_mean, c_min, c_ratio = _mean_min_ratio(center)
-    r_mean, r_min, r_ratio = _mean_min_ratio(right)
-
-    u_mean, u_ratio = _mean_ratio(upper)
-    m_mean, m_ratio = _mean_ratio(middle)
-    lo_mean, lo_ratio = _mean_ratio(lower)
-
-    flat_all = d.reshape(B, -1)
-    g_mean = flat_all.mean(dim=-1)
-    g_std = flat_all.std(dim=-1, unbiased=False)
-    lr_diff = l_mean - r_mean
-    center_vs_side = c_mean - 0.5 * (l_mean + r_mean)
-
-    geom_feat = torch.stack([
-        l_mean, l_min, l_ratio,
-        c_mean, c_min, c_ratio,
-        r_mean, r_min, r_ratio,
-        u_mean, u_ratio,
-        m_mean, m_ratio,
-        lo_mean, lo_ratio,
-        g_mean, g_std, lr_diff, center_vs_side,
-    ], dim=-1)
-    return sanitize_tensor(geom_feat, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-
-
-def extract_progress_features(p_history_list, v_history_list, dist_obj_history_list, p_target, window=8):
-    """
-    构造近期进展/卡住摘要特征。
-
-    输出维度: [B, 8]
-    - progress_to_goal
-    - disp_k
-    - speed_mean_k
-    - collision_depth_mean_k
-    - stuck_score
-    - progress_efficiency
-    - tortuosity
-    - heading_align_improvement
-    """
-    if len(p_history_list) == 0:
-        B = p_target.shape[0]
-        return torch.zeros((B, 8), device=p_target.device, dtype=p_target.dtype)
-
-    p_now = p_history_list[-1]
-    device = p_now.device
-    dtype = p_now.dtype
-
-    k = max(1, min(int(window), len(p_history_list)))
-    p_prev = p_history_list[-k]
-
-    dist_now = safe_l2_norm(p_target - p_now, dim=-1)
-    dist_prev = safe_l2_norm(p_target - p_prev, dim=-1)
-    progress_to_goal = dist_prev - dist_now
-
-    disp_k = safe_l2_norm(p_now - p_prev, dim=-1)
-
-    v_tail = torch.stack(v_history_list[-k:], dim=0)
-    speed_mean_k = safe_l2_norm(v_tail, dim=-1).mean(dim=0)
-
-    if len(dist_obj_history_list) > 0:
-        dist_tail = torch.stack(dist_obj_history_list[-k:], dim=0)
-        depth_tail = F.relu(-dist_tail)
-        # dist_tail 可能是 [k, B] 或 [k, sub_div, B]，统一压缩到 [B]
-        while depth_tail.dim() > 1:
-            depth_tail = depth_tail.mean(dim=0)
-        collision_depth_mean_k = depth_tail
-    else:
-        collision_depth_mean_k = torch.zeros_like(progress_to_goal)
-
-    stuck_score = F.softplus((0.3 - disp_k) * 10.0)
-    # 效率比: 跑了多少净位移是否真正转化为接近目标
-    progress_efficiency = progress_to_goal / (disp_k + 1e-6)
-
-    # 曲折度: 窗口路径长度 / 窗口净位移，越大表示越绕/打转
-    p_tail = torch.stack(p_history_list[-k:], dim=0)  # [k, B, 3]
-    if k > 1:
-        path_len_k = safe_l2_norm(p_tail[1:] - p_tail[:-1], dim=-1).sum(dim=0)
-    else:
-        path_len_k = torch.zeros_like(disp_k)
-    tortuosity = path_len_k / (disp_k + 1e-6)
-
-    v_now = v_history_list[-1]
-    target_dir_now = safe_normalize(p_target - p_now, dim=-1)
-    v_dir_now = safe_normalize(v_now, dim=-1)
-    heading_align_now = (v_dir_now * target_dir_now).sum(dim=-1)
-
-    if len(v_history_list) >= k:
-        v_prev = v_history_list[-k]
-        target_dir_prev = safe_normalize(p_target - p_prev, dim=-1)
-        v_dir_prev = safe_normalize(v_prev, dim=-1)
-        heading_align_prev = (v_dir_prev * target_dir_prev).sum(dim=-1)
-        heading_align_improvement = heading_align_now - heading_align_prev
-    else:
-        heading_align_improvement = torch.zeros_like(heading_align_now)
-
-    progress_feat = torch.stack([
-        progress_to_goal,
-        disp_k,
-        speed_mean_k,
-        collision_depth_mean_k,
-        stuck_score,
-        progress_efficiency,
-        tortuosity,
-        heading_align_improvement,
-    ], dim=-1)
-
-    progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-    return progress_feat.to(device=device, dtype=dtype)
-
-
-@torch.no_grad()
-def sanitize_module_(module, clamp_value=10.0):
-    for p in module.parameters():
-        p.data = sanitize_tensor(p.data, nan=0.0, posinf=clamp_value, neginf=-clamp_value).clamp(-clamp_value, clamp_value)
 
 ########### 1. 参数配置 ##########
 parser = argparse.ArgumentParser()
 parser.add_argument('--resume_worker', default="", help='Path to pretrained worker model')
 parser.add_argument('--resume_lgn', default="", help='Path to pretrained lgn model')
-parser.add_argument('--resume_norm', default="", help='Path to pretrained normalization stats')
-parser.add_argument('--batch_size', type=int, default=8)
-parser.add_argument('--num_iters', type=int, default=50000)
+parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('--num_iters', type=int, default=20000)
 
 # [优化策略参数]
 parser.add_argument('--lgn_steps', type=int, default=1)
@@ -494,29 +136,27 @@ parser.add_argument('--hard_speed_clip', type=float, default=30.0,#env.run 中 v
 parser.add_argument('--start_goal_plane_y_abs', type=float, default=25,#調節起點和終點的位置
                     help='Start/goal planes are set to +Y and -Y using this absolute value')
 parser.add_argument('--attitude_model', type=str, default='v2', choices=['legacy', 'v2'],
-                    help='legacy uses v_pred-projected heading; v2 uses explicit yaw-rate dynamics')
+                    help='legacy uses goal-projected heading; v2 uses explicit yaw-rate dynamics')
 parser.add_argument('--yaw_rate_max_deg', type=float, default=150.0)
 parser.add_argument('--coef_yaw_cmd', type=float, default=0.2)
 parser.add_argument('--coef_yaw_smooth', type=float, default=0.01)
 
 # ===================== v2 机头跟踪参数（中文详解） =====================
 # 这些参数只在 attitude_model='v2' 的显式 yaw 动力学下生效，用于控制：
-# 1) 机头参考方向来自哪里；
-# 2) 机头参考速度来源与低速退化策略；
-# 3) 机头追踪速度方向的“转头力度”；
-# 4) 是否允许网络输出的 yaw_rate 作为小幅残差；
-# 5) 对“倒飞/侧后飞”的惩罚强度。
+# 1) 机头追踪真实速度方向的“转头力度”；
+# 2) 是否允许网络输出的 yaw_rate 作为小幅残差；
+# 3) 对“倒飞/侧后飞”的惩罚强度。
 #
 # 调参建议（经验）：
 # - 机头转得慢：增大 heading_yaw_kp 或 yaw_rate_max_deg。
-# - 低速抖头：hybrid 模式可增大 heading_min_speed，或降低 heading_yaw_kp。
+# - 低速抖头：增大 heading_min_speed，或降低 heading_yaw_kp。
 # - 不希望倒飞：增大 coef_backward_penalty，必要时把 backward_cos_limit 调高到 0.1~0.3。
 # - 想保留少量学习型偏航微调：把 heading_residual_scale 从 0.0 提到 0.1/0.2。
 parser.add_argument('--heading_track_mode', type=str, default='actual_v',
-                    choices=['v_pred', 'actual_v', 'hybrid'],
-                    help='机头参考方向来源：v_pred=跟踪Worker预测速度；actual_v=跟踪环境实际速度（默认）；hybrid=低速时退回actual_v，降低过零抖动')
+                    choices=['actual_v'],
+                    help='Compatibility option; Worker no longer predicts velocity, so heading tracks actual velocity')
 parser.add_argument('--heading_min_speed', type=float, default=0.25,
-                    help='仅用于 hybrid 模式的速度阈值（低于阈值时 v_pred 退回 actual_v）；不再用于“保持当前机头方向”')
+                    help='Minimum horizontal speed for heading-alignment safety metrics/losses')
 parser.add_argument('--heading_yaw_kp', type=float, default=4.0,
                     help='机头跟踪比例增益：yaw_rate_rule = heading_yaw_kp * yaw_error。越大转头越积极，但过大可能引起振荡')
 parser.add_argument('--heading_residual_scale', type=float, default=0.0,
@@ -533,12 +173,16 @@ parser.add_argument('--lgn_timesteps', type=int, default=150,
                     help='Rollout steps used in LGN phase; smaller value reduces 2nd-order gradient memory')
 parser.add_argument('--exploration_time_window', type=int, default=1,
                     help='Look-back gap for exploration overlap loss; effective window is auto-clipped to keep valid long-range pairs')
-parser.add_argument('--turn_window', type=int, default=8,
-                    help='Fixed temporal window for cumulative-turn preference loss')
+parser.add_argument('--turn_speed_threshold', type=float, default=0.2,
+                    help='Center speed (m/s) of the differentiable low-speed gate for turn loss')
+parser.add_argument('--turn_speed_softness', type=float, default=0.01,
+                    help='Sigmoid transition width (m/s) of the low-speed gate for turn loss')
+parser.add_argument('--turn_soft_angle_deg', type=float, default=10.0,
+                    help='Quadratic-to-linear angle boundary (degrees) for 3D turn loss')
 parser.add_argument('--detach_interval', type=int, default=12,
                     help='Detach temporal memory every N steps to limit graph depth (<=0 disables)')
 parser.add_argument('--cam_angle', type=int, default=10)
-parser.add_argument('--goal_radius', type=float, default=0.5,
+parser.add_argument('--goal_radius', type=float, default=1.0,
                     help='Episode terminates when all drones are within this radius of their goal')
 parser.add_argument('--meta_arrival_reward_radius', type=float, default=0.5,
                     help='Goal-ball radius where arrival reward starts reducing meta loss')
@@ -641,8 +285,6 @@ parser.add_argument('--meta_smooth_jerk_weight', type=float, default=0.001,
                     help='Meta loss weight for first-order action difference (jerk) smoothing')
 parser.add_argument('--meta_smooth_snap_weight', type=float, default=0.0002,
                     help='Meta loss weight for second-order normalized action difference (snap) smoothing')
-parser.add_argument('--meta_smooth_v_pred_weight', type=float, default=0.1,
-                    help='Meta loss weight for velocity prediction error')
 
 # 全局规划引导元损失参数
 parser.add_argument('--meta_guidance_weight', type=float, default=0.5,
@@ -729,21 +371,20 @@ parser.add_argument('--diag_second_order', dest='diag_second_order', action='sto
 parser.add_argument('--no_diag_second_order', dest='diag_second_order', action='store_false',
                     help='Disable heavy second-order diagnostic probes')
 parser.set_defaults(diag_second_order=False)
-parser.add_argument('--diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_true',
-                    help='Enable diagnostic loss-to-worker gradient probes (extra autograd overhead)')
-parser.add_argument('--no_diag_proxy_worker_grads', dest='diag_proxy_worker_grads', action='store_false',
-                    help='Disable diagnostic loss-to-worker gradient probes')
-parser.set_defaults(diag_proxy_worker_grads=True)
 parser.add_argument('--terminal_log_interval', type=int, default=500,
                     help='Update terminal progress/log text every N iterations')
 parser.add_argument('--debug_scalar_interval', type=int, default=25,
                     help='Unified TensorBoard scalar logging interval in iterations (<=0 disables periodic scalar writes)')
 parser.add_argument('--debug_tb_interval', type=int, default=500,
                     help='TensorBoard Debug/* logging interval in iterations (<=0 disables Debug tag writes)')
-parser.add_argument('--trajectory_save_interval', type=int, default=100,
-                    help='Save cached trajectory/video visualizations every N iterations (<=0 disables)')
+parser.add_argument('--artifact_save_interval', type=int, default=1000,
+                    help='Unified checkpoint, trajectory, and video save interval (<=0 disables periodic saves)')
+parser.add_argument('--trajectory_save_interval', type=int, default=None,
+                    help='Deprecated alias for --artifact_save_interval')
 
 args = parser.parse_args()
+if args.trajectory_save_interval is not None:
+    args.artifact_save_interval = int(args.trajectory_save_interval)
 yaw_rate_max = math.radians(float(args.yaw_rate_max_deg))
 use_attitude_v2 = args.attitude_model == 'v2'
 
@@ -759,21 +400,23 @@ else:
 args.guidance_all_phases = bool(args.guidance_all_phases or args.use_precomputed_potential_maps)
 
 # Planner parallel runtime config (used by guidance reference computation)
-PLANNER_PARALLEL_ENABLE = bool(args.planner_parallel)
-PLANNER_NUM_WORKERS = int(args.planner_workers)
-PLANNER_POOL_MAXTASKS = max(1, int(args.planner_pool_maxtasks))
-_PLANNER_POOL = None
-_PLANNER_POOL_SIZE = 0
+configure_planner_pool(
+    enabled=args.planner_parallel,
+    num_workers=args.planner_workers,
+    maxtasks_per_child=args.planner_pool_maxtasks,
+)
 POTENTIAL_MAP_CACHE = None
 
 ########## 2. 目录与日志初始化 ##########
 current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 script_name = os.path.splitext(os.path.basename(__file__))[0]
 save_dir_name = "代码9.2.7自己决定速度"
-save_dir = os.path.join("..", "checkpoints", save_dir_name)
+save_dir = create_unique_experiment_dir(
+    os.path.join("..", "checkpoints"),
+    save_dir_name,
+)
 video_dir = os.path.join(save_dir, 'videos')
 
-os.makedirs(save_dir, exist_ok=True)
 os.makedirs(video_dir, exist_ok=True)
 print(f"Training artifacts will be saved to: {save_dir}")
 
@@ -781,28 +424,9 @@ with open(os.path.join(save_dir, 'config.json'), 'w') as f:
     json.dump(vars(args), f, indent=4)
 
 writer = SummaryWriter(log_dir=os.path.join(save_dir, 'logs'))
-MAP_SPLIT_LOG_TYPES = ("easy", "hairpin", "u_min")
 map_writers = {}
-for map_type in MAP_SPLIT_LOG_TYPES:
-    map_log_dir = os.path.join(save_dir, f"logs_{map_type}")
-    os.makedirs(map_log_dir, exist_ok=True)
-    map_writers[map_type] = SummaryWriter(log_dir=map_log_dir)
-print(
-    "[TensorBoard] Split-by-map logs enabled: "
-    + ", ".join([f"{k}->{os.path.join(save_dir, f'logs_{k}')}" for k in MAP_SPLIT_LOG_TYPES])
-)
+print(f"[TensorBoard] Unified log directory: {os.path.join(save_dir, 'logs')}")
 
-
-def _resolve_map_log_key(map_type_name):
-    key = str(map_type_name).strip().lower().replace("-", "_")
-    return key if key in map_writers else "global"
-
-
-def _resolve_tb_writer(map_type_name):
-    key = _resolve_map_log_key(map_type_name)
-    if key == "global":
-        return writer
-    return map_writers[key]
 
 device = torch.device('cuda')
 
@@ -824,8 +448,9 @@ env = Env(args.batch_size, 64, 48, args.grad_decay, device,
           wall_physical_feedback=args.wall_physical_feedback)
 
 
-PRECOMPUTED_CURRICULUM_REQUIRED_TYPES = ("easy", "hairpin", "u_min")
-VIZ_MAP_TYPES = ("easy", "hairpin", "u_min")
+TRAIN_MAP_TYPES = ("easy",)
+PRECOMPUTED_CURRICULUM_REQUIRED_TYPES = TRAIN_MAP_TYPES
+VIZ_MAP_TYPES = TRAIN_MAP_TYPES
 PRECOMPUTED_MAP_TYPE_CODES = {
     "none": -1,
     "easy": 0,
@@ -841,96 +466,6 @@ PRECOMPUTED_CURRICULUM_STAGE_CODES = {
     "easy_hairpin_u_min": 2,
 }
 
-
-def _precomputed_map_type_from_path(path):
-    stem = os.path.splitext(os.path.basename(str(path)))[0]
-    if stem.startswith("easy_"):
-        return "easy"
-    if stem.startswith("hairpin_"):
-        return "hairpin"
-    if stem.startswith("u_min_"):
-        return "u_min"
-    if stem.startswith("hard_"):
-        return "hard"
-    if stem.startswith("map_"):
-        return "legacy"
-    return "unknown"
-
-
-def _build_precomputed_map_type_indices(map_cache):
-    groups = defaultdict(list)
-    for idx, path in enumerate(getattr(map_cache, "map_files", [])):
-        groups[_precomputed_map_type_from_path(path)].append(int(idx))
-    return {k: v for k, v in groups.items() if len(v) > 0}
-
-
-def _precomputed_curriculum_stage(iter_idx):
-    if int(iter_idx) < 500:
-        return "easy_only", ("easy",)
-    if int(iter_idx) < 4000:
-        return "easy_hairpin", ("easy", "hairpin")
-    return "easy_hairpin_u_min", ("easy", "hairpin", "u_min")
-
-
-def _select_precomputed_curriculum_map(active_types, stage_update_count, type_offsets, type_indices):
-    map_type = active_types[int(stage_update_count) % len(active_types)]
-    candidates = type_indices.get(map_type, [])
-    if len(candidates) == 0:
-        raise RuntimeError(f"No precomputed maps available for curriculum type: {map_type}")
-    offset = int(type_offsets[map_type])
-    map_idx = candidates[offset % len(candidates)]
-    type_offsets[map_type] = offset + 1
-    return int(map_idx), map_type
-
-
-def _align_env_goal_planes_to_precomputed_map(map_data, env_obj, map_idx_hint=None, tol=1e-3):
-    start_y_from_map = None
-    goal_y_from_map = None
-
-    if "spawn_start_y" in map_data:
-        start_y_from_map = float(map_data["spawn_start_y"])
-    elif "spawn_start_bounds" in map_data:
-        sb = map_data["spawn_start_bounds"]
-        if isinstance(sb, torch.Tensor):
-            sb = sb.detach().cpu().numpy()
-        sb = np.asarray(sb, dtype=np.float32).reshape(-1)
-        if sb.size >= 2:
-            start_y_from_map = 0.5 * float(sb[0] + sb[1])
-
-    if "spawn_goal_y" in map_data:
-        goal_y_from_map = float(map_data["spawn_goal_y"])
-    elif "goal_world" in map_data:
-        gw = map_data["goal_world"]
-        if isinstance(gw, torch.Tensor):
-            gw = gw.detach().cpu().numpy()
-        gw = np.asarray(gw, dtype=np.float32).reshape(-1)
-        if gw.size >= 2:
-            goal_y_from_map = float(gw[1])
-    elif "spawn_goal_bounds" in map_data:
-        gb = map_data["spawn_goal_bounds"]
-        if isinstance(gb, torch.Tensor):
-            gb = gb.detach().cpu().numpy()
-        gb = np.asarray(gb, dtype=np.float32).reshape(-1)
-        if gb.size >= 2:
-            goal_y_from_map = 0.5 * float(gb[0] + gb[1])
-
-    if start_y_from_map is None and goal_y_from_map is None:
-        return
-
-    old_start = float(getattr(env_obj, "spawn_start_y", -11.5))
-    old_goal = float(getattr(env_obj, "spawn_goal_y", 11.5))
-    new_start = old_start if start_y_from_map is None else float(start_y_from_map)
-    new_goal = old_goal if goal_y_from_map is None else float(goal_y_from_map)
-
-    env_obj.spawn_start_y = new_start
-    env_obj.spawn_goal_y = new_goal
-
-    if abs(new_start - old_start) > float(tol) or abs(new_goal - old_goal) > float(tol):
-        idx_msg = "unknown" if map_idx_hint is None else str(int(map_idx_hint))
-        print(
-            f"[PotentialMap] Align start/goal planes to map_idx={idx_msg}: "
-            f"start_y {old_start:.3f}->{new_start:.3f}, goal_y {old_goal:.3f}->{new_goal:.3f}"
-        )
 
 PRECOMPUTED_MAP_TYPE_INDICES = {}
 INITIAL_PRECOMPUTED_MAP_IDX = -1
@@ -959,7 +494,7 @@ if args.use_precomputed_potential_maps:
             f"{k}={len(v)}" for k, v in sorted(PRECOMPUTED_MAP_TYPE_INDICES.items())
         )
         raise RuntimeError(
-            "Precomputed map curriculum requires easy, hairpin, and u_min maps. "
+            "Easy-only training requires at least one easy precomputed map. "
             f"Missing: {','.join(missing_types)}. loaded_counts: {counts_msg}. "
             "If --num_precomputed_maps is set, increase it or use 0 to load all maps."
         )
@@ -989,7 +524,7 @@ print(
 
 base_state_dim = 7 if args.no_odom else 10
 state_dim = base_state_dim + (3 if use_attitude_v2 else 0)
-action_dim = 7 if use_attitude_v2 else 6
+action_dim = 4 if use_attitude_v2 else 3
 geom_dim = 19
 progress_dim = 8
 progress_dim += WORKER_CONTEXT_FEATURE_DIM
@@ -1018,2901 +553,27 @@ try:
     ).to(device)
 except TypeError:
     lgn = LossGenNet(state_dim=state_dim).to(device)
-state_normalizer = RunningMeanStd(shape=(state_dim,)).to(device)
-geom_normalizer = RunningMeanStd(shape=(geom_dim,)).to(device)
-progress_normalizer = RunningMeanStd(shape=(progress_dim,)).to(device)
-
 ########## 4. 加载预训练模型 ##########
-def load_compatible_checkpoint(module, path, name, zero_expanded=True):
-    if not path:
-        return
-    if not os.path.isfile(path):
-        print(f"Warning: {name} path provided but file not found: {path}")
-        return
-    print(f"Loading {name} from {path}")
-    state_dict = torch.load(path, map_location=device)
-    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-
-    target_state = module.state_dict()
-    compatible_state = {}
-    resized_keys = []
-    skipped_keys = []
-    for key, value in state_dict.items():
-        if key not in target_state:
-            skipped_keys.append(key)
-            continue
-        target_value = target_state[key]
-        if value.shape == target_value.shape:
-            compatible_state[key] = value
-            continue
-        if value.dim() != target_value.dim():
-            skipped_keys.append(key)
-            continue
-        expanded = torch.zeros_like(target_value) if zero_expanded else target_value.clone()
-        slices = tuple(slice(0, min(value.shape[d], target_value.shape[d])) for d in range(value.dim()))
-        expanded[slices] = value[slices]
-        compatible_state[key] = expanded
-        resized_keys.append((key, tuple(value.shape), tuple(target_value.shape)))
-
-    missing_keys, unexpected_keys = module.load_state_dict(compatible_state, strict=False)
-    if missing_keys:
-        print(f"{name} missing_keys:", missing_keys)
-    if unexpected_keys:
-        print(f"{name} unexpected_keys:", unexpected_keys)
-    if resized_keys:
-        print(f"{name} resized_keys:", resized_keys)
-    if skipped_keys:
-        print(f"{name} skipped_keys:", skipped_keys)
 
 
-load_compatible_checkpoint(worknet, args.resume_worker, "Worker", zero_expanded=True)
-load_compatible_checkpoint(lgn, args.resume_lgn, "LGN", zero_expanded=True)
-if args.resume_norm:
-    load_compatible_checkpoint(state_normalizer, args.resume_norm, "Norm Stats", zero_expanded=False)
-elif args.resume_worker:
-    norm_path = args.resume_worker.replace('worker_', 'norm_')
-    load_compatible_checkpoint(state_normalizer, norm_path, "Auto-inferred Norm Stats", zero_expanded=False)
+worker_output_row_indices = [0, 2, 4, 6] if use_attitude_v2 else [0, 2, 4]
+load_compatible_checkpoint(
+    worknet,
+    args.resume_worker,
+    "Worker",
+    device,
+    zero_expanded=True,
+    output_row_indices=worker_output_row_indices,
+)
+load_compatible_checkpoint(lgn, args.resume_lgn, "LGN", device, zero_expanded=True)
 
 ########## 5. 优化器配置 ##########
 optim_worker = AdamW(worknet.parameters(), args.lr)
 optim_lgn = AdamW(lgn.parameters(), args.lgn_lr)
 sched = CosineAnnealingLR(optim_worker, args.num_iters, args.lr * 0.01)
 
-########## 6. 辅助函数 ##########
+########## 6. 日志状态 ##########
 scaler_q_by_map = defaultdict(lambda: defaultdict(list))
-
-def smooth_dict(ori_dict, map_log_key="global"):
-    q = scaler_q_by_map[map_log_key]
-    for k, v in ori_dict.items():
-        if isinstance(v, torch.Tensor):
-            v = v.item()
-        q[k].append(float(v))
-
-
-def _scalar_to_float(v):
-    if isinstance(v, torch.Tensor):
-        if v.numel() == 0:
-            return None
-        v = v.detach()
-        if v.numel() != 1:
-            v = v.float().mean()
-        v = v.item()
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def write_scalar_dict(tb_writer, scalar_dict, step):
-    """Best-effort TensorBoard scalar writer for lightweight live diagnostics."""
-    for k, v in scalar_dict.items():
-        value = _scalar_to_float(v)
-        if value is None:
-            continue
-        tb_writer.add_scalar(k, value, step)
-
-
-def is_save_iter(i):
-    return (i + 1) % 1000 == 0 if i >= 2000 else (i + 1) % 500 == 0
-
-
-def is_save_trajectory_iter(i):
-    interval = int(args.trajectory_save_interval)
-    return interval > 0 and (i + 1) % interval == 0
-
-
-def is_debug_tb_step(step):
-    interval = int(args.debug_tb_interval)
-    return interval > 0 and (step % interval == 0 or step == args.num_iters)
-
-
-def is_debug_tb_iter(i):
-    return is_debug_tb_step(i + 1)
-
-
-def rotation_matrix_to_rpy_deg(R):
-    """Convert rotation matrix to roll-pitch-yaw in degrees (ZYX convention)."""
-    r20 = R[..., 2, 0]
-    r21 = R[..., 2, 1]
-    r22 = R[..., 2, 2]
-    r10 = R[..., 1, 0]
-    r00 = R[..., 0, 0]
-
-    pitch = torch.asin(torch.clamp(-r20, -1.0, 1.0))
-    roll = torch.atan2(r21, r22)
-    yaw = torch.atan2(r10, r00)
-    return torch.rad2deg(torch.stack([roll, pitch, yaw], dim=-1))
-
-def get_grad_stats(module):
-    total_sq = 0.0
-    max_abs = 0.0
-    nonfinite_cnt = 0
-    grad_elem_cnt = 0
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        finite_mask = torch.isfinite(g)
-        nonfinite_cnt += int((~finite_mask).sum().item())
-        if finite_mask.any():
-            g_finite = g[finite_mask]
-            total_sq += float((g_finite * g_finite).sum().item())
-            max_abs = max(max_abs, float(g_finite.abs().max().item()))
-        grad_elem_cnt += g.numel()
-    global_norm = math.sqrt(total_sq)
-    return global_norm, max_abs, nonfinite_cnt, grad_elem_cnt
-
-def get_grad_norm_from_grads(grads):
-    total_sq = 0.0
-    nonfinite_cnt = 0
-    grad_elem_cnt = 0
-    for g in grads:
-        if g is None:
-            continue
-        g = g.detach()
-        finite_mask = torch.isfinite(g)
-        nonfinite_cnt += int((~finite_mask).sum().item())
-        if finite_mask.any():
-            g_finite = g[finite_mask]
-            total_sq += float((g_finite * g_finite).sum().item())
-        grad_elem_cnt += g.numel()
-    return math.sqrt(total_sq), nonfinite_cnt, grad_elem_cnt
-
-def get_loss_to_worker_grad_norm(loss, params):
-    if not loss.requires_grad:
-        return 0.0, 0, 0
-    grads = torch.autograd.grad(
-        loss, params, allow_unused=True, retain_graph=True, create_graph=False,
-    )
-    return get_grad_norm_from_grads(grads)
-
-
-def scale_scalar_objective(x, target_mag=10.0, eps=1e-6):
-    """Rescale scalar objective by detached magnitude to avoid gradient blow-up."""
-    if x is None:
-        return x
-    denom = x.detach().abs().clamp_min(eps)
-    return x * (float(target_mag) / denom)
-
-
-def merge_intervals(intervals, min_gap=1e-4):
-    if not intervals:
-        return []
-    intervals = sorted(intervals, key=lambda x: x[0])
-    merged = [list(intervals[0])]
-    for start, end in intervals[1:]:
-        if start <= merged[-1][1] + min_gap:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
-
-
-def _diag_should_log(iter_idx):
-    return args.diag_interval > 0 and (iter_idx % args.diag_interval == 0)
-
-
-def _diag_grad_meta(x):
-    if x is None:
-        return "None"
-    gfn = type(x.grad_fn).__name__ if getattr(x, 'grad_fn', None) is not None else "None"
-    return f"requires_grad={x.requires_grad}, is_leaf={x.is_leaf}, grad_fn={gfn}"
-
-
-def _diag_tensor_finite(tag, x, iter_idx):
-    if x is None:
-        print(f"[DIAG iter={iter_idx}] {tag}: None")
-        return
-    with torch.no_grad():
-        xd = x.detach()
-        finite_mask = torch.isfinite(xd)
-        finite_cnt = int(finite_mask.sum().item())
-        total_cnt = int(xd.numel())
-        nonfinite_cnt = total_cnt - finite_cnt
-        if finite_cnt > 0:
-            vals = xd[finite_mask]
-            vmin = float(vals.min().item())
-            vmax = float(vals.max().item())
-        else:
-            vmin = float('nan')
-            vmax = float('nan')
-    print(
-        f"[DIAG iter={iter_idx}] {tag}: finite={finite_cnt}/{total_cnt}, "
-        f"nonfinite={nonfinite_cnt}/{total_cnt}, min={vmin:.6g}, max={vmax:.6g}"
-    )
-
-
-def _diag_grad_tuple_to_params(tag, grad_tuple, params, iter_idx, retain_graph=True):
-    params = list(params)
-    total_params = len(params)
-    if total_params == 0:
-        print(f"[DIAG iter={iter_idx}] {tag}: None=0/0, NonZero=0/0, Norm=0.000000, NonFinite=0/0")
-        return
-
-    if grad_tuple is None:
-        print(f"[DIAG iter={iter_idx}] {tag}: None={total_params}/{total_params}, NonZero=0/{total_params}, Norm=0.000000, NonFinite=0/0")
-        return
-
-    grads = [g for g in grad_tuple if g is not None]
-    if len(grads) == 0:
-        print(f"[DIAG iter={iter_idx}] {tag}: None={total_params}/{total_params}, NonZero=0/{total_params}, Norm=0.000000, NonFinite=0/0")
-        return
-
-    probe = None
-    for g in grads:
-        s = g.sum()
-        probe = s if probe is None else (probe + s)
-
-    try:
-        mapped = torch.autograd.grad(
-            probe,
-            params,
-            allow_unused=True,
-            retain_graph=retain_graph,
-            create_graph=False,
-        )
-    except Exception as e:
-        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
-        return
-
-    none_cnt = sum(g is None for g in mapped)
-    nonzero_cnt = 0
-    total_sq = 0.0
-    nonfinite = 0
-    total_elems = 0
-    for g in mapped:
-        if g is None:
-            continue
-        gd = g.detach()
-        finite_mask = torch.isfinite(gd)
-        nonfinite += int((~finite_mask).sum().item())
-        total_elems += gd.numel()
-        if finite_mask.any():
-            vals = gd[finite_mask]
-            total_sq += float((vals * vals).sum().item())
-            if float(vals.abs().sum().item()) > 1e-12:
-                nonzero_cnt += 1
-
-    print(
-        f"[DIAG iter={iter_idx}] {tag}: None={none_cnt}/{total_params}, "
-        f"NonZero={nonzero_cnt}/{total_params}, Norm={math.sqrt(total_sq):.6f}, "
-        f"NonFinite={nonfinite}/{total_elems}"
-    )
-
-
-def _diag_output_to_params(tag, output, params, iter_idx, retain_graph=True):
-    params = list(params)
-    total_params = len(params)
-    if total_params == 0:
-        print(f"[DIAG iter={iter_idx}] {tag}: norm=0.000000, NonFinite=0/0")
-        return
-    try:
-        grads = torch.autograd.grad(
-            output,
-            params,
-            allow_unused=True,
-            retain_graph=retain_graph,
-            create_graph=False,
-        )
-    except Exception as e:
-        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
-        return
-
-    norm, nonfinite, grad_elems = get_grad_norm_from_grads(grads)
-    print(f"[DIAG iter={iter_idx}] {tag}: norm={norm:.6f}, NonFinite={nonfinite}/{grad_elems}")
-
-
-def _diag_output_to_params_count(tag, output, params, iter_idx, retain_graph=True):
-    params = list(params)
-    total_params = len(params)
-    if total_params == 0:
-        print(f"[DIAG iter={iter_idx}] {tag}: None=0/0, NonZero=0/0")
-        return
-    try:
-        grads = torch.autograd.grad(
-            output,
-            params,
-            allow_unused=True,
-            retain_graph=retain_graph,
-            create_graph=False,
-        )
-    except Exception as e:
-        print(f"[DIAG iter={iter_idx}] {tag}: grad-check failed: {e}")
-        return
-
-    none_cnt = sum(g is None for g in grads)
-    nonzero_cnt = 0
-    for g in grads:
-        if g is None:
-            continue
-        if float(g.detach().abs().sum().item()) > 1e-12:
-            nonzero_cnt += 1
-    print(f"[DIAG iter={iter_idx}] {tag}: None={none_cnt}/{total_params}, NonZero={nonzero_cnt}/{total_params}")
-
-
-def _grad_or_none_tuple(loss, params, create_graph=True, retain_graph=True):
-    params = tuple(params)
-    if not getattr(loss, "requires_grad", False):
-        return tuple(None for _ in params)
-    return torch.autograd.grad(
-        loss,
-        params,
-        create_graph=create_graph,
-        allow_unused=True,
-        retain_graph=retain_graph,
-    )
-
-
-########## 6.1 全局规划引导元损失辅助函数 ##########
-
-import heapq
-from typing import List, Tuple, Optional, Dict
-
-class GlobalPlanner:
-    """
-    3D A* 全局路径规划器
-
-    构建占用栅格地图并使用 A* 算法规划从起点到终点的最优路径，
-    然后从路径中提取参考方向、速度和加速度。
-    """
-
-    def __init__(self, resolution: float = 0.3, margin: float = 0.15,
-                 z_min: float = 0.0, z_max: float = 2.5, device='cuda'):
-        """
-        Args:
-            resolution: 栅格分辨率 (米)
-            margin: 安全边距 (米)，障碍物膨胀量
-            z_min, z_max: Z轴范围
-            device: 计算设备
-        """
-        self.resolution = resolution
-        self.margin = margin
-        self.z_min = z_min
-        self.z_max = z_max
-        self.device = device
-
-        # 缓存的占用栅格地图
-        self.occupancy_grid = None
-        self.grid_origin = None  # [x_min, y_min, z_min]
-        self.grid_shape = None   # [nx, ny, nz]
-
-        # 缓存的规划路径 (每个 batch 元素一条路径)
-        self.cached_paths = {}   # batch_idx -> path tensor [N, 3]
-        self.plan_stats = {'success': 0, 'total': 0}
-
-        # 3D 邻居偏移 (26-连通)
-        self._neighbors_26 = []
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
-                    cost = math.sqrt(dx**2 + dy**2 + dz**2)
-                    self._neighbors_26.append((dx, dy, dz, cost))
-
-    def build_occupancy_grid(self, env, batch_idx: int = 0):
-        """
-        从环境障碍物构建 3D 占用栅格地图
-
-        Args:
-            env: 环境对象，包含 voxels, balls, cyl, cyl_h 等障碍物
-            batch_idx: batch 索引
-        """
-        # 确定地图边界
-        x_min, x_max = -15.0, 15.0
-        y_min, y_max = -25.0, 25.0
-
-        if hasattr(env, 'p_target') and env.p_target is not None:
-            target = env.p_target[batch_idx].detach().cpu()
-            y_min = min(y_min, float(target[1]) - 5.0)
-            y_max = max(y_max, float(target[1]) + 5.0)
-
-        # 栅格尺寸
-        nx = int(math.ceil((x_max - x_min) / self.resolution))
-        ny = int(math.ceil((y_max - y_min) / self.resolution))
-        nz = int(math.ceil((self.z_max - self.z_min) / self.resolution))
-
-        self.grid_origin = np.array([x_min, y_min, self.z_min])
-        self.grid_shape = (nx, ny, nz)
-
-        # 初始化为空闲
-        self.occupancy_grid = np.zeros((nx, ny, nz), dtype=np.uint8)
-
-        # 填充障碍物
-        total_margin = self.margin + 0.15  # 额外的安全边距
-
-        # 1. 体素盒体障碍物
-        if hasattr(env, 'voxels') and env.voxels.numel() > 0:
-            voxels = env.voxels[batch_idx].detach().cpu().numpy()
-            for vox in voxels:
-                cx, cy, cz, hx, hy, hz = vox[:6]
-                if hx > 15 or hy > 15 or hz > 15:  # 跳过占位大盒体
-                    continue
-                # 膨胀障碍物
-                x0 = max(0, int((cx - hx - total_margin - x_min) / self.resolution))
-                x1 = min(nx, int((cx + hx + total_margin - x_min) / self.resolution) + 1)
-                y0 = max(0, int((cy - hy - total_margin - y_min) / self.resolution))
-                y1 = min(ny, int((cy + hy + total_margin - y_min) / self.resolution) + 1)
-                z0 = max(0, int((cz - hz - total_margin - self.z_min) / self.resolution))
-                z1 = min(nz, int((cz + hz + total_margin - self.z_min) / self.resolution) + 1)
-                self.occupancy_grid[x0:x1, y0:y1, z0:z1] = 1
-
-        # 2. 球形障碍物
-        if hasattr(env, 'balls') and env.balls.numel() > 0:
-            balls = env.balls[batch_idx].detach().cpu().numpy()
-            for ball in balls:
-                bx, by, bz, br = ball[:4]
-                r_inflated = br + total_margin
-                # 球的包围盒
-                x0 = max(0, int((bx - r_inflated - x_min) / self.resolution))
-                x1 = min(nx, int((bx + r_inflated - x_min) / self.resolution) + 1)
-                y0 = max(0, int((by - r_inflated - y_min) / self.resolution))
-                y1 = min(ny, int((by + r_inflated - y_min) / self.resolution) + 1)
-                z0 = max(0, int((bz - r_inflated - self.z_min) / self.resolution))
-                z1 = min(nz, int((bz + r_inflated - self.z_min) / self.resolution) + 1)
-                # 精确球形检测
-                for ix in range(x0, x1):
-                    for iy in range(y0, y1):
-                        for iz in range(z0, z1):
-                            px = x_min + (ix + 0.5) * self.resolution
-                            py = y_min + (iy + 0.5) * self.resolution
-                            pz = self.z_min + (iz + 0.5) * self.resolution
-                            if (px - bx)**2 + (py - by)**2 + (pz - bz)**2 < r_inflated**2:
-                                self.occupancy_grid[ix, iy, iz] = 1
-
-        # 3. 竖直圆柱障碍物 (沿Z轴)
-        if hasattr(env, 'cyl') and env.cyl.numel() > 0:
-            cyl = env.cyl[batch_idx].detach().cpu().numpy()
-            for c in cyl:
-                cx, cy, cr = c[:3]
-                r_inflated = cr + total_margin
-                x0 = max(0, int((cx - r_inflated - x_min) / self.resolution))
-                x1 = min(nx, int((cx + r_inflated - x_min) / self.resolution) + 1)
-                y0 = max(0, int((cy - r_inflated - y_min) / self.resolution))
-                y1 = min(ny, int((cy + r_inflated - y_min) / self.resolution) + 1)
-                for ix in range(x0, x1):
-                    for iy in range(y0, y1):
-                        px = x_min + (ix + 0.5) * self.resolution
-                        py = y_min + (iy + 0.5) * self.resolution
-                        if (px - cx)**2 + (py - cy)**2 < r_inflated**2:
-                            self.occupancy_grid[ix, iy, :] = 1
-
-        # 4. 水平圆柱障碍物 (沿Y轴)
-        if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
-            cyl_h = env.cyl_h[batch_idx].detach().cpu().numpy()
-            for c in cyl_h:
-                cx, cz, cr = c[:3]
-                r_inflated = cr + total_margin
-                x0 = max(0, int((cx - r_inflated - x_min) / self.resolution))
-                x1 = min(nx, int((cx + r_inflated - x_min) / self.resolution) + 1)
-                z0 = max(0, int((cz - r_inflated - self.z_min) / self.resolution))
-                z1 = min(nz, int((cz + r_inflated - self.z_min) / self.resolution) + 1)
-                for ix in range(x0, x1):
-                    for iz in range(z0, z1):
-                        px = x_min + (ix + 0.5) * self.resolution
-                        pz = self.z_min + (iz + 0.5) * self.resolution
-                        if (px - cx)**2 + (pz - cz)**2 < r_inflated**2:
-                            self.occupancy_grid[ix, :, iz] = 1
-
-        return self.occupancy_grid
-
-    def world_to_grid(self, pos: np.ndarray) -> Tuple[int, int, int]:
-        """世界坐标转栅格索引"""
-        idx = ((pos - self.grid_origin) / self.resolution).astype(int)
-        return tuple(np.clip(idx, 0, np.array(self.grid_shape) - 1))
-
-    def grid_to_world(self, idx: Tuple[int, int, int]) -> np.ndarray:
-        """栅格索引转世界坐标（单元格中心）"""
-        return self.grid_origin + (np.array(idx) + 0.5) * self.resolution
-
-    def is_valid(self, idx: Tuple[int, int, int]) -> bool:
-        """检查栅格索引是否有效且空闲"""
-        nx, ny, nz = self.grid_shape
-        if not (0 <= idx[0] < nx and 0 <= idx[1] < ny and 0 <= idx[2] < nz):
-            return False
-        return self.occupancy_grid[idx[0], idx[1], idx[2]] == 0
-
-    def heuristic(self, a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
-        """A* 启发式函数（欧几里得距离）"""
-        return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) * self.resolution
-
-    def plan_astar(self, start_pos: np.ndarray, goal_pos: np.ndarray,
-                   max_iterations: int = 50000) -> Optional[List[np.ndarray]]:
-        """
-        3D A* 路径规划
-
-        Args:
-            start_pos: 起点世界坐标 [3]
-            goal_pos: 终点世界坐标 [3]
-            max_iterations: 最大迭代次数
-
-        Returns:
-            path: 路径点列表 [N, 3] 或 None（规划失败）
-        """
-        if self.occupancy_grid is None:
-            return None
-
-        start_idx = self.world_to_grid(start_pos)
-        goal_idx = self.world_to_grid(goal_pos)
-
-        # 如果起点在障碍物内，尝试找到最近的空闲点
-        if not self.is_valid(start_idx):
-            start_idx = self._find_nearest_free(start_idx)
-            if start_idx is None:
-                return None
-
-        # 如果终点在障碍物内，尝试找到最近的空闲点
-        if not self.is_valid(goal_idx):
-            goal_idx = self._find_nearest_free(goal_idx)
-            if goal_idx is None:
-                return None
-
-        # A* 搜索
-        open_set = []
-        heapq.heappush(open_set, (0 + self.heuristic(start_idx, goal_idx), 0, start_idx))
-
-        came_from = {}
-        g_score = {start_idx: 0}
-
-        iterations = 0
-        while open_set and iterations < max_iterations:
-            iterations += 1
-            _, current_g, current = heapq.heappop(open_set)
-
-            # 到达目标
-            if current == goal_idx:
-                # 重建路径
-                path = [self.grid_to_world(current)]
-                while current in came_from:
-                    current = came_from[current]
-                    path.append(self.grid_to_world(current))
-                path.reverse()
-                return path
-
-            # 跳过过期节点
-            if current_g > g_score.get(current, float('inf')):
-                continue
-
-            # 扩展邻居
-            for dx, dy, dz, move_cost in self._neighbors_26:
-                neighbor = (current[0] + dx, current[1] + dy, current[2] + dz)
-
-                if not self.is_valid(neighbor):
-                    continue
-
-                tentative_g = g_score[current] + move_cost * self.resolution
-
-                if tentative_g < g_score.get(neighbor, float('inf')):
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score = tentative_g + self.heuristic(neighbor, goal_idx)
-                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
-
-        # 规划失败
-        return None
-
-    def _find_nearest_free(self, idx: Tuple[int, int, int], search_radius: int = 10) -> Optional[Tuple[int, int, int]]:
-        """寻找最近的空闲栅格"""
-        for r in range(1, search_radius + 1):
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    for dz in range(-r, r + 1):
-                        if abs(dx) == r or abs(dy) == r or abs(dz) == r:
-                            neighbor = (idx[0] + dx, idx[1] + dy, idx[2] + dz)
-                            if self.is_valid(neighbor):
-                                return neighbor
-        return None
-
-    def smooth_path(self, path: List[np.ndarray], window_size: int = 5) -> np.ndarray:
-        """
-        路径平滑处理（移动平均）
-
-        Args:
-            path: 原始路径点列表
-            window_size: 平滑窗口大小
-
-        Returns:
-            smoothed_path: 平滑后的路径 [N, 3]
-        """
-        if len(path) < 3:
-            return np.array(path)
-
-        path_array = np.array(path)
-        smoothed = np.copy(path_array)
-
-        half_w = window_size // 2
-        for i in range(half_w, len(path) - half_w):
-            smoothed[i] = path_array[max(0, i-half_w):min(len(path), i+half_w+1)].mean(axis=0)
-
-        # 保持起点和终点不变
-        smoothed[0] = path_array[0]
-        smoothed[-1] = path_array[-1]
-
-        return smoothed
-
-    def extract_reference_from_path(self, current_pos: np.ndarray, path: np.ndarray,
-                                    max_speed: float = 5.0,
-                                    max_accel: float = 5.0,
-                                    max_decel: float = 6.0,
-                                    lookahead_dist: float = 1.0) -> Dict:
-        """
-        从规划路径中提取当前位置的参考方向、速度和加速度
-
-        使用梯形速度剖面和动力学约束计算参考值：
-        - 速度剖面考虑：最大速度、曲率限制、终点减速
-        - 加速度基于速度剖面的变化率计算
-        - 横向偏差为到路径的真正几何距离
-
-        Args:
-            current_pos: 当前位置 [3]
-            path: 规划路径 [N, 3]
-            max_speed: 最大速度 (m/s)
-            max_accel: 最大加速度 (m/s^2)
-            max_decel: 最大减速度 (m/s^2)，正值
-            lookahead_dist: 前瞻距离 (m)
-
-        Returns:
-            dict: 包含参考方向、速度、加速度、曲率、横向偏差等
-        """
-        if path is None or len(path) < 2:
-            return {
-                'direction': np.array([0.0, 1.0, 0.0]),
-                'speed': max_speed * 0.5,
-                'acceleration': np.array([0.0, 0.0, 0.0]),
-                'curvature': 0.0,
-                'path_progress': 0.0,
-                'dist_to_goal': 10.0,
-                'lateral_error': 0.0,  # 横向偏差
-                'valid': False
-            }
-
-        # ========== 1. 找到路径上最近点并计算横向偏差 ==========
-        distances = np.linalg.norm(path - current_pos, axis=1)
-        nearest_idx = np.argmin(distances)
-        nearest_point = path[nearest_idx]
-
-        # 横向偏差：当前位置到路径最近点的距离
-        lateral_error = distances[nearest_idx]
-
-        # 更精确的横向偏差：投影到路径线段上
-        if 0 < nearest_idx < len(path) - 1:
-            # 检查是否应该投影到前一段或后一段
-            for seg_start, seg_end in [(nearest_idx - 1, nearest_idx), (nearest_idx, nearest_idx + 1)]:
-                if seg_end >= len(path):
-                    continue
-                p0 = path[seg_start]
-                p1 = path[seg_end]
-                seg_vec = p1 - p0
-                seg_len = np.linalg.norm(seg_vec)
-                if seg_len > 1e-6:
-                    seg_dir = seg_vec / seg_len
-                    t = np.clip(np.dot(current_pos - p0, seg_dir), 0, seg_len)
-                    proj_point = p0 + t * seg_dir
-                    proj_dist = np.linalg.norm(current_pos - proj_point)
-                    if proj_dist < lateral_error:
-                        lateral_error = proj_dist
-                        nearest_point = proj_point
-
-        # ========== 2. 计算路径进度和剩余路径长度 ==========
-        path_progress = nearest_idx / max(len(path) - 1, 1)
-
-        # 计算从当前点到终点的路径长度
-        remaining_path_length = 0.0
-        for i in range(nearest_idx, len(path) - 1):
-            remaining_path_length += np.linalg.norm(path[i+1] - path[i])
-        dist_to_goal = remaining_path_length
-
-        # ========== 3. 计算前瞻点和参考方向 ==========
-        lookahead_idx = nearest_idx
-        accumulated_dist = 0.0
-        for i in range(nearest_idx, len(path) - 1):
-            segment_dist = np.linalg.norm(path[i+1] - path[i])
-            accumulated_dist += segment_dist
-            if accumulated_dist >= lookahead_dist:
-                lookahead_idx = i + 1
-                break
-        else:
-            lookahead_idx = len(path) - 1
-
-        lookahead_point = path[lookahead_idx]
-        direction_vec = lookahead_point - current_pos
-        direction_norm = np.linalg.norm(direction_vec)
-        if direction_norm > 1e-6:
-            direction = direction_vec / direction_norm
-        else:
-            if nearest_idx < len(path) - 1:
-                direction = path[nearest_idx + 1] - path[nearest_idx]
-                direction = direction / (np.linalg.norm(direction) + 1e-6)
-            else:
-                direction = np.array([0.0, 1.0, 0.0])
-
-        # ========== 4. 计算局部曲率（用于速度限制）==========
-        curvature = 0.0
-        if 1 <= nearest_idx < len(path) - 1:
-            v1 = path[nearest_idx] - path[nearest_idx - 1]
-            v2 = path[nearest_idx + 1] - path[nearest_idx]
-            v1_norm = np.linalg.norm(v1)
-            v2_norm = np.linalg.norm(v2)
-            if v1_norm > 1e-6 and v2_norm > 1e-6:
-                v1 = v1 / v1_norm
-                v2 = v2 / v2_norm
-                cos_angle = np.clip(np.dot(v1, v2), -1.0, 1.0)
-                angle_change = math.acos(cos_angle)
-                curvature = angle_change / (self.resolution + 1e-6)
-
-        # ========== 5. 计算梯形速度剖面 ==========
-        # 5.1 曲率速度限制：v_max_curve = sqrt(a_lateral_max / curvature)
-        a_lateral_max = 4.0  # 最大侧向加速度 (m/s^2)
-        if curvature > 0.1:
-            v_curve_limit = min(max_speed, math.sqrt(a_lateral_max / (curvature + 1e-6)))
-        else:
-            v_curve_limit = max_speed
-
-        # 5.2 终点减速限制：v^2 = 2 * a_decel * d
-        # 在终点速度应为 0，所以 v_max_decel = sqrt(2 * max_decel * dist_to_goal)
-        v_decel_limit = math.sqrt(2.0 * max_decel * max(dist_to_goal, 0.01))
-
-        # 5.3 前方曲率预瞰（提前减速）
-        v_lookahead_limit = max_speed
-        lookahead_curvature_dist = 2.0  # 向前看 2m
-        accumulated = 0.0
-        max_future_curvature = 0.0
-        for i in range(nearest_idx, min(nearest_idx + 20, len(path) - 1)):
-            seg_len = np.linalg.norm(path[i+1] - path[i])
-            accumulated += seg_len
-            if accumulated > lookahead_curvature_dist:
-                break
-            if 1 <= i < len(path) - 1:
-                v1 = path[i] - path[i-1]
-                v2 = path[i+1] - path[i]
-                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-                if n1 > 1e-6 and n2 > 1e-6:
-                    cos_a = np.clip(np.dot(v1/n1, v2/n2), -1.0, 1.0)
-                    future_curv = math.acos(cos_a) / (self.resolution + 1e-6)
-                    max_future_curvature = max(max_future_curvature, future_curv)
-
-        if max_future_curvature > 0.1:
-            v_future = math.sqrt(a_lateral_max / (max_future_curvature + 1e-6))
-            # 需要在 lookahead_curvature_dist 内减速到 v_future
-            v_lookahead_limit = math.sqrt(v_future**2 + 2.0 * max_decel * lookahead_curvature_dist)
-
-        # 5.4 综合速度限制
-        ref_speed = min(max_speed, v_curve_limit, v_decel_limit, v_lookahead_limit)
-        ref_speed = max(ref_speed, 0.1)  # 最小速度
-
-        # ========== 6. 计算参考加速度（基于速度剖面变化）==========
-        # 切向加速度：基于当前位置的速度限制变化
-        tangent_accel = 0.0
-
-        # 如果当前速度限制低于最大速度，说明需要减速
-        if ref_speed < max_speed * 0.9:
-            # 估算需要的减速度
-            if dist_to_goal > 0.1:
-                # v_final^2 - v_current^2 = 2 * a * d
-                # 假设需要在 dist_to_goal 内减到 0
-                tangent_accel = -(ref_speed ** 2) / (2 * max(dist_to_goal, 0.1))
-                tangent_accel = max(tangent_accel, -max_decel)
-            else:
-                tangent_accel = -max_decel
-
-        # 如果在弯道，额外减速
-        if curvature > 0.5:
-            curve_decel = -curvature * 1.5  # 曲率越大，减速越多
-            tangent_accel = min(tangent_accel, curve_decel)
-
-        # 限制加速度范围
-        tangent_accel = np.clip(tangent_accel, -max_decel, max_accel)
-
-        # 加速度向量 = 切向加速度 * 方向
-        acceleration = direction * tangent_accel
-
-        return {
-            'direction': direction,
-            'speed': ref_speed,
-            'acceleration': acceleration,
-            'curvature': curvature,
-            'path_progress': path_progress,
-            'dist_to_goal': dist_to_goal,
-            'lateral_error': lateral_error,  # 新增：横向偏差
-            'valid': True
-        }
-
-    def plan_and_cache(self, env, start_positions: torch.Tensor,
-                       goal_positions: torch.Tensor, batch_indices: List[int] = None):
-        """
-        为多个 batch 元素规划并缓存路径
-
-        Args:
-            env: 环境对象
-            start_positions: 起点位置 [B, 3]
-            goal_positions: 目标位置 [B, 3]
-            batch_indices: 要规划的 batch 索引列表，None 表示全部
-        """
-        B = start_positions.shape[0]
-        if batch_indices is None:
-            batch_indices = list(range(B))
-
-        success_count = 0
-
-        for b in batch_indices:
-            # 为该 batch 构建占用栅格
-            self.build_occupancy_grid(env, batch_idx=b)
-
-            start = start_positions[b].detach().cpu().numpy()
-            goal = goal_positions[b].detach().cpu().numpy()
-
-            # A* 规划
-            path = self.plan_astar(start, goal)
-
-            if path is not None:
-                # 路径平滑
-                path = self.smooth_path(path, window_size=5)
-                self.cached_paths[b] = path
-                success_count += 1
-            else:
-                # 规划失败：标记为 None，由恢复项接管，避免强制拟合不可靠参考
-                self.cached_paths[b] = None
-
-        self.plan_stats = {
-            'success': int(success_count),
-            'total': int(len(batch_indices)),
-        }
-
-    def clear_cache(self):
-        """清除缓存的路径"""
-        self.cached_paths.clear()
-        self.occupancy_grid = None
-
-
-def _compute_planner_worker_count():
-    if PLANNER_NUM_WORKERS > 0:
-        return PLANNER_NUM_WORKERS
-    cpu_total = os.cpu_count() or 8
-    # 在高核机器上预留少量核给训练主进程与系统线程
-    return max(1, min(28, cpu_total - 3))
-
-
-def _shutdown_planner_pool():
-    global _PLANNER_POOL, _PLANNER_POOL_SIZE
-    if _PLANNER_POOL is not None:
-        _PLANNER_POOL.close()
-        _PLANNER_POOL.join()
-        _PLANNER_POOL = None
-        _PLANNER_POOL_SIZE = 0
-
-
-def _get_planner_pool():
-    global _PLANNER_POOL, _PLANNER_POOL_SIZE
-    if not PLANNER_PARALLEL_ENABLE:
-        return None
-
-    target_size = _compute_planner_worker_count()
-    if _PLANNER_POOL is not None and _PLANNER_POOL_SIZE == target_size:
-        return _PLANNER_POOL
-
-    if _PLANNER_POOL is not None:
-        _shutdown_planner_pool()
-
-    # 本脚本顶层直接启动训练，spawn 会重入模块；Linux 下优先 fork。
-    start_method = 'fork' if sys.platform.startswith('linux') else 'spawn'
-    ctx = mp.get_context(start_method)
-    _PLANNER_POOL = ctx.Pool(processes=target_size, maxtasksperchild=PLANNER_POOL_MAXTASKS)
-    _PLANNER_POOL_SIZE = target_size
-    return _PLANNER_POOL
-
-
-atexit.register(_shutdown_planner_pool)
-
-
-def _plan_sample_points_worker(payload):
-    """Per-sample planning worker: build occupancy once and solve all sampled points."""
-    voxels_np = payload['voxels']
-    balls_np = payload['balls']
-    cyl_np = payload['cyl']
-    cyl_h_np = payload['cyl_h']
-    sampled_positions = payload['sampled_positions']  # [S, 3]
-    sampled_dist = payload['sampled_dist']            # [S]
-    sampled_steps = payload.get('sampled_steps', None)
-    goal_np = payload['goal']                         # [3]
-    resolution = float(payload['resolution'])
-    margin = float(payload['margin'])
-    z_min = float(payload['z_min'])
-    z_max = float(payload['z_max'])
-    max_speed = float(payload['max_speed'])
-    max_accel = float(payload['max_accel'])
-    max_decel = float(payload['max_decel'])
-    lookahead_dist = float(payload['lookahead_dist'])
-    invalid_dist_threshold = float(payload['invalid_dist_threshold'])
-
-    planner = GlobalPlanner(resolution=resolution, margin=margin, z_min=z_min, z_max=z_max, device='cpu')
-
-    class _EnvShim:
-        pass
-
-    env_shim = _EnvShim()
-    env_shim.voxels = torch.from_numpy(voxels_np).unsqueeze(0)
-    env_shim.balls = torch.from_numpy(balls_np).unsqueeze(0)
-    env_shim.cyl = torch.from_numpy(cyl_np).unsqueeze(0)
-    env_shim.cyl_h = torch.from_numpy(cyl_h_np).unsqueeze(0)
-    env_shim.p_target = torch.from_numpy(goal_np).reshape(1, 3)
-
-    planner.build_occupancy_grid(env_shim, batch_idx=0)
-
-    S = sampled_positions.shape[0]
-    ref_direction = np.zeros((S, 3), dtype=np.float32)
-    ref_speed = np.zeros((S,), dtype=np.float32)
-    ref_acceleration = np.zeros((S, 3), dtype=np.float32)
-    lateral_error = np.zeros((S,), dtype=np.float32)
-    valid_mask = np.zeros((S,), dtype=np.bool_)
-
-    plan_total = 0
-    plan_success = 0
-    curv_sum = 0.0
-    prog_sum = 0.0
-    lat_sum = 0.0
-    lat_max = 0.0
-    metric_count = 0
-    sampled_paths = []
-
-    for s in range(S):
-        pos_np = sampled_positions[s]
-        dist = float(sampled_dist[s])
-
-        step_t = int(sampled_steps[s]) if sampled_steps is not None else int(s)
-
-        if dist < invalid_dist_threshold:
-            sampled_paths.append((step_t, None))
-            continue
-
-        plan_total += 1
-        path = planner.plan_astar(pos_np, goal_np)
-        if path is None:
-            sampled_paths.append((step_t, None))
-            continue
-        path = planner.smooth_path(path, window_size=5)
-        path_np = np.asarray(path, dtype=np.float32)
-        sampled_paths.append((step_t, path_np))
-
-        ref_info = planner.extract_reference_from_path(
-            pos_np,
-            path,
-            max_speed=max_speed,
-            max_accel=max_accel,
-            max_decel=max_decel,
-            lookahead_dist=lookahead_dist,
-        )
-
-        ref_direction[s] = np.asarray(ref_info['direction'], dtype=np.float32)
-        ref_speed[s] = float(ref_info['speed'])
-        ref_acceleration[s] = np.asarray(ref_info['acceleration'], dtype=np.float32)
-        lateral_error[s] = float(ref_info.get('lateral_error', 0.0))
-        valid_mask[s] = bool(ref_info['valid'])
-        if valid_mask[s]:
-            plan_success += 1
-
-        curv_sum += float(ref_info.get('curvature', 0.0))
-        prog_sum += float(ref_info.get('path_progress', 0.0))
-        lat = float(ref_info.get('lateral_error', 0.0))
-        lat_sum += lat
-        lat_max = max(lat_max, lat)
-        metric_count += 1
-
-    return {
-        'ref_direction': ref_direction,
-        'ref_speed': ref_speed,
-        'ref_acceleration': ref_acceleration,
-        'lateral_error': lateral_error,
-        'valid_mask': valid_mask,
-        'plan_total': int(plan_total),
-        'plan_success': int(plan_success),
-        'curv_sum': float(curv_sum),
-        'prog_sum': float(prog_sum),
-        'lat_sum': float(lat_sum),
-        'lat_max': float(lat_max),
-        'metric_count': int(metric_count),
-        'sampled_paths': sampled_paths,
-    }
-
-
-# 全局规划器实例（在迷宫更新时重新规划）
-global_planner = GlobalPlanner(resolution=0.3, margin=0.15)
-
-
-def compute_guidance_reference_from_planner(env, p, v, p_target, dist_obj, planner: GlobalPlanner,
-                                             max_speed=5.0, max_accel=5.0, max_decel=6.0,
-                                             lookahead_dist=1.0, invalid_dist_threshold=-0.05,
-                                             sampled_steps=None):
-    """
-    使用全局规划器生成参考方向、速度、加速度和横向偏差
-
-    基于 A* 规划路径和梯形速度剖面计算动力学可行的参考值：
-    - 方向：指向前瞻点
-    - 速度：考虑曲率、终点减速、动力学约束
-    - 加速度：基于速度剖面变化率
-    - 横向偏差：到规划路径的真正几何距离
-
-    Args:
-        p: 位置 [S, B, 3] 或 [B, 3]
-        v: 速度 [S, B, 3] 或 [B, 3]
-        p_target: 目标位置 [B, 3]
-        dist_obj: 到障碍物的距离 [S, B] 或 [B]
-        planner: 全局规划器实例
-        max_speed: 最大速度 (m/s)
-        max_accel: 最大加速度 (m/s^2)
-        max_decel: 最大减速度 (m/s^2)
-        lookahead_dist: 前瞻距离 (m)
-
-    Returns:
-        ref_direction: 参考方向 [S, B, 3]
-        ref_speed: 参考速度 [S, B]
-        ref_acceleration: 参考加速度 [S, B, 3]
-        lateral_error: 横向偏差 [S, B]，到规划路径的距离
-        valid_mask: 有效性掩码 [S, B]
-        planner_info: 规划器信息字典
-    """
-    squeeze_output = False
-    if p.dim() == 2:
-        p = p.unsqueeze(0)
-        v = v.unsqueeze(0)
-        dist_obj = dist_obj.unsqueeze(0)
-        squeeze_output = True
-
-    S, B, _ = p.shape
-    device = p.device
-
-    ref_direction = torch.zeros(S, B, 3, device=device)
-    ref_speed = torch.zeros(S, B, device=device)
-    ref_acceleration = torch.zeros(S, B, 3, device=device)
-    lateral_error = torch.zeros(S, B, device=device)
-    valid_mask = torch.zeros(S, B, dtype=torch.bool, device=device)
-
-    curv_sum = 0.0
-    prog_sum = 0.0
-    lat_sum = 0.0
-    lat_max = 0.0
-    metric_count = 0
-    sample_plan_total = 0
-    sample_plan_success = 0
-    sampled_astar_paths = [[] for _ in range(B)]
-
-    used_parallel = False
-    pool = _get_planner_pool()
-    if pool is not None and B > 1:
-        try:
-            payloads = []
-            for b in range(B):
-                vox_np = env.voxels[b].detach().cpu().numpy() if hasattr(env, 'voxels') else np.zeros((0, 6), dtype=np.float32)
-                balls_np = env.balls[b].detach().cpu().numpy() if hasattr(env, 'balls') else np.zeros((0, 4), dtype=np.float32)
-                cyl_np = env.cyl[b].detach().cpu().numpy() if hasattr(env, 'cyl') else np.zeros((0, 3), dtype=np.float32)
-                cyl_h_np = env.cyl_h[b].detach().cpu().numpy() if hasattr(env, 'cyl_h') else np.zeros((0, 3), dtype=np.float32)
-
-                payloads.append({
-                    'voxels': np.asarray(vox_np, dtype=np.float32),
-                    'balls': np.asarray(balls_np, dtype=np.float32),
-                    'cyl': np.asarray(cyl_np, dtype=np.float32),
-                    'cyl_h': np.asarray(cyl_h_np, dtype=np.float32),
-                    'sampled_positions': np.asarray(p[:, b].detach().cpu().numpy(), dtype=np.float32),
-                    'sampled_dist': np.asarray(dist_obj[:, b].detach().cpu().numpy(), dtype=np.float32),
-                    'sampled_steps': (
-                        np.asarray(sampled_steps[:, b].detach().cpu().numpy(), dtype=np.int64)
-                        if sampled_steps is not None else None
-                    ),
-                    'goal': np.asarray(p_target[b].detach().cpu().numpy(), dtype=np.float32),
-                    'resolution': planner.resolution,
-                    'margin': planner.margin,
-                    'z_min': planner.z_min,
-                    'z_max': planner.z_max,
-                    'max_speed': max_speed,
-                    'max_accel': max_accel,
-                    'max_decel': max_decel,
-                    'lookahead_dist': lookahead_dist,
-                    'invalid_dist_threshold': invalid_dist_threshold,
-                })
-
-            results = pool.map(_plan_sample_points_worker, payloads)
-            used_parallel = True
-
-            for b, out in enumerate(results):
-                ref_direction[:, b] = torch.from_numpy(out['ref_direction']).to(device=device, dtype=p.dtype)
-                ref_speed[:, b] = torch.from_numpy(out['ref_speed']).to(device=device, dtype=p.dtype)
-                ref_acceleration[:, b] = torch.from_numpy(out['ref_acceleration']).to(device=device, dtype=p.dtype)
-                lateral_error[:, b] = torch.from_numpy(out['lateral_error']).to(device=device, dtype=p.dtype)
-                valid_mask[:, b] = torch.from_numpy(out['valid_mask']).to(device=device)
-
-                sample_plan_total += int(out['plan_total'])
-                sample_plan_success += int(out['plan_success'])
-                curv_sum += float(out['curv_sum'])
-                prog_sum += float(out['prog_sum'])
-                lat_sum += float(out['lat_sum'])
-                lat_max = max(lat_max, float(out['lat_max']))
-                metric_count += int(out['metric_count'])
-
-                out_paths = out.get('sampled_paths', [])
-                for item in out_paths:
-                    if item is None:
-                        continue
-                    step_t, path_s = item
-                    sampled_astar_paths[b].append((int(step_t), np.asarray(path_s, dtype=np.float32)))
-        except Exception:
-            used_parallel = False
-
-    if not used_parallel:
-        # 串行回退路径：每个 batch 仅构建一次占用栅格，随后复用
-        occupancy_cache = {}
-        for b in range(B):
-            planner.build_occupancy_grid(env, batch_idx=b)
-            occupancy_cache[b] = (
-                planner.occupancy_grid,
-                planner.grid_origin.copy(),
-                planner.grid_shape,
-            )
-
-        for b in range(B):
-            planner.occupancy_grid, planner.grid_origin, planner.grid_shape = occupancy_cache[b]
-            goal_np = p_target[b].detach().cpu().numpy()
-
-            for s in range(S):
-                pos_np = p[s, b].detach().cpu().numpy()
-                dist = dist_obj[s, b].item()
-
-                step_t = int(sampled_steps[s, b].item()) if sampled_steps is not None else int(s)
-
-                if dist < invalid_dist_threshold:
-                    sampled_astar_paths[b].append((step_t, None))
-                    continue
-
-                sample_plan_total += 1
-                path = planner.plan_astar(pos_np, goal_np)
-                if path is None:
-                    sampled_astar_paths[b].append((step_t, None))
-                    continue
-                path = planner.smooth_path(path, window_size=5)
-                path_np = np.asarray(path, dtype=np.float32)
-                sampled_astar_paths[b].append((step_t, path_np))
-
-                ref_info = planner.extract_reference_from_path(
-                    pos_np, path,
-                    max_speed=max_speed,
-                    max_accel=max_accel,
-                    max_decel=max_decel,
-                    lookahead_dist=lookahead_dist,
-                )
-
-                ref_direction[s, b] = torch.tensor(ref_info['direction'], device=device, dtype=p.dtype)
-                ref_speed[s, b] = ref_info['speed']
-                ref_acceleration[s, b] = torch.tensor(ref_info['acceleration'], device=device, dtype=p.dtype)
-                lateral_error[s, b] = ref_info.get('lateral_error', 0.0)
-                valid_mask[s, b] = bool(ref_info['valid'])
-                if bool(ref_info['valid']):
-                    sample_plan_success += 1
-
-                curv_sum += float(ref_info.get('curvature', 0.0))
-                prog_sum += float(ref_info.get('path_progress', 0.0))
-                lat = float(ref_info.get('lateral_error', 0.0))
-                lat_sum += lat
-                lat_max = max(lat_max, lat)
-                metric_count += 1
-
-    plan_total = max(1, int(sample_plan_total))
-    plan_success = int(sample_plan_success)
-    planner_info = {
-        'avg_curvature': (curv_sum / metric_count) if metric_count > 0 else 0.0,
-        'avg_path_progress': (prog_sum / metric_count) if metric_count > 0 else 0.0,
-        'avg_lateral_error': (lat_sum / metric_count) if metric_count > 0 else 0.0,
-        'max_lateral_error': lat_max if metric_count > 0 else 0.0,
-        'planner_success_ratio': float(plan_success) / float(plan_total),
-        'reference_valid_ratio': float(valid_mask.float().mean().item()),
-        'sample_plan_total': int(sample_plan_total),
-        'sample_plan_success': int(sample_plan_success),
-        'sampled_astar_paths': sampled_astar_paths,
-    }
-
-    if squeeze_output:
-        ref_direction = ref_direction.squeeze(0)
-        ref_speed = ref_speed.squeeze(0)
-        ref_acceleration = ref_acceleration.squeeze(0)
-        lateral_error = lateral_error.squeeze(0)
-        valid_mask = valid_mask.squeeze(0)
-
-    return ref_direction, ref_speed, ref_acceleration, lateral_error, valid_mask, planner_info
-
-
-def compute_escape_penalty(v, vec_to_pt, dist_obj, collision_mask):
-    """
-    对已碰撞点，计算逃逸惩罚而非规划引导
-    鼓励速度方向与逃逸方向（远离障碍物内部）一致
-
-    Args:
-        v: 速度 [S, B, 3]
-        vec_to_pt: 指向最近障碍物表面的向量 [S, B, 3]
-        dist_obj: 到障碍物的距离 [S, B]
-        collision_mask: 碰撞掩码 [S, B]
-
-    Returns:
-        escape_loss: 逃逸方向一致性损失 [S, B]
-        depth_penalty: 碰撞深度惩罚 [S, B]
-    """
-    # 逃逸方向：vec_to_pt 指向障碍物表面最近点
-    # 当在障碍物内时，应该朝 vec_to_pt 的方向移动以逃出
-    escape_dir = safe_normalize(vec_to_pt, dim=-1)  # [S, B, 3]
-    v_dir = safe_normalize(v, dim=-1)  # [S, B, 3]
-
-    # 逃逸方向一致性损失：1 - cos(v, escape_dir)
-    # 当速度方向与逃逸方向一致时，损失为0
-    escape_alignment = 1.0 - (v_dir * escape_dir).sum(dim=-1)  # [S, B]
-
-    # 只对碰撞点计算
-    escape_loss = escape_alignment * collision_mask.float()  # [S, B]
-
-    # 额外惩罚：碰撞深度越大，惩罚越重
-    depth_penalty = F.relu(-dist_obj).pow(2) * collision_mask.float()  # [S, B]
-
-    return escape_loss, depth_penalty
-
-
-def sample_guidance_points(p_history, v_history, dist_obj, sample_count, strategy='random'):
-    """
-    智能采样轨迹上的关键点
-
-    Args:
-        p_history: 位置历史 [T, B, 3]
-        v_history: 速度历史 [T, B, 3]
-        dist_obj: 到障碍物的距离 [T, B]
-        sample_count: 采样点数
-        strategy: 采样策略 ('random', 'uniform', 'adaptive', 'critical')
-
-    Returns:
-        indices: 采样点索引 tensor [S, B]（每个 batch 独立采样）
-    """
-    T, B = p_history.shape[:2]
-    device = p_history.device
-
-    # 确保采样数不超过总时间步数
-    sample_count = min(sample_count, T)
-
-    if strategy == 'random':
-        # 随机采样时间步（不放回），每个 batch 独立采样并按时间排序
-        if sample_count >= T:
-            base = torch.arange(T, device=device, dtype=torch.long)
-            indices = base[:, None].expand(T, B).clone()
-        else:
-            cols = []
-            for b in range(B):
-                idx_b = torch.randperm(T, device=device)[:sample_count].sort().values
-                cols.append(idx_b)
-            indices = torch.stack(cols, dim=1)
-
-    elif strategy == 'uniform':
-        # 均匀采样（时间步一致，但按 batch 维度展开）
-        base = torch.linspace(0, T - 1, sample_count, device=device).long()
-        indices = base[:, None].expand(sample_count, B).clone()
-
-    elif strategy == 'adaptive':
-        # 自适应采样：优先采样危险点和变化大的点（每个 batch 独立）
-        with torch.no_grad():
-            # 危险度：dist_obj 越小越危险
-            danger_score = F.softplus(-dist_obj * 5.0)  # [T, B]
-
-            # 速度变化度（曲率指标）
-            v_diff = (v_history[1:] - v_history[:-1]).norm(dim=-1)  # [T-1, B]
-            v_diff = F.pad(v_diff, (0, 0, 0, 1), value=0.0)  # [T, B]
-
-            # 综合分数
-            importance = danger_score + v_diff  # [T, B]
-
-            # 每个 batch 选择最重要的点
-            k = min(sample_count, T)
-            cols = []
-            for b in range(B):
-                _, top_indices = importance[:, b].topk(k)
-                cols.append(top_indices.sort().values)
-            indices = torch.stack(cols, dim=1)
-
-    elif strategy == 'critical':
-        # 只采样关键时刻：轨迹的起点、终点、最危险点（每个 batch 独立）
-        with torch.no_grad():
-            danger = F.softplus(-dist_obj * 5.0)  # [T, B]
-            cols = []
-            for b in range(B):
-                critical_indices = {0, T - 1}
-                remaining_count = sample_count - len(critical_indices)
-                if remaining_count > 0 and T > 2:
-                    danger_mid = danger[1:-1, b]
-                    k = min(remaining_count, int(danger_mid.numel()))
-                    if k > 0:
-                        _, top_danger = danger_mid.topk(k)
-                        for idx in (top_danger + 1).tolist():
-                            critical_indices.add(int(idx))
-
-                idx_b = torch.tensor(sorted(critical_indices), device=device, dtype=torch.long)
-                if idx_b.numel() < sample_count:
-                    pad = idx_b[-1].repeat(sample_count - idx_b.numel())
-                    idx_b = torch.cat([idx_b, pad], dim=0)
-                elif idx_b.numel() > sample_count:
-                    idx_b = idx_b[:sample_count]
-                cols.append(idx_b)
-
-            indices = torch.stack(cols, dim=1)
-
-    else:
-        # 默认均匀采样
-        base = torch.linspace(0, T - 1, sample_count, device=device).long()
-        indices = base[:, None].expand(sample_count, B).clone()
-
-    return indices
-
-
-def _masked_mean(x, mask):
-    mask_bool = mask.bool()
-    mask_f = mask_bool.float()
-    denom = mask_f.sum().clamp_min(1.0)
-    x_safe = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.where(mask_bool, x_safe, torch.zeros_like(x_safe)).sum() / denom
-
-
-def compute_guidance_reference_from_potential_map(p_history, map_data, interpolation='trilinear'):
-    """Query dense potential value and descending direction from precomputed map field."""
-    potential_value, ref_dir, valid_mask = query_potential_guidance(
-        map_data=map_data,
-        points_world=p_history,
-        interpolation=interpolation,
-    )
-    ref_dir = safe_normalize(ref_dir, dim=-1)
-    return potential_value, ref_dir, valid_mask
-
-
-def compute_potential_guidance_meta_loss(env, p_history, v_history, vec_to_pt, dist_obj,
-                                         map_data,
-                                         max_speed=5.0,
-                                         dir_weight=0.5,
-                                         speed_weight=0.3,
-                                         lateral_weight=0.3,
-                                         escape_weight=1.0,
-                                         collision_threshold=-0.05,
-                                         accel_weight=0.2,
-                                         speed_diff_weight=0.2,
-                                         recovery_speed_weight=0.15):
-    """Dense guidance loss based on precomputed Dijkstra potential/vector field."""
-    T, B, _ = p_history.shape
-
-    potential_value, ref_dir, valid_mask = compute_guidance_reference_from_potential_map(
-        p_history=p_history,
-        map_data=map_data,
-        interpolation=args.potential_interpolation,
-    )
-
-    ref_dir = sanitize_tensor(ref_dir, nan=0.0, posinf=0.0, neginf=0.0)
-    v_dir = safe_normalize(v_history, dim=-1)
-    v_speed = v_history.norm(dim=-1)
-
-    loss_dir_align = sanitize_tensor(
-        1.0 - (v_dir * ref_dir).sum(dim=-1),
-        nan=0.0,
-        posinf=2.0,
-        neginf=0.0,
-    ).clamp(0.0, 2.0)
-
-    # Simple, stable speed reference: full speed in free/early areas, damp near walls and near low-potential zones.
-    finite_mask = torch.isfinite(potential_value)
-    valid_mask = valid_mask & finite_mask
-    potential_value_safe = torch.where(finite_mask, potential_value, torch.zeros_like(potential_value))
-    safe_pot = torch.where(valid_mask, potential_value_safe, torch.zeros_like(potential_value_safe))
-    pot_max = safe_pot.max(dim=0, keepdim=True).values.clamp_min(1.0)
-    pot_ratio = torch.clamp(safe_pot / pot_max, 0.0, 1.0)
-    obstacle_factor = torch.sigmoid((dist_obj - 0.8) * 5.0)
-    ref_speed = max_speed * (0.25 + 0.75 * obstacle_factor) * (0.30 + 0.70 * pot_ratio)
-
-    loss_overspeed = F.relu(v_speed - ref_speed)
-    loss_underspeed = F.relu(ref_speed - v_speed) * 0.3
-    loss_speed_diff = loss_overspeed + loss_underspeed
-
-    # Potential descent constraint: penalize local potential increase.
-    loss_pot_step = torch.zeros_like(potential_value)
-    if T > 1:
-        step_valid = valid_mask[:-1] & valid_mask[1:]
-        step_term = F.relu(potential_value_safe[1:] - potential_value_safe[:-1] + float(args.potential_delta_margin))
-        loss_pot_step[:-1] = torch.where(step_valid, step_term, torch.zeros_like(step_term))
-    else:
-        step_valid = torch.zeros((0, B), dtype=torch.bool, device=p_history.device)
-
-    # Potential absolute term: normalized potential on valid field points.
-    loss_pot_abs = torch.where(valid_mask, safe_pot / (pot_max + 1e-6), torch.zeros_like(safe_pot))
-
-    collision_mask = dist_obj < collision_threshold
-    invalid_mask = (~valid_mask) & (~collision_mask)
-    recovery_mask = collision_mask | invalid_mask
-    valid_guidance_mask = valid_mask & (~collision_mask)
-
-    loss_escape, loss_depth = compute_escape_penalty(
-        v_history, vec_to_pt, dist_obj, recovery_mask
-    )
-    loss_recovery_speed = v_speed * invalid_mask.float()
-
-    guidance_for_valid = (
-        dir_weight * loss_dir_align
-        + lateral_weight * loss_pot_abs
-    )
-    guidance_for_recovery = (
-        escape_weight * (loss_escape + loss_depth)
-    )
-
-    guidance_loss_per_point = torch.where(valid_guidance_mask, guidance_for_valid, guidance_for_recovery)
-    guidance_loss_per_point = sanitize_tensor(guidance_loss_per_point, nan=0.0, posinf=1e3, neginf=0.0)
-    guidance_loss = guidance_loss_per_point.mean()
-
-    potential_decrease = torch.tensor(0.0, device=p_history.device, dtype=p_history.dtype)
-    if T > 1:
-        raw_dec = potential_value_safe[:-1] - potential_value_safe[1:]
-        potential_decrease = _masked_mean(raw_dec, step_valid)
-
-    field_dir_align = _masked_mean(1.0 - loss_dir_align, valid_guidance_mask)
-
-    loss_components = {
-        'dir_align': loss_dir_align.mean(),
-        'speed_diff': loss_speed_diff.mean(),
-        'overspeed': loss_overspeed.mean(),
-        'underspeed': loss_underspeed.mean(),
-        'potential_abs': loss_pot_abs.mean(),
-        'potential_step_penalty': loss_pot_step.mean(),
-        # compatibility aliases
-        'lateral_error': loss_pot_abs.mean(),
-        'accel_mismatch': loss_pot_step.mean(),
-        'escape': loss_escape.mean(),
-        'depth': loss_depth.mean(),
-        'recovery_speed': loss_recovery_speed.mean(),
-        'valid_ratio': valid_mask.float().mean(),
-        'invalid_ratio': invalid_mask.float().mean(),
-        'collision_ratio': collision_mask.float().mean(),
-        'sample_count': float(T),
-        'avg_curvature': 0.0,
-        'avg_path_progress': 0.0,
-        'avg_lateral_error': loss_pot_abs.mean().item(),
-        'max_lateral_error': loss_pot_abs.max().item(),
-        'potential_valid_ratio': valid_mask.float().mean(),
-        # compatibility alias
-        'planner_success_ratio': valid_mask.float().mean().item(),
-        'avg_ref_speed': ref_speed.mean().item(),
-        'sampled_astar_paths': [],
-        'potential_mean': _masked_mean(safe_pot, valid_mask),
-        'potential_decrease': potential_decrease,
-        'field_dir_align': field_dir_align,
-    }
-    return guidance_loss, loss_components
-
-
-def compute_global_guidance_meta_loss(env, p_history, v_history, p_target, vec_to_pt, dist_obj,
-                                       a_history=None,
-                                       sample_count=10, strategy='random',
-                                       max_speed=5.0, max_accel=5.0, max_decel=6.0,
-                                       dir_weight=0.5, speed_weight=0.3, lateral_weight=0.3,
-                                       escape_weight=1.0, collision_threshold=-0.05,
-                                       accel_weight=0.2, speed_diff_weight=0.2,
-                                       recovery_speed_weight=0.15):
-    """
-    全局规划器引导的元损失，使用 A* 算法规划的全局路径作为参考
-
-    基于梯形速度剖面和动力学约束计算损失：
-    - 方向一致性：速度方向与规划方向的夹角
-    - 速度偏差：实际速度与规划参考速度的差异（双向惩罚）
-    - 横向偏差：到规划路径的真正几何距离
-    - 加速度偏差：实际加速度与规划参考加速度的差异
-
-    Args:
-        p_history: 位置历史 [T, B, 3]
-        v_history: 速度历史 [T, B, 3]
-        p_target: 目标位置 [B, 3]
-        vec_to_pt: 指向最近障碍物的向量 [T, B, 3]
-        dist_obj: 到障碍物的距离 [T, B]
-        a_history: 可选的环境真实加速度历史 [T, B, 3]，提供时优先用于加速度监督
-        sample_count: 采样点数
-        strategy: 采样策略
-        max_speed: 最大速度 (m/s)
-        max_accel: 最大加速度 (m/s^2)
-        max_decel: 最大减速度 (m/s^2)
-        dir_weight: 方向一致性损失权重
-        speed_weight: 速度偏差惩罚权重
-        lateral_weight: 横向偏差惩罚权重（到路径的几何距离）
-        escape_weight: 逃逸惩罚权重
-        collision_threshold: 碰撞判定阈值
-        accel_weight: 加速度偏差权重
-        speed_diff_weight: 速度差（超速/低速）惩罚权重
-
-    Returns:
-        guidance_loss: 标量损失
-        loss_components: 各分项损失的字典
-    """
-    # New default path: dense potential-field guidance from precomputed map cache.
-    if args.use_precomputed_potential_maps and not args.use_astar_guidance:
-        if POTENTIAL_MAP_CACHE is None:
-            raise RuntimeError("Precomputed potential map mode is enabled but POTENTIAL_MAP_CACHE is not initialized")
-        map_idx = int(getattr(env, 'current_map_idx', 0))
-        map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
-        return compute_potential_guidance_meta_loss(
-            env=env,
-            p_history=p_history,
-            v_history=v_history,
-            vec_to_pt=vec_to_pt,
-            dist_obj=dist_obj,
-            map_data=map_data,
-            max_speed=max_speed,
-            dir_weight=dir_weight,
-            speed_weight=speed_weight,
-            lateral_weight=lateral_weight,
-            escape_weight=escape_weight,
-            collision_threshold=collision_threshold,
-            accel_weight=accel_weight,
-            speed_diff_weight=speed_diff_weight,
-            recovery_speed_weight=recovery_speed_weight,
-        )
-
-    T, B, _ = p_history.shape
-
-    # 1. 采样关键点
-    sample_indices = sample_guidance_points(
-        p_history, v_history, dist_obj, sample_count, strategy
-    )
-    S = sample_indices.shape[0]
-
-    # 2. 提取采样点的状态
-    b_idx = torch.arange(B, device=p_history.device).unsqueeze(0).expand(S, B)
-    p_sampled = p_history[sample_indices, b_idx]      # [S, B, 3]
-    v_sampled = v_history[sample_indices, b_idx]      # [S, B, 3]
-    vec_sampled = vec_to_pt[sample_indices, b_idx]    # [S, B, 3]
-    dist_sampled = dist_obj[sample_indices, b_idx]    # [S, B]
-    a_sampled = None
-    if a_history is not None:
-        a_sampled = a_history[sample_indices, b_idx]  # [S, B, 3]
-
-    # 3. 使用全局规划器计算参考（A* 规划 + 梯形速度剖面）
-    ref_dir, ref_speed, ref_accel, lateral_error, valid_mask, planner_info = compute_guidance_reference_from_planner(
-        env, p_sampled, v_sampled, p_target, dist_sampled, global_planner,
-        max_speed=max_speed, max_accel=max_accel, max_decel=max_decel,
-        lookahead_dist=1.0,
-        invalid_dist_threshold=collision_threshold,
-        sampled_steps=sample_indices,
-    )
-
-    # 4. 计算各项损失
-    v_dir = safe_normalize(v_sampled, dim=-1)  # [S, B, 3]
-    v_speed = v_sampled.norm(dim=-1)  # [S, B]
-
-    # 4.1 方向一致性损失：1 - cos(v_dir, ref_dir)
-    loss_dir_align = 1.0 - (v_dir * ref_dir).sum(dim=-1)  # [S, B]
-
-    # 4.2 速度偏差：双向惩罚（超速和低速都惩罚）
-    # 超速惩罚更重，低速惩罚较轻
-    loss_overspeed = F.relu(v_speed - ref_speed)  # [S, B]
-    loss_underspeed = F.relu(ref_speed - v_speed) * 0.3  # 低速惩罚较轻
-    loss_speed_diff = loss_overspeed + loss_underspeed  # [S, B]
-
-    # 4.3 横向偏差：到规划路径的真正几何距离
-    # 使用平滑的 L1 损失，对小偏差不过度惩罚
-    loss_lateral = F.smooth_l1_loss(lateral_error, torch.zeros_like(lateral_error), reduction='none')  # [S, B]
-
-    # 4.4 加速度偏差惩罚
-    if S > 1:
-        # 实际加速度：优先使用环境提供的 a_history，缺失时回退到速度差分估算
-        if a_sampled is not None:
-            v_diff = a_sampled
-        else:
-            v_diff = torch.zeros_like(v_sampled)
-            for i in range(S - 1):
-                dt_approx = (sample_indices[i + 1] - sample_indices[i]).to(v_sampled.dtype) / 15.0  # [B]
-                step_acc = (v_sampled[i + 1] - v_sampled[i]) / (dt_approx[:, None] + 1e-6)
-                valid_dt = dt_approx > 0
-                if valid_dt.any():
-                    v_diff[i, valid_dt] = step_acc[valid_dt]
-            v_diff[-1] = v_diff[-2] if S > 1 else torch.zeros_like(v_diff[-1])
-
-        # 加速度偏差：实际加速度与参考加速度的差异
-        # ref_accel 是基于速度剖面计算的参考加速度（通常是减速）
-        accel_error = (v_diff - ref_accel).norm(dim=-1)  # [S, B]
-
-        # 只惩罚明显的加速度偏差（阈值 0.5 m/s^2）
-        loss_accel_mismatch = F.relu(accel_error - 0.5)  # [S, B]
-
-        # 额外检查：需要减速时是否真的在减速
-        ref_accel_mag = ref_accel.norm(dim=-1)  # [S, B]
-        ref_accel_dir = safe_normalize(ref_accel, dim=-1)
-        actual_accel_along_ref = (v_diff * ref_accel_dir).sum(dim=-1)  # [S, B]
-        # 如果规划器要求减速（ref_accel 有显著幅度且为负）但实际在加速
-        need_decel = ref_accel_mag > 0.5
-        not_deceling = actual_accel_along_ref < -0.5  # 实际加速度与减速方向相反
-        loss_decel_violation = need_decel.float() * not_deceling.float() * ref_accel_mag
-        loss_accel_mismatch = loss_accel_mismatch + loss_decel_violation
-    else:
-        loss_accel_mismatch = torch.zeros_like(loss_dir_align)
-
-    # 5. 对不可规划点/碰撞点的恢复处理
-    collision_mask = dist_sampled < collision_threshold  # [S, B]
-    invalid_mask = (~valid_mask) & (~collision_mask)
-    recovery_mask = collision_mask | invalid_mask
-    valid_guidance_mask = valid_mask & (~collision_mask)
-
-    loss_escape, loss_depth = compute_escape_penalty(
-        v_sampled, vec_sampled, dist_sampled, recovery_mask
-    )
-    loss_recovery_speed = v_speed * invalid_mask.float()
-
-    # 6. 组合损失
-    # 有效点（非碰撞）用规划引导；速度/加速度动态项仅保留日志，不进入 loss。
-    guidance_for_valid = (
-        dir_weight * loss_dir_align +
-        lateral_weight * loss_lateral
-    )  # [S, B]
-
-    # 碰撞点和不可规划点用恢复惩罚
-    guidance_for_recovery = (
-        escape_weight * (loss_escape + loss_depth)
-    )  # [S, B]
-
-    # 根据点状态选择损失
-    guidance_loss_per_point = torch.where(
-        valid_guidance_mask,
-        guidance_for_valid,
-        guidance_for_recovery,
-    )  # [S, B]
-
-    # 总损失
-    guidance_loss = guidance_loss_per_point.mean()
-
-    # 返回各分项用于日志
-    loss_components = {
-        'dir_align': loss_dir_align.mean(),
-        'speed_diff': loss_speed_diff.mean(),
-        'overspeed': loss_overspeed.mean(),
-        'underspeed': loss_underspeed.mean(),
-        'lateral_error': loss_lateral.mean(),
-        'accel_mismatch': loss_accel_mismatch.mean(),
-        'escape': loss_escape.mean(),
-        'depth': loss_depth.mean(),
-        'recovery_speed': loss_recovery_speed.mean(),
-        'valid_ratio': valid_mask.float().mean(),
-        'invalid_ratio': invalid_mask.float().mean(),
-        'collision_ratio': collision_mask.float().mean(),
-        'sample_count': S,
-        'avg_curvature': planner_info.get('avg_curvature', 0.0),
-        'avg_path_progress': planner_info.get('avg_path_progress', 0.0),
-        'avg_lateral_error': planner_info.get('avg_lateral_error', 0.0),
-        'max_lateral_error': planner_info.get('max_lateral_error', 0.0),
-        'planner_success_ratio': planner_info.get('planner_success_ratio', 0.0),
-        'avg_ref_speed': ref_speed.mean().item(),
-        'sampled_astar_paths': planner_info.get('sampled_astar_paths', []),
-    }
-
-    return guidance_loss, loss_components
-
-
-@torch.no_grad()
-def get_map_view_bounds(env, traj_xy, target_xy=None, pad=0.5):
-    """Auto-fit map bounds for both maze-like and random obstacle layouts."""
-    x_vals = [traj_xy[:, 0]]
-    y_vals = [traj_xy[:, 1]]
-
-    if target_xy is not None:
-        x_vals.append(target_xy[0:1])
-        y_vals.append(target_xy[1:2])
-
-    if hasattr(env, 'voxels') and env.voxels.numel() > 0:
-        walls = env.voxels[0].detach().cpu()
-        c = walls[:, :2]
-        h = walls[:, 3:5]
-        x_vals.extend([c[:, 0] - h[:, 0], c[:, 0] + h[:, 0]])
-        y_vals.extend([c[:, 1] - h[:, 1], c[:, 1] + h[:, 1]])
-
-    x_all = torch.cat(x_vals)
-    y_all = torch.cat(y_vals)
-
-    x_min = float(x_all.min().item()) - pad
-    x_max = float(x_all.max().item()) + pad
-    y_min = float(y_all.min().item()) - pad
-    y_max = float(y_all.max().item()) + pad
-
-    if (x_max - x_min) < 1e-3:
-        x_min -= 0.5
-        x_max += 0.5
-    if (y_max - y_min) < 1e-3:
-        y_min -= 0.5
-        y_max += 0.5
-    return x_min, x_max, y_min, y_max
-
-
-def build_potential_xy_debug_figure(map_data, z_world, stride=5):
-    """Build XY heatmap + vector field slice from cached potential map for quick debugging."""
-    if map_data is None:
-        return None
-
-    potential = map_data.get('potential', None)
-    occupancy = map_data.get('occupancy', None)
-    guide_dir = map_data.get('guide_dir', None)
-    origin = map_data.get('grid_origin', None)
-    resolution = float(map_data.get('resolution', 0.3))
-
-    if potential is None or occupancy is None or guide_dir is None or origin is None:
-        return None
-
-    if isinstance(potential, torch.Tensor):
-        potential = potential.detach().cpu().numpy()
-    if isinstance(occupancy, torch.Tensor):
-        occupancy = occupancy.detach().cpu().numpy()
-    if isinstance(guide_dir, torch.Tensor):
-        guide_dir = guide_dir.detach().cpu().numpy()
-    if isinstance(origin, torch.Tensor):
-        origin = origin.detach().cpu().numpy()
-
-    nx, ny, nz = potential.shape
-    zi = int(round((float(z_world) - float(origin[2])) / max(resolution, 1e-6)))
-    zi = max(0, min(nz - 1, zi))
-
-    pot_xy = potential[:, :, zi]
-    occ_xy = occupancy[:, :, zi] > 0
-    dir_xy = guide_dir[:, :, zi, :2]
-
-    finite_mask = np.isfinite(pot_xy)
-    valid_mask = finite_mask & (~occ_xy)
-    if valid_mask.sum() <= 0:
-        return None
-
-    # Keep image orientation intuitive: x-axis horizontal, y-axis vertical.
-    pot_show = pot_xy.T.copy()
-    pot_show[~np.isfinite(pot_show)] = np.nan
-
-    x_min = float(origin[0])
-    x_max = x_min + nx * resolution
-    y_min = float(origin[1])
-    y_max = y_min + ny * resolution
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(
-        pot_show,
-        origin='lower',
-        extent=[x_min, x_max, y_min, y_max],
-        cmap='viridis',
-        aspect='auto',
-    )
-    fig.colorbar(im, ax=ax, label='Potential')
-
-    # Overlay obstacle mask.
-    occ_show = np.where(occ_xy.T, 1.0, np.nan)
-    ax.imshow(
-        occ_show,
-        origin='lower',
-        extent=[x_min, x_max, y_min, y_max],
-        cmap='gray',
-        alpha=0.35,
-        aspect='auto',
-    )
-
-    # Sparse vector field arrows.
-    sx = max(1, int(stride))
-    xs = []
-    ys = []
-    us = []
-    vs = []
-    for ix in range(0, nx, sx):
-        for iy in range(0, ny, sx):
-            if not valid_mask[ix, iy]:
-                continue
-            dv = dir_xy[ix, iy]
-            dn = float(np.linalg.norm(dv))
-            if dn <= 1e-6:
-                continue
-            px = x_min + (ix + 0.5) * resolution
-            py = y_min + (iy + 0.5) * resolution
-            xs.append(px)
-            ys.append(py)
-            us.append(float(dv[0] / dn))
-            vs.append(float(dv[1] / dn))
-
-    if len(xs) > 0:
-        ax.quiver(xs, ys, us, vs, color='white', alpha=0.85, scale=28, width=0.002)
-
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_title(f'Potential Field XY Slice (z={z_world:.2f} m, grid_z={zi})')
-    return fig
-
-
-def draw_sphere(ax, cx, cy, cz, r, color='royalblue', alpha=0.18, res=12):
-    u = np.linspace(0.0, 2.0 * np.pi, res)
-    v = np.linspace(0.0, np.pi, res)
-    x = cx + r * np.outer(np.cos(u), np.sin(v))
-    y = cy + r * np.outer(np.sin(u), np.sin(v))
-    z = cz + r * np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
-
-
-def draw_cylinder_z(ax, cx, cy, r, z0, z1, color='teal', alpha=0.14, res_theta=18, res_h=2):
-    theta = np.linspace(0.0, 2.0 * np.pi, res_theta)
-    z = np.linspace(z0, z1, res_h)
-    th_grid, z_grid = np.meshgrid(theta, z)
-    x = cx + r * np.cos(th_grid)
-    y = cy + r * np.sin(th_grid)
-    ax.plot_surface(x, y, z_grid, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
-
-
-def draw_cylinder_y(ax, cx, zc, r, y0, y1, color='darkorange', alpha=0.16, res_theta=18, res_h=2):
-    theta = np.linspace(0.0, 2.0 * np.pi, res_theta)
-    y = np.linspace(y0, y1, res_h)
-    th_grid, y_grid = np.meshgrid(theta, y)
-    x = cx + r * np.cos(th_grid)
-    z = zc + r * np.sin(th_grid)
-    ax.plot_surface(x, y_grid, z, color=color, alpha=alpha, linewidth=0.1, edgecolor='k', antialiased=True, shade=True)
-
-
-def _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.65):
-    x0, x1 = cx - hx, cx + hx
-    y0, y1 = cy - hy, cy + hy
-    z0, z1 = cz - hz, cz + hz
-    x = [x0, x1, x1, x0, x0, x1, x1, x0]
-    y = [y0, y0, y1, y1, y0, y0, y1, y1]
-    z = [z0, z0, z0, z0, z1, z1, z1, z1]
-    i = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
-    j = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 0, 4]
-    k = [2, 3, 6, 7, 5, 4, 6, 5, 7, 6, 4, 7]
-    fig.add_trace(go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k,
-                            color=color, opacity=opacity, flatshading=True,
-                            hoverinfo='skip', showscale=False))
-
-
-def _plotly_add_sphere(fig, cx, cy, cz, r, color='royalblue', opacity=0.75, res=16):
-    u = np.linspace(0.0, 2.0 * np.pi, res)
-    v = np.linspace(0.0, np.pi, res)
-    x = cx + r * np.outer(np.cos(u), np.sin(v))
-    y = cy + r * np.outer(np.sin(u), np.sin(v))
-    z = cz + r * np.outer(np.ones_like(u), np.cos(v))
-    c = np.zeros_like(x)
-    fig.add_trace(go.Surface(x=x, y=y, z=z, surfacecolor=c,
-                             colorscale=[[0, color], [1, color]], showscale=False,
-                             opacity=opacity, hoverinfo='skip'))
-
-
-def _plotly_add_cylinder_z(fig, cx, cy, r, z0, z1, color='teal', opacity=0.72, res_theta=22):
-    th = np.linspace(0.0, 2.0 * np.pi, res_theta)
-    z = np.array([z0, z1])
-    th_grid, z_grid = np.meshgrid(th, z)
-    x = cx + r * np.cos(th_grid)
-    y = cy + r * np.sin(th_grid)
-    c = np.zeros_like(x)
-    fig.add_trace(go.Surface(x=x, y=y, z=z_grid, surfacecolor=c,
-                             colorscale=[[0, color], [1, color]], showscale=False,
-                             opacity=opacity, hoverinfo='skip'))
-
-
-def _plotly_add_cylinder_y(fig, cx, zc, r, y0, y1, color='darkorange', opacity=0.72, res_theta=22):
-    th = np.linspace(0.0, 2.0 * np.pi, res_theta)
-    y = np.array([y0, y1])
-    th_grid, y_grid = np.meshgrid(th, y)
-    x = cx + r * np.cos(th_grid)
-    z = zc + r * np.sin(th_grid)
-    c = np.zeros_like(x)
-    fig.add_trace(go.Surface(x=x, y=y_grid, z=z, surfacecolor=c,
-                             colorscale=[[0, color], [1, color]], showscale=False,
-                             opacity=opacity, hoverinfo='skip'))
-
-
-def _is_ceiling_voxel(box_xyz_half, env):
-    """Return True if a voxel is the top ceiling slab."""
-    cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
-    if not all(hasattr(env, key) for key in ('map_x_max', 'map_y_min', 'map_y_max', 'map_z_max', 'boundary_half')):
-        return False
-
-    map_x_max = float(env.map_x_max)
-    map_y_min = float(env.map_y_min)
-    map_y_max = float(env.map_y_max)
-    map_z_max = float(env.map_z_max)
-    boundary_half = float(env.boundary_half)
-    map_y_span = max(1e-6, map_y_max - map_y_min)
-
-    tol = max(0.08, boundary_half * 1.6)
-    ceiling = (
-        abs(cz - map_z_max) <= tol
-        and abs(hz - boundary_half) <= tol
-        and hx >= 0.45 * map_x_max
-        and hy >= 0.45 * map_y_span
-    )
-    return bool(ceiling)
-
-
-def _is_top_ceiling_voxel_relaxed(box_xyz_half, env):
-    """Relaxed ceiling check: identify any top boundary slab near map_z_max."""
-    cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
-    if not all(hasattr(env, key) for key in ('map_z_max', 'boundary_half')):
-        return False
-    map_z_max = float(env.map_z_max)
-    boundary_half = float(env.boundary_half)
-    tol = max(0.08, boundary_half * 1.8)
-    return bool(abs(cz - map_z_max) <= tol and abs(hz - boundary_half) <= tol)
-
-
-def _is_boundary_wall_voxel(box_xyz_half, env):
-    """Heuristic check for outer enclosure side walls (x/y boundaries)."""
-    cx, cy, cz, hx, hy, hz = [float(v) for v in box_xyz_half]
-    if not all(hasattr(env, key) for key in ('map_x_max', 'map_y_min', 'map_y_max', 'boundary_half')):
-        return False
-
-    map_x_max = float(env.map_x_max)
-    map_y_min = float(env.map_y_min)
-    map_y_max = float(env.map_y_max)
-    boundary_half = float(env.boundary_half)
-
-    tol = max(0.08, boundary_half * 1.8)
-    side_x = (abs(cx - 0.0) <= tol or abs(cx - map_x_max) <= tol) and abs(hx - boundary_half) <= tol
-    side_y = (abs(cy - map_y_min) <= tol or abs(cy - map_y_max) <= tol) and abs(hy - boundary_half) <= tol
-    return bool(side_x or side_y)
-
-
-def save_interactive_3d_html(html_path, env, p_cpu, v_cpu, R_cpu=None, idx=0, axis_len=0.3, axis_step=5,
-                             astar_path=None, astar_paths_sampled=None,
-                             potential_map_data=None, show_potential_overlay=False,
-                             map_type=None):
-    """保存交互式3D轨迹HTML，带有无人机姿态坐标系和A*全局引导轨迹
-
-    Args:
-        R_cpu: 姿态矩阵 [T, 3, 3]，如果提供则绘制坐标系
-        axis_len: 坐标轴长度(米)
-        axis_step: 每隔多少个时间步绘制一次坐标系
-        potential_map_data: 势场缓存数据（map_XXX.pt 反序列化对象）
-        show_potential_overlay: 是否在 HTML 中叠加势场切片
-    """
-    if go is None:
-        return False
-
-    map_type_norm = str(map_type).strip().lower().replace("-", "_") if map_type is not None else ""
-    hide_relaxed_ceiling = map_type_norm in ("u_min", "u_minimal")
-
-    traj_xyz = p_cpu.numpy()
-    speed_cpu = v_cpu.norm(dim=-1).numpy()
-    traj_labels = [f"t={t}<br>speed={speed_cpu[t]:.2f} m/s" for t in range(len(traj_xyz))]
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter3d(
-        x=traj_xyz[:, 0], y=traj_xyz[:, 1], z=traj_xyz[:, 2],
-        mode='lines+markers',
-        marker=dict(
-            size=3,
-            color=speed_cpu,
-            colorscale='Turbo',
-            cmin=0.0,
-            cmax=15.0,
-            colorbar=dict(title='Speed (m/s)')
-        ),
-        line=dict(color='limegreen', width=5),
-        hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<br>%{text}<extra></extra>',
-        text=traj_labels,
-        name='Trajectory'
-    ))
-
-    # 势场后端时，在 HTML 中叠加一个 XY 势场切片层。
-    potential_overlay_ok = False
-    potential_overlay_msg = ""
-    if show_potential_overlay and potential_map_data is not None:
-        try:
-            pot = potential_map_data.get('potential', None)
-            occ = potential_map_data.get('occupancy', None)
-            origin = potential_map_data.get('grid_origin', None)
-            resolution = float(potential_map_data.get('resolution', 0.3))
-
-            if isinstance(pot, torch.Tensor):
-                pot = pot.detach().cpu().numpy()
-            if isinstance(occ, torch.Tensor):
-                occ = occ.detach().cpu().numpy()
-            if isinstance(origin, torch.Tensor):
-                origin = origin.detach().cpu().numpy()
-
-            if pot is not None and occ is not None and origin is not None and pot.ndim == 3:
-                nx, ny, nz = pot.shape
-                # 先尝试轨迹中位高度对应切片；若切片无有效点，自动选择有效点最多的切片。
-                z_world = float(np.median(traj_xyz[:, 2]))
-                zi_guess = int(round((z_world - float(origin[2])) / max(resolution, 1e-6)))
-                zi_guess = max(0, min(nz - 1, zi_guess))
-
-                best_zi = zi_guess
-                best_valid_cnt = -1
-                for zi in range(nz):
-                    pot_xy_i = pot[:, :, zi]
-                    occ_xy_i = occ[:, :, zi] > 0
-                    valid_i = np.isfinite(pot_xy_i) & (~occ_xy_i)
-                    cnt_i = int(np.count_nonzero(valid_i))
-                    if cnt_i > best_valid_cnt:
-                        best_valid_cnt = cnt_i
-                        best_zi = zi
-
-                zi = zi_guess
-                pot_xy = pot[:, :, zi].copy()
-                occ_xy = occ[:, :, zi] > 0
-                finite = np.isfinite(pot_xy)
-                valid = finite & (~occ_xy)
-
-                if int(np.count_nonzero(valid)) <= 0 and best_valid_cnt > 0:
-                    zi = best_zi
-                    pot_xy = pot[:, :, zi].copy()
-                    occ_xy = occ[:, :, zi] > 0
-                    finite = np.isfinite(pot_xy)
-                    valid = finite & (~occ_xy)
-
-                if np.any(valid):
-                    pot_valid = pot_xy[valid]
-                    pmin = float(np.min(pot_valid))
-                    pmax = float(np.max(pot_valid))
-                    denom = max(1e-6, pmax - pmin)
-                    pot_norm = (pot_xy - pmin) / denom
-
-                    z_world_slice = float(origin[2]) + (float(zi) + 0.5) * resolution
-                    z_layer = np.full_like(pot_xy, z_world_slice - 0.08, dtype=np.float32)
-                    z_layer[~valid] = np.nan
-                    pot_norm[~valid] = np.nan
-
-                    x_vec = float(origin[0]) + (np.arange(nx, dtype=np.float32) + 0.5) * resolution
-                    y_vec = float(origin[1]) + (np.arange(ny, dtype=np.float32) + 0.5) * resolution
-                    X, Y = np.meshgrid(x_vec, y_vec, indexing='ij')
-
-                    fig.add_trace(go.Surface(
-                        x=X,
-                        y=Y,
-                        z=z_layer,
-                        surfacecolor=pot_norm,
-                        colorscale='Viridis',
-                        cmin=0.0,
-                        cmax=1.0,
-                        opacity=0.62,
-                        showscale=True,
-                        colorbar=dict(title='Potential (norm)'),
-                        name='Potential Slice',
-                        hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>Potential=%{surfacecolor:.3f}<extra></extra>'
-                    ))
-                    potential_overlay_ok = True
-                    if zi != zi_guess:
-                        potential_overlay_msg = (
-                            f"Potential overlay: switched z-slice {zi_guess} -> {zi} "
-                            f"(valid={int(np.count_nonzero(valid))})."
-                        )
-                else:
-                    # 兜底：当所有 XY 切片都难以直接显示时，渲染稀疏势场点云。
-                    finite_all = np.isfinite(pot) & (~(occ > 0))
-                    idxs = np.argwhere(finite_all)
-                    if idxs.shape[0] > 0:
-                        max_pts = 5000
-                        if idxs.shape[0] > max_pts:
-                            pick = np.random.choice(idxs.shape[0], size=max_pts, replace=False)
-                            idxs = idxs[pick]
-                        x_pts = float(origin[0]) + (idxs[:, 0].astype(np.float32) + 0.5) * resolution
-                        y_pts = float(origin[1]) + (idxs[:, 1].astype(np.float32) + 0.5) * resolution
-                        z_pts = float(origin[2]) + (idxs[:, 2].astype(np.float32) + 0.5) * resolution
-                        p_pts = pot[idxs[:, 0], idxs[:, 1], idxs[:, 2]].astype(np.float32)
-                        pmin = float(np.min(p_pts))
-                        pmax = float(np.max(p_pts))
-                        pnorm = (p_pts - pmin) / max(1e-6, pmax - pmin)
-                        fig.add_trace(go.Scatter3d(
-                            x=x_pts,
-                            y=y_pts,
-                            z=z_pts,
-                            mode='markers',
-                            marker=dict(
-                                size=2,
-                                color=pnorm,
-                                colorscale='Viridis',
-                                opacity=0.42,
-                                colorbar=dict(title='Potential (norm)')
-                            ),
-                            name='Potential Cloud',
-                            hovertemplate='x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<extra></extra>'
-                        ))
-                        potential_overlay_ok = True
-                        potential_overlay_msg = "Potential overlay: XY slice empty, fallback to sparse 3D cloud."
-                    else:
-                        potential_overlay_msg = "Potential overlay: no finite free-space potential values."
-        except Exception as e:
-            potential_overlay_msg = f"Potential overlay error: {e}"
-            print(f"[HTML Potential Overlay] {potential_overlay_msg}")
-    elif show_potential_overlay and potential_map_data is None:
-        potential_overlay_msg = "Potential overlay requested but potential_map_data is None."
-
-    if show_potential_overlay and (not potential_overlay_ok) and potential_overlay_msg:
-        fig.add_trace(go.Scatter3d(
-            x=[traj_xyz[0, 0]],
-            y=[traj_xyz[0, 1]],
-            z=[traj_xyz[0, 2]],
-            mode='text',
-            text=[potential_overlay_msg],
-            textposition='top left',
-            textfont=dict(color='crimson', size=11),
-            showlegend=False,
-            name='Potential Overlay Status',
-        ))
-
-    # 绘制全局A*引导轨迹（起点到终点）
-    if astar_path is not None and len(astar_path) > 1:
-        fig.add_trace(go.Scatter3d(
-            x=astar_path[:, 0], y=astar_path[:, 1], z=astar_path[:, 2],
-            mode='lines+markers',
-            marker=dict(size=2, color='gold', symbol='diamond'),
-            line=dict(color='orange', width=4, dash='dash'),
-            name='A* Global Path'
-        ))
-
-    # 绘制采样点对应的所有A*轨迹（直接复用已计算结果，不额外规划）
-    if astar_paths_sampled is not None and len(astar_paths_sampled) > 0:
-        normalized_paths = []
-        for item in astar_paths_sampled:
-            if item is None:
-                continue
-            if isinstance(item, (tuple, list)) and len(item) == 2:
-                sample_t, path = item
-            else:
-                # Fallback for legacy/malformed records: treat as path-only entry.
-                sample_t, path = 0, item
-
-            path_arr = None
-            if path is not None:
-                try:
-                    if isinstance(path, torch.Tensor):
-                        path_arr = path.detach().cpu().numpy()
-                    else:
-                        path_arr = np.asarray(path)
-                    if path_arr.ndim == 1 and path_arr.size == 3:
-                        path_arr = path_arr.reshape(1, 3)
-                    if not (path_arr.ndim == 2 and path_arr.shape[1] == 3):
-                        path_arr = None
-                except Exception:
-                    path_arr = None
-
-            normalized_paths.append((sample_t, path_arr))
-
-        num_paths = len(normalized_paths)
-        for path_idx, (sample_t, path) in enumerate(normalized_paths):
-            color_ratio = path_idx / max(num_paths - 1, 1)
-            r = int(100 + 100 * color_ratio)
-            g = int(150 * (1 - color_ratio))
-            b = int(200 + 55 * color_ratio)
-            color = f'rgb({r},{g},{b})'
-
-            if path is not None and len(path) >= 2:
-                fig.add_trace(go.Scatter3d(
-                    x=path[:, 0], y=path[:, 1], z=path[:, 2],
-                    mode='lines',
-                    line=dict(color=color, width=2),
-                    opacity=0.6,
-                    showlegend=(path_idx == 0),
-                    name='A* Sampled Paths' if path_idx == 0 else None,
-                    legendgroup='astar_sampled',
-                    hovertemplate=f't={sample_t}<br>x=%{{x:.2f}}<br>y=%{{y:.2f}}<br>z=%{{z:.2f}}<extra></extra>'
-                ))
-
-            # 标记采样锚点，便于核对“路径从采样点出发”
-            try:
-                sample_t_int = int(np.asarray(sample_t).reshape(-1)[0])
-            except Exception:
-                sample_t_int = 0
-            t_idx = int(max(0, min(sample_t_int, len(traj_xyz) - 1)))
-            anchor = traj_xyz[t_idx]
-            fig.add_trace(go.Scatter3d(
-                x=[anchor[0]], y=[anchor[1]], z=[anchor[2]],
-                mode='markers',
-                marker=dict(size=4, color='orange', symbol='cross'),
-                showlegend=(path_idx == 0),
-                name='A* Sample Anchors' if path_idx == 0 else None,
-                legendgroup='astar_sampled_anchor',
-                hovertemplate=f'anchor t={sample_t}<br>x=%{{x:.2f}}<br>y=%{{y:.2f}}<br>z=%{{z:.2f}}<extra></extra>'
-            ))
-
-    # 绘制无人机姿态坐标系 (X-红, Y-绿, Z-蓝)
-    if R_cpu is not None:
-        R_np = R_cpu.numpy()  # [T, 3, 3]
-        T = len(traj_xyz)
-        # 每隔 axis_step 个点绘制一次坐标系
-        for t in range(0, T, axis_step):
-            pos = traj_xyz[t]
-            R = R_np[t]  # [3, 3], 列向量为机体坐标系的X,Y,Z轴
-            # X轴 (红色) - 机头方向（真实姿态）
-            x_axis = R[:, 0] * axis_len
-            fig.add_trace(go.Scatter3d(
-                x=[pos[0], pos[0] + x_axis[0]],
-                y=[pos[1], pos[1] + x_axis[1]],
-                z=[pos[2], pos[2] + x_axis[2]],
-                mode='lines',
-                line=dict(color='red', width=4),
-                showlegend=(t == 0),
-                name='X-axis (Forward)' if t == 0 else None,
-                legendgroup='x_axis'
-            ))
-            # Y轴 (绿色) - 左侧方向（真实姿态）
-            y_axis = R[:, 1] * axis_len
-            fig.add_trace(go.Scatter3d(
-                x=[pos[0], pos[0] + y_axis[0]],
-                y=[pos[1], pos[1] + y_axis[1]],
-                z=[pos[2], pos[2] + y_axis[2]],
-                mode='lines',
-                line=dict(color='green', width=4),
-                showlegend=(t == 0),
-                name='Y-axis (Left)' if t == 0 else None,
-                legendgroup='y_axis'
-            ))
-            # Z轴 (蓝色) - 上方向（真实姿态）
-            z_axis = R[:, 2] * axis_len
-            fig.add_trace(go.Scatter3d(
-                x=[pos[0], pos[0] + z_axis[0]],
-                y=[pos[1], pos[1] + z_axis[1]],
-                z=[pos[2], pos[2] + z_axis[2]],
-                mode='lines',
-                line=dict(color='blue', width=4),
-                showlegend=(t == 0),
-                name='Z-axis (Up/Thrust)' if t == 0 else None,
-                legendgroup='z_axis'
-            ))
-
-    x_vals = [traj_xyz[:, 0]]
-    y_vals = [traj_xyz[:, 1]]
-    z_vals = [traj_xyz[:, 2]]
-
-    if hasattr(env, 'voxels') and env.voxels.numel() > 0:
-        vox = env.voxels[idx].detach().cpu().numpy()
-        vox = vox[(vox[:, 3:6] < 20).all(axis=1)]
-        for box in vox[:180]:
-            if hide_relaxed_ceiling and _is_top_ceiling_voxel_relaxed(box, env):
-                continue
-            if _is_ceiling_voxel(box, env) or _is_boundary_wall_voxel(box, env):
-                continue
-            cx, cy, cz, hx, hy, hz = box.tolist()
-            _plotly_add_cuboid(fig, cx, cy, cz, hx, hy, hz, color='lightgray', opacity=0.7)
-            x_vals.extend([[cx - hx], [cx + hx]])
-            y_vals.extend([[cy - hy], [cy + hy]])
-            z_vals.extend([[cz - hz], [cz + hz]])
-
-    if hasattr(env, 'balls') and env.balls.numel() > 0:
-        balls = env.balls[idx].detach().cpu().numpy()
-        for bx, by, bz, br in balls[:80]:
-            _plotly_add_sphere(fig, float(bx), float(by), float(bz), float(br), color='royalblue', opacity=0.78, res=14)
-            x_vals.extend([[bx - br], [bx + br]])
-            y_vals.extend([[by - br], [by + br]])
-            z_vals.extend([[bz - br], [bz + br]])
-
-    z0_vis, z1_vis = 0.0, 5.0
-    if hasattr(env, 'cyl') and env.cyl.numel() > 0:
-        cyl = env.cyl[idx].detach().cpu().numpy()
-        for cx, cy, cr in cyl[:100]:
-            _plotly_add_cylinder_z(fig, float(cx), float(cy), float(cr), z0_vis, z1_vis, color='teal', opacity=0.76)
-            x_vals.extend([[cx - cr], [cx + cr]])
-            y_vals.extend([[cy - cr], [cy + cr]])
-
-    y0_vis, y1_vis = -9.5, 9.5
-    if hasattr(env, 'cyl_h') and env.cyl_h.numel() > 0:
-        cyl_h = env.cyl_h[idx].detach().cpu().numpy()
-        for cx, cz, cr in cyl_h[:100]:
-            _plotly_add_cylinder_y(fig, float(cx), float(cz), float(cr), y0_vis, y1_vis, color='darkorange', opacity=0.76)
-            x_vals.extend([[cx - cr], [cx + cr]])
-            z_vals.extend([[cz - cr], [cz + cr]])
-
-    fig.add_trace(go.Scatter3d(x=[traj_xyz[0, 0]], y=[traj_xyz[0, 1]], z=[traj_xyz[0, 2]], mode='markers',
-                               marker=dict(size=6, color='green', symbol='circle'), name='Start'))
-    fig.add_trace(go.Scatter3d(x=[traj_xyz[-1, 0]], y=[traj_xyz[-1, 1]], z=[traj_xyz[-1, 2]], mode='markers',
-                               marker=dict(size=6, color='black', symbol='x'), name='End'))
-    if hasattr(env, 'p_target'):
-        tgt = env.p_target[idx].detach().cpu().numpy()
-        fig.add_trace(go.Scatter3d(x=[tgt[0]], y=[tgt[1]], z=[tgt[2]], mode='markers',
-                                   marker=dict(size=8, color='red', symbol='diamond'), name='Goal'))
-        x_vals.append([tgt[0]])
-        y_vals.append([tgt[1]])
-        z_vals.append([tgt[2]])
-
-    if astar_path is not None and len(astar_path) > 0:
-        x_vals.append(astar_path[:, 0])
-        y_vals.append(astar_path[:, 1])
-        z_vals.append(astar_path[:, 2])
-
-    if astar_paths_sampled is not None:
-        for item in astar_paths_sampled:
-            if not (isinstance(item, (tuple, list)) and len(item) == 2):
-                continue
-            _, path = item
-            if path is None:
-                continue
-            try:
-                path_arr = path.detach().cpu().numpy() if isinstance(path, torch.Tensor) else np.asarray(path)
-                if path_arr.ndim == 1 and path_arr.size == 3:
-                    path_arr = path_arr.reshape(1, 3)
-                if path_arr.ndim == 2 and path_arr.shape[1] == 3 and path_arr.shape[0] > 0:
-                    x_vals.append(path_arr[:, 0])
-                    y_vals.append(path_arr[:, 1])
-                    z_vals.append(path_arr[:, 2])
-            except Exception:
-                continue
-
-    x_all = np.concatenate([np.asarray(v) for v in x_vals])
-    y_all = np.concatenate([np.asarray(v) for v in y_vals])
-    z_all = np.concatenate([np.asarray(v) for v in z_vals])
-
-    fig.update_layout(
-        title='Interactive 3D Trajectory & Obstacles',
-        scene=dict(
-            xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)',
-            xaxis=dict(range=[float(x_all.min()) - 0.5, float(x_all.max()) + 0.5]),
-            yaxis=dict(range=[float(y_all.min()) - 0.5, float(y_all.max()) + 0.5]),
-            zaxis=dict(range=[float(z_all.min()) - 0.2, float(z_all.max()) + 0.2]),
-            aspectmode='data',
-            camera=dict(eye=dict(x=1.6, y=1.4, z=1.2))
-        ),
-        template='plotly_white',
-        showlegend=True,
-        margin=dict(l=5, r=5, t=40, b=5)
-    )
-    fig.write_html(html_path, include_plotlyjs='cdn')
-    return True
-
-
-class _VizEnvSnapshot:
-    pass
-
-
-@torch.no_grad()
-def snapshot_env_for_viz(env_obj, idx=0):
-    """Capture just the map/target tensors needed by the visualization helpers."""
-    snap = _VizEnvSnapshot()
-    for name in ('voxels', 'balls', 'cyl', 'cyl_h'):
-        if hasattr(env_obj, name):
-            value = getattr(env_obj, name)
-            if isinstance(value, torch.Tensor):
-                setattr(snap, name, value[idx:idx + 1].detach().cpu().clone())
-    if hasattr(env_obj, 'p_target') and isinstance(env_obj.p_target, torch.Tensor):
-        snap.p_target = env_obj.p_target[idx:idx + 1].detach().cpu().clone()
-    for name in ('map_x_max', 'map_y_min', 'map_y_max', 'map_z_max', 'boundary_half'):
-        if hasattr(env_obj, name):
-            setattr(snap, name, float(getattr(env_obj, name)))
-    return snap
-
-
-def _depth_frames_to_video(depth_stack, mp4_path, gif_path, step, tb_tag_prefix):
-    if depth_stack is None or depth_stack.numel() == 0:
-        return
-    depth_stack = depth_stack.float()
-    inv_depth = 3.0 / depth_stack.clamp(0.3, 24.0) - 0.6
-    p2 = torch.quantile(inv_depth, 0.02)
-    p98 = torch.quantile(inv_depth, 0.98)
-    inv_norm = ((inv_depth - p2) / (p98 - p2 + 1e-6)).clamp(0.0, 1.0)
-
-    cmap_np = plt.get_cmap('magma')
-    inv_np = inv_norm.cpu().numpy()
-    frames = []
-    for frame_idx in range(inv_np.shape[0]):
-        rgb = (cmap_np(inv_np[frame_idx])[..., :3] * 255.0).astype('uint8')
-        frames.append(rgb)
-
-    if imageio is not None:
-        try:
-            imageio.mimsave(mp4_path, frames, fps=15, macro_block_size=None)
-            writer.add_text(f'{tb_tag_prefix}/Depth_Video', mp4_path, step)
-            return
-        except Exception:
-            imageio.mimsave(gif_path, frames, format='GIF', fps=15)
-            writer.add_text(f'{tb_tag_prefix}/Depth_Video', gif_path, step)
-            return
-
-    depth_uint8 = (inv_norm * 255).to(torch.uint8)
-    for frame_idx, frame in enumerate(depth_uint8):
-        writer.add_image(f'{tb_tag_prefix}/Depth_Frame/{frame_idx:03d}', frame.unsqueeze(0), step)
-
-
-def save_cached_viz_record(record, save_step):
-    map_type = str(record['map_type'])
-    source_iter = int(record['iter'])
-    idx = 0
-    p_cpu = record['p_cpu']
-    v_cpu = record['v_cpu']
-    rpy_cpu = record['rpy_cpu']
-    R_cpu = record['R_cpu']
-    act_cpu = record['act_cpu']
-    w_cpu = record['weights_cpu']
-    env_snapshot = record['env_snapshot']
-    astar_paths_sampled = record.get('astar_paths_sampled', [])
-
-    tag_prefix = f'Trajectory/{map_type}'
-    debug_prefix = f'Debug/{map_type}'
-    # Put save_step first so plain filename sorting follows training chronology.
-    file_prefix = f'save_{save_step:06d}_src_{source_iter:06d}_{map_type}'
-
-    fig_p, ax = plt.subplots()
-    ax.plot(p_cpu[:, 0], label='x')
-    ax.plot(p_cpu[:, 1], label='y')
-    ax.plot(p_cpu[:, 2], label='z')
-    ax.legend()
-    ax.set_title(f"{map_type} source iter {source_iter} Pos")
-    writer.add_figure(f'{tag_prefix}/Position_Series', fig_p, save_step)
-    plt.close(fig_p)
-
-    potential_map_data = None
-    map_idx = int(record.get('map_idx', -1))
-    if args.use_precomputed_potential_maps and POTENTIAL_MAP_CACHE is not None and map_idx >= 0:
-        potential_map_data = POTENTIAL_MAP_CACHE.get_map(map_idx)
-
-    interactive_html = os.path.join(video_dir, f'trajectory3d_{file_prefix}.html')
-    if save_interactive_3d_html(
-        interactive_html, env_snapshot, p_cpu, v_cpu, R_cpu=R_cpu, idx=idx,
-        astar_path=None, astar_paths_sampled=astar_paths_sampled,
-        potential_map_data=potential_map_data,
-        show_potential_overlay=potential_map_data is not None,
-        map_type=map_type,
-    ):
-        writer.add_text(f'{tag_prefix}/Interactive3D_HTML', interactive_html, save_step)
-
-    # TensorBoard potential-field figure logging is intentionally disabled.
-
-    fig_v, ax = plt.subplots()
-    ax.plot(v_cpu[:, 0], label='vx')
-    ax.plot(v_cpu[:, 1], label='vy')
-    ax.plot(v_cpu[:, 2], label='vz')
-    ax.plot(v_cpu.norm(dim=-1), label='speed', linestyle='--')
-    ax.legend()
-    ax.set_title(f"{map_type} source iter {source_iter} Velocity")
-    writer.add_figure(f'{tag_prefix}/Velocity_Series', fig_v, save_step)
-    plt.close(fig_v)
-
-    fig_rpy, ax = plt.subplots()
-    ax.plot(rpy_cpu[:, 0], label='roll(deg)')
-    ax.plot(rpy_cpu[:, 1], label='pitch(deg)')
-    ax.plot(rpy_cpu[:, 2], label='yaw(deg)')
-    ax.legend()
-    ax.set_title(f"{map_type} source iter {source_iter} Attitude RPY")
-    writer.add_figure(f'{tag_prefix}/Attitude_RPY_Series', fig_rpy, save_step)
-    plt.close(fig_rpy)
-
-    fig_act, ax = plt.subplots()
-    ax.plot(act_cpu[:, 0], label='ax_cmd')
-    ax.plot(act_cpu[:, 1], label='ay_cmd')
-    ax.plot(act_cpu[:, 2], label='az_cmd')
-    ax.plot(act_cpu.norm(dim=-1), label='|a_cmd|', linestyle='--')
-    ax.legend()
-    ax.set_title(f"{map_type} source iter {source_iter} Control Accel Cmd")
-    writer.add_figure(f'{tag_prefix}/Control_Accel_Cmd_Series', fig_act, save_step)
-    plt.close(fig_act)
-
-    write_debug_tb = is_debug_tb_step(save_step)
-    if write_debug_tb:
-        labels = ['SpeedPref_Signed', 'SpeedPref_Strength', 'Direction', 'Avoidance', 'Exploration', 'Turn', 'VRef']
-        tag_suffix = ['0_SpeedPref_Signed', '0_1_SpeedPref_Strength', '1_Direction', '2_Avoidance', '3_Exploration', '4_Turn', '5_VRef']
-        for wi in range(min(len(labels), w_cpu.shape[-1])):
-            fig_wi, ax = plt.subplots()
-            ax.plot(w_cpu[:, wi], label=labels[wi])
-            ax.legend()
-            ax.set_title(f"{map_type} source iter {source_iter} Weight - {labels[wi]}")
-            writer.add_figure(f'{debug_prefix}/Weights_StepWise_{tag_suffix[wi]}', fig_wi, save_step)
-            plt.close(fig_wi)
-
-    depth_stack = record.get('depth_stack', None)
-    if depth_stack is not None:
-        mp4_path = os.path.join(video_dir, f'depth_{file_prefix}.mp4')
-        gif_path = os.path.join(video_dir, f'depth_{file_prefix}.gif')
-        _depth_frames_to_video(depth_stack, mp4_path, gif_path, save_step, f'Video/{map_type}')
-
-    if write_debug_tb:
-        weights_snapshot = record['weights_snapshot']
-        raw_snapshot = record['raw_snapshot']
-        write_scalar_dict(
-            writer,
-            {
-                f'{debug_prefix}/Source_Iter': source_iter,
-                f'{debug_prefix}/Map_Index': map_idx,
-                f'{debug_prefix}/Weights_Snapshot/0_SpeedPref_Signed': weights_snapshot[0],
-                f'{debug_prefix}/Weights_Snapshot/0_1_SpeedPref_Strength': weights_snapshot[1],
-                f'{debug_prefix}/Weights_Snapshot/1_Direction': weights_snapshot[2],
-                f'{debug_prefix}/Weights_Snapshot/2_Avoidance': weights_snapshot[3],
-                f'{debug_prefix}/Weights_Snapshot/3_Exploration': weights_snapshot[4],
-                f'{debug_prefix}/Weights_Snapshot/4_Turn': weights_snapshot[5],
-                f'{debug_prefix}/Weights_Snapshot/5_VRef': weights_snapshot[6],
-                f'{debug_prefix}/Weights_Snapshot/Std': weights_snapshot.std(unbiased=False),
-                f'{debug_prefix}/Weights_Snapshot/Raw_Min': raw_snapshot.min(),
-                f'{debug_prefix}/Weights_Snapshot/Raw_Max': raw_snapshot.max(),
-                f'{debug_prefix}/Weights_Snapshot/Raw_Mean': raw_snapshot.mean(),
-            },
-            save_step,
-        )
-
-
-@torch.no_grad()
-def get_collision_wall_patches(points_xyz, walls, drone_radius, segment_len=0.45, contact_eps=0.02):
-    if points_xyz.numel() == 0 or walls.numel() == 0:
-        return []
-
-    wall_mask = (
-        (walls[:, 2] >= 0.1)
-        & (walls[:, 2] <= 1.9)
-        & (walls[:, 5] > 0.5)
-    )
-    walls = walls[wall_mask]
-    if walls.numel() == 0:
-        return []
-
-    centers = walls[:, :3]
-    half = walls[:, 3:]
-    wall_min = centers - half
-    wall_max = centers + half
-    axis_is_x = half[:, 0] <= half[:, 1]
-
-    points_expanded = points_xyz.unsqueeze(1)
-    nearest = torch.minimum(torch.maximum(points_expanded, wall_min.unsqueeze(0)), wall_max.unsqueeze(0))
-    clearance = (nearest - points_expanded).norm(dim=-1) - float(drone_radius)
-    contact_steps = torch.nonzero(clearance.min(dim=1).values <= contact_eps, as_tuple=False).flatten().tolist()
-
-    wall_intervals = defaultdict(list)
-    for step_idx in contact_steps:
-        wall_idx = int(clearance[step_idx].argmin().item())
-        if float(clearance[step_idx, wall_idx].item()) > contact_eps:
-            continue
-
-        point = points_xyz[step_idx]
-        center = centers[wall_idx]
-        wall_half = half[wall_idx]
-
-        if bool(axis_is_x[wall_idx]):
-            tangent_min = float(center[1] - wall_half[1])
-            tangent_max = float(center[1] + wall_half[1])
-            tangent_center = min(max(float(point[1]), tangent_min), tangent_max)
-        else:
-            tangent_min = float(center[0] - wall_half[0])
-            tangent_max = float(center[0] + wall_half[0])
-            tangent_center = min(max(float(point[0]), tangent_min), tangent_max)
-
-        seg_half = min(0.5 * float(segment_len), 0.5 * (tangent_max - tangent_min))
-        seg_start = max(tangent_min, tangent_center - seg_half)
-        seg_end = min(tangent_max, tangent_center + seg_half)
-        if seg_end - seg_start <= 1e-4:
-            continue
-        wall_intervals[wall_idx].append((seg_start, seg_end))
-
-    patches = []
-    for wall_idx, intervals in wall_intervals.items():
-        center = centers[wall_idx]
-        wall_half = half[wall_idx]
-        for seg_start, seg_end in merge_intervals(intervals, min_gap=0.02):
-            if bool(axis_is_x[wall_idx]):
-                patches.append({
-                    'xy': (float(center[0] - wall_half[0]), seg_start),
-                    'width': float(2.0 * wall_half[0]),
-                    'height': float(seg_end - seg_start),
-                })
-            else:
-                patches.append({
-                    'xy': (seg_start, float(center[1] - wall_half[1])),
-                    'width': float(seg_end - seg_start),
-                    'height': float(2.0 * wall_half[1]),
-                })
-    return patches
-
-def compute_overlap_loss_per_step(p_history, sigma=0.5, time_window=10):
-    """
-    Step-wise 重叠损失计算
-    返回: [Batch, Time] (注意: 调用处需要permute)
-    """
-    # Use squared-distance RBF directly (without sqrt/cdist) so 2nd-order gradients
-    # stay well-behaved when trajectory points overlap exactly.
-    p_history = p_history.permute(1, 0, 2)  # [B, T, 3]
-    n_batch, n_points, _ = p_history.shape
-    device = p_history.device
-    dtype = p_history.dtype
-
-    time_window = max(0, int(time_window))
-    sigma = max(float(sigma), 1e-4)
-
-    if n_points <= 1:
-        return torch.zeros((n_batch, n_points), device=device, dtype=dtype)
-    # Keep at least one valid long-range pair. Otherwise the mask becomes all-zero
-    # and exploration term is permanently zero when time_window ~= rollout length.
-    max_effective_window = max(0, n_points - 2)
-    time_window = min(time_window, max_effective_window)
-
-    # Pairwise squared distances: [B, T, T]
-    pair_delta = p_history[:, :, None, :] - p_history[:, None, :, :]
-    sq_dist = (pair_delta * pair_delta).sum(dim=-1)
-    sq_dist = sanitize_tensor(sq_dist, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
-    inv_two_sigma2 = 0.5 / (sigma * sigma)
-    overlap_energy = torch.exp(-sq_dist * inv_two_sigma2)
-
-    indices = torch.arange(n_points, device=device)
-    time_diff = torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1))
-    mask = (time_diff > time_window).to(dtype=dtype)  # [T, T]
-
-    # Step-wise mean overlap energy with temporal exclusion mask.
-    energy_sum = (overlap_energy * mask.unsqueeze(0)).sum(dim=2)  # [B, T]
-    mask_sum = mask.sum(dim=1).unsqueeze(0).clamp_min(1.0)  # [1, T]
-
-    return energy_sum / mask_sum
-
-
-def compute_turn_preference_loss(v_history, speed_threshold=0.2, turn_window=8):
-    """
-    转弯偏好损失：
-    仅在水平面 (x-y) 上定义航向变化，不把 z 方向速度变化计入“转弯”。
-    使用水平速度单位向量点积衡量方向一致性，避免速度幅值直接主导损失。
-
-    输入:
-        v_history: [T, B, 3]
-    输出:
-        loss_turn_seq: [T, B]
-    """
-    return compute_turn_preference_loss_xy_windowed(
-        v_history=v_history,
-        speed_threshold=speed_threshold,
-        window=turn_window,
-    )
-
-
-def compute_stuck_loss(p_history, collision_depth, stuck_window=15, displacement_threshold=0.3):
-    """
-    计算卡住惩罚损失
-
-    检测两种卡住状态：
-    1. 局部窗口内位移过小
-    2. 持续碰撞状态
-    """
-    T, B, _ = p_history.shape
-    device = p_history.device
-
-    loss_stuck = torch.zeros((T, B), device=device)
-    if T > stuck_window:
-        for t in range(stuck_window, T):
-            window_start = t - stuck_window
-            displacement = safe_l2_norm(p_history[t] - p_history[window_start], dim=-1)  # [B]
-            loss_stuck[t] = F.softplus((displacement_threshold - displacement) * 10.0)
-
-    in_collision = (collision_depth > 0).float()  # [T, B]
-    loss_collision_duration = torch.zeros_like(in_collision)
-
-    collision_streak = torch.zeros((B,), device=device)
-    for t in range(T):
-        collision_streak = collision_streak * in_collision[t] + in_collision[t]
-        loss_collision_duration[t] = collision_streak * in_collision[t]
-
-    with torch.no_grad():
-        stuck_mask = loss_stuck > 0.5
-        stuck_ratio = stuck_mask.float().mean()
-
-    return loss_stuck, loss_collision_duration, stuck_ratio
-
-
-def unrolled_meta_rollout(
-    env,
-    worknet,
-    fast_params,
-    state_normalizer,
-    geom_normalizer,
-    progress_normalizer,
-    args,
-    B,
-    device,
-    iter_idx=0,
-):
-    """
-    Validation rollout with virtually-updated worker params (via functional_call).
-    Computes and returns meta_loss (position + collision + height) plus components.
-    Control effort is tracked for monitoring but is not included in optimization target.
-    LGN is NOT needed here; this meta loss is task-performance based.
-    Reuses the same maze layout for consistent LGN signal.
-    """
-    # 保持同一张迷宫布局, 仅重置无人机状态用于验证rollout
-    env.reset_drone_only()
-
-    p_list, v_list, a_list, vec_list = [], [], [], []
-    dist_obj_list = []
-    act_buf = [env.act.detach()] * 2
-    v_preds_val = []
-    h_val = None
-    yaw_rate_max_value = math.radians(float(args.yaw_rate_max_deg))
-
-    for t in range(args.lgn_timesteps):
-        ctl_dt = 1.0 / 15.0
-        depth, flow = env.render(ctl_dt)
-        depth = sanitize_tensor(depth, nan=24.0, posinf=24.0, neginf=0.3)
-
-        p_list.append(env.p)
-        v_list.append(env.v)
-        a_list.append(env.a)
-        vec_curr = env.find_vec_to_nearest_pt()
-        vec_list.append(vec_curr)
-        dist_obj_curr = safe_l2_norm(vec_curr, dim=-1) - env.margin
-        dist_obj_list.append(dist_obj_curr)
-
-        target_v_raw = env.p_target - env.p.detach()
-        target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
-        max_speed = torch.as_tensor(env.max_speed, device=target_v_norm.device,
-                                    dtype=target_v_norm.dtype)
-        target_v = (target_v_raw / (target_v_norm + 1e-6)) * torch.minimum(target_v_norm, max_speed)
-
-        R = build_yaw_frame(env.R) if args.attitude_model == 'v2' else env.R
-        state_list = [torch.squeeze(target_v[:, None] @ R, 1), env.R[:, 2], env.margin[:, None]]
-        if args.attitude_model == 'v2':
-            heading_ref_world, heading_ref_local_xy, _ = compute_heading_reference(env, R)
-            yaw_rate_norm = getattr(env, "yaw_rate", torch.zeros((B, 1), device=device)) / float(yaw_rate_max_value)
-            state_list.extend([heading_ref_local_xy, yaw_rate_norm])
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom:
-            state_list.insert(0, local_v)
-
-        raw_state = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        state_t = state_normalizer(raw_state, update=False)  # 不更新统计量
-        state_t = sanitize_tensor(state_t, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
-        x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        geom_feat_raw = extract_depth_geometry_features(depth)
-        geom_feat = geom_normalizer(geom_feat_raw, update=False)
-        geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        progress_feat_base_raw = extract_progress_features(
-            p_history_list=p_list,
-            v_history_list=v_list,
-            dist_obj_history_list=dist_obj_list,
-            p_target=env.p_target,
-            window=8,
-        )
-        context_feat_raw = extract_worker_context_features(
-            p_history_list=p_list,
-            p_target=env.p_target,
-            R_current=R,
-        )
-        progress_feat_raw = torch.cat([progress_feat_base_raw, context_feat_raw], dim=-1)
-        progress_feat = progress_normalizer(progress_feat_raw, update=False)
-        progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        # Worker forward with virtually-updated params
-        worker_input = torch.cat([state_t, geom_feat, progress_feat], dim=-1)
-        act_out, _, h_val = functional_call(worknet, fast_params, (x_pooled, worker_input, h_val))
-        act_out = sanitize_tensor(act_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-
-        if args.attitude_model == 'v2':
-            a_pred, v_pred, yaw_rate_cmd = decode_worker_action(act_out, R, yaw_rate_max_value)
-        else:
-            a_pred, v_pred, *_ = (R @ act_out.reshape(B, 3, -1)).unbind(-1)
-            yaw_rate_cmd = None
-        v_preds_val.append(v_pred)
-        real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
-        real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
-        act_buf.append(real_act)
-
-        if args.attitude_model == 'v2':
-            if args.heading_track_mode == 'v_pred':
-                heading_v_ref = v_pred
-            elif args.heading_track_mode == 'actual_v':
-                heading_v_ref = env.v
-            else:
-                v_pred_xy_speed = safe_l2_norm(v_pred[:, :2], dim=-1, keepdim=True)
-                heading_v_ref = torch.where(
-                    v_pred_xy_speed > float(args.heading_min_speed),
-                    v_pred,
-                    env.v,
-                )
-
-            heading_ref_world, heading_ref_local_xy, yaw_error_vel, yaw_rate_rule, heading_speed_xy = \
-                compute_velocity_heading_command(
-                    R_yaw=R,
-                    v_ref_world=heading_v_ref,
-                    yaw_rate_max_value=yaw_rate_max_value,
-                    yaw_kp=args.heading_yaw_kp,
-                    min_speed=args.heading_min_speed,
-                )
-
-            if yaw_rate_cmd is None:
-                yaw_rate_residual = torch.zeros((B, 1), device=device, dtype=real_act.dtype)
-            else:
-                yaw_rate_residual = yaw_rate_cmd
-
-            yaw_rate_cmd_final = yaw_rate_rule + float(args.heading_residual_scale) * yaw_rate_residual
-            yaw_rate_cmd_final = torch.clamp(
-                yaw_rate_cmd_final,
-                -float(yaw_rate_max_value),
-                float(yaw_rate_max_value),
-            )
-
-            env.run(
-                real_act,
-                ctl_dt,
-                heading_ref=heading_ref_world,
-                yaw_rate_cmd=yaw_rate_cmd_final,
-                yaw_rate_max=yaw_rate_max_value,
-            )
-        else:
-            env.run(real_act, ctl_dt, target_v_raw)
-
-        # Keep full horizon so in-goal staying can continuously accumulate arrival reward.
-
-        # 周期性截断以限制显存
-        if args.detach_interval > 0 and (t + 1) % args.detach_interval == 0:
-            if h_val is not None:
-                h_val = h_val.detach()
-
-    # --- 计算 Meta Loss ---
-    p_val = torch.stack(p_list)
-    a_val = torch.stack(a_list)
-    act_val = torch.stack(act_buf)
-    vec_val = torch.stack(vec_list)
-    if vec_val.dim() == 4:
-        vec_val = vec_val.mean(1)
-
-    dist_val = sanitize_tensor(safe_l2_norm(vec_val, dim=-1) - env.margin, nan=0.0, posinf=10.0, neginf=-10.0)
-
-    collision_depth_val = F.relu(-dist_val)
-    loss_stuck_val, loss_collision_duration_val, stuck_ratio = compute_stuck_loss(
-        p_val, collision_depth_val,
-        stuck_window=args.stuck_window,
-        displacement_threshold=args.stuck_displacement_threshold,
-    )
-
-    m_pos  = safe_l2_norm(p_val[-1] - env.p_target, dim=-1).mean()
-    m_arrival_reward, m_arrival_hit_rate, m_arrival_best_dist = compute_arrival_reward(
-        p_val,
-        env.p_target,
-        radius=args.meta_arrival_reward_radius,
-    )
-    with torch.no_grad():
-        v_to_pt = torch.ones_like(dist_val)
-        if dist_val.shape[0] > 1:
-            v_to_pt[1:] = (-torch.diff(dist_val, 1, 0) * 135.0).clamp_min(1.0)
-    m_coll = (F.softplus(dist_val.mul(-32.0)) * v_to_pt).mean()
-    m_ctrl = safe_l2_norm(act_val, dim=-1).sum()
-    m_jerk = act_val.diff(1, 0).mul(15.0).pow(2).sum(-1).mean()
-    m_snap = (F.normalize(act_val - env.g_std, dim=-1)
-              .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
-    # Meta rollout 的高度惩罚，与主训练分支保持一致
-    m_height = (F.smooth_l1_loss(p_val[:, :, 2], torch.full_like(p_val[:, :, 2], 1.0), reduction='none')
-               + F.softplus((p_val[:, :, 2] - 5.0) * 20.0)
-               + F.softplus((0.0 - p_val[:, :, 2]) * 20.0)).mean()
-
-    v_preds_val_tensor = torch.stack(v_preds_val)  # [T, B, 3]
-    v_val = torch.stack(v_list)  # [T, B, 3]
-    m_v_pred = F.mse_loss(v_preds_val_tensor, v_val.detach())
-    m_stuck = loss_stuck_val.mean()
-
-    # 全局规划引导损失：始终进入 unrolled 二阶链路
-    m_guidance, _ = compute_global_guidance_meta_loss(
-        env, p_val, v_val, env.p_target, vec_val, dist_val,
-        a_history=a_val,
-        sample_count=args.guide_sample_count,
-        strategy=args.guide_sample_strategy,
-        max_speed=float(env.max_speed),
-        max_accel=args.guide_max_accel,
-        max_decel=args.guide_max_decel,
-        dir_weight=args.guide_dir_weight,
-        speed_weight=args.guide_speed_weight,
-        lateral_weight=args.guide_lateral_weight,
-        escape_weight=args.guide_escape_weight,
-        collision_threshold=args.guide_collision_threshold,
-        accel_weight=args.guide_accel_weight,
-        speed_diff_weight=args.guide_speed_diff_weight,
-        recovery_speed_weight=args.guide_recovery_speed_weight,
-    )
-
-    meta_val = (
-        m_pos
-        + m_coll
-        + m_height
-        + args.meta_guidance_weight * m_guidance
-        + args.meta_smooth_jerk_weight * m_jerk
-        + args.meta_smooth_snap_weight * m_snap
-        + args.meta_smooth_v_pred_weight * m_v_pred
-        + args.stuck_loss_weight * m_stuck
-        - args.meta_arrival_reward_weight * m_arrival_reward
-    )
-    return meta_val, m_pos, m_coll, m_ctrl, m_arrival_reward, m_arrival_hit_rate, m_arrival_best_dist
 
 ########## 7. 训练主循环 ##########
 
@@ -3932,6 +593,8 @@ current_precomputed_stage_update_count = 0
 current_precomputed_active_types = ""
 precomputed_type_offsets = defaultdict(int)
 latest_viz_by_map_type = {map_type: None for map_type in VIZ_MAP_TYPES}
+best_meta_loss = float('inf')
+best_meta_loss_step = 0
 
 terminal_log_interval = max(1, int(args.terminal_log_interval))
 tb_scalar_interval = int(args.debug_scalar_interval)
@@ -3939,9 +602,6 @@ pbar = tqdm(range(args.num_iters), ncols=120, miniters=terminal_log_interval)
 B = args.batch_size
 cycle_len = args.lgn_steps + args.worker_steps
 maze_update_counter = 0
-meta_lgn_grad_window = deque(maxlen=20)
-
-state_normalizer.train()
 
 for i in pbar:
     term_log_now = ((i + 1) % terminal_log_interval == 0)
@@ -3952,12 +612,11 @@ for i in pbar:
             or ((i + 1) == args.num_iters)
         )
     )
-    debug_tb_log_now = is_debug_tb_iter(i)
     cycle_pos = i % cycle_len
     train_lgn_phase = cycle_pos < args.lgn_steps
     phase_str = f"LGN ({cycle_pos+1}/{args.lgn_steps})" if train_lgn_phase else f"Work ({cycle_pos-args.lgn_steps+1}/{args.worker_steps})"
     env.set_meta_differentiable_mode(train_lgn_phase)
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         print(
             f"[DIAG iter={i}] phase={phase_str}, train_lgn_phase={train_lgn_phase}, "
             f"cycle_pos={cycle_pos}, cycle_len={cycle_len}, lgn_steps={args.lgn_steps}, worker_steps={args.worker_steps}"
@@ -3997,7 +656,7 @@ for i in pbar:
                 f"type={current_precomputed_map_type}, file={current_precomputed_map_file}"
             )
             if tb_log_now or stage_changed:
-                _resolve_tb_writer(current_precomputed_map_type).add_text(
+                _resolve_tb_writer(current_precomputed_map_type, writer, map_writers).add_text(
                     "Map/Current_Precomputed_File",
                     map_msg,
                     i + 1,
@@ -4024,7 +683,6 @@ for i in pbar:
     trajectory_lgn_weights = []
     trajectory_lgn_vrefs = []
     R_proxy_history = []
-    v_preds = []
     yaw_rate_cmd_history = []
     yaw_error_history = []
     act_for_diag = None
@@ -4072,16 +730,23 @@ for i in pbar:
         local_v = torch.squeeze(env.v[:, None] @ R, 1)
         if not args.no_odom: state_list.insert(0, local_v)
         
-        raw_state_tensor = sanitize_tensor(torch.cat(state_list, -1), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        state_tensor = state_normalizer(raw_state_tensor, update=True)
-        state_tensor = sanitize_tensor(state_tensor, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        state_tensor = sanitize_tensor(
+            torch.cat(state_list, -1),
+            nan=0.0,
+            posinf=10.0,
+            neginf=-10.0,
+        ).clamp(-10.0, 10.0)
 
         x_pooled = F.max_pool2d((3 / depth.clamp(0.3, 24) - 0.6)[:, None], 4, 4)
         x_pooled = sanitize_tensor(x_pooled, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
-        geom_feat_raw = extract_depth_geometry_features(depth)
-        geom_feat = geom_normalizer(geom_feat_raw, update=True)
-        geom_feat = sanitize_tensor(geom_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        geom_feat = extract_depth_geometry_features(depth)
+        geom_feat = sanitize_tensor(
+            geom_feat,
+            nan=0.0,
+            posinf=10.0,
+            neginf=-10.0,
+        ).clamp(-10.0, 10.0)
 
         progress_feat_base_raw = extract_progress_features(
             p_history_list=p_history,
@@ -4095,9 +760,13 @@ for i in pbar:
             p_target=env.p_target,
             R_current=R,
         )
-        progress_feat_raw = torch.cat([progress_feat_base_raw, context_feat_raw], dim=-1)
-        progress_feat = progress_normalizer(progress_feat_raw, update=True)
-        progress_feat = sanitize_tensor(progress_feat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        progress_feat = torch.cat([progress_feat_base_raw, context_feat_raw], dim=-1)
+        progress_feat = sanitize_tensor(
+            progress_feat,
+            nan=0.0,
+            posinf=10.0,
+            neginf=-10.0,
+        ).clamp(-10.0, 10.0)
         geom_feat_last = geom_feat
         progress_feat_last = progress_feat
 
@@ -4122,7 +791,7 @@ for i in pbar:
                     lgn_hx,
                 )
 
-        if t == 0 and _diag_should_log(i):
+        if t == 0 and _diag_should_log(i, args):
             first_lgn_weight = current_weights[0, 0] if current_weights.numel() > 0 else None
             print(
                 f"[DIAG iter={i} t=0] current_weights={_diag_grad_meta(current_weights)}, "
@@ -4148,29 +817,14 @@ for i in pbar:
         act, _, h = worknet(x_pooled, worker_input, h)
         act = sanitize_tensor(act, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         act_for_diag = act
-        if use_attitude_v2:
-            a_pred, v_pred, yaw_rate_cmd = decode_worker_action(act, R, yaw_rate_max)
-        else:
-            a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
-            yaw_rate_cmd = None
-        v_preds.append(v_pred)
-        real_act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
+        a_pred, yaw_rate_cmd = decode_worker_action(act, R, yaw_rate_max)
+        real_act = a_pred
         real_act = sanitize_tensor(real_act, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
         real_act_history.append(real_act.detach())
         act_buffer.append(real_act)
 
         if use_attitude_v2:
-            if args.heading_track_mode == 'v_pred':
-                heading_v_ref = v_pred
-            elif args.heading_track_mode == 'actual_v':
-                heading_v_ref = env.v
-            else:
-                v_pred_xy_speed = safe_l2_norm(v_pred[:, :2], dim=-1, keepdim=True)
-                heading_v_ref = torch.where(
-                    v_pred_xy_speed > float(args.heading_min_speed),
-                    v_pred,
-                    env.v,
-                )
+            heading_v_ref = env.v
 
             heading_ref_world, heading_ref_local_xy, yaw_error_vel, yaw_rate_rule, heading_speed_xy = \
                 compute_velocity_heading_command(
@@ -4222,7 +876,6 @@ for i in pbar:
     weights_seq = torch.stack(trajectory_lgn_weights)  # [T, B, 7]
     vref_body_seq = torch.stack(trajectory_lgn_vrefs)  # [T, B, 3]
     R_proxy_seq = torch.stack(R_proxy_history)         # [T, B, 3, 3]
-    v_preds_tensor = torch.stack(v_preds)              # [T, B, 3], world frame
     v_real_body_seq = torch.squeeze(v_history[:, :, None, :] @ R_proxy_seq, 2)
     v_real_body_dir = safe_normalize(v_real_body_seq, dim=-1)
     vref_body_dir = safe_normalize(vref_body_seq, dim=-1)
@@ -4233,8 +886,10 @@ for i in pbar:
         p_history=p_history,
         vref_body_seq=vref_body_seq,
         R_proxy_seq=R_proxy_seq,
+        config=args,
+        potential_map_cache=POTENTIAL_MAP_CACHE,
     )
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         print(f"[DIAG iter={i}] weights_seq: {_diag_grad_meta(weights_seq)}")
         if train_lgn_phase and not weights_seq.requires_grad:
             print(
@@ -4280,8 +935,9 @@ for i in pbar:
     ).permute(1, 0)
     loss_turn_base_seq = compute_turn_preference_loss(
         v_history,
-        speed_threshold=0.2,
-        turn_window=int(args.turn_window),
+        speed_threshold=args.turn_speed_threshold,
+        speed_softness=args.turn_speed_softness,
+        soft_angle_deg=args.turn_soft_angle_deg,
     )
     loss_turn_seq = loss_turn_base_seq
     if use_attitude_v2 and len(yaw_rate_cmd_history) > 0:
@@ -4332,7 +988,6 @@ for i in pbar:
         stuck_window=args.stuck_window,
         displacement_threshold=args.stuck_displacement_threshold,
     )
-    loss_stuck_total = args.stuck_loss_weight * loss_stuck_seq.mean()
     actual_T = p_history.shape[0]
 
     # 高度约束损失 (固定权重, 不经LGN控制)
@@ -4345,7 +1000,7 @@ for i in pbar:
 
     # 非负权重策略：所有分量均不允许为负
     weights_seq_raw = weights_seq
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         print(f"[DIAG iter={i}] weights_seq_raw: requires_grad={weights_seq_raw.requires_grad}, grad_fn={type(weights_seq_raw.grad_fn).__name__ if weights_seq_raw.grad_fn else 'None'}")
         print(
             f"[DIAG iter={i}] loss_raw requires_grad: delta_speed={delta_speed_signed.requires_grad}, "
@@ -4355,7 +1010,7 @@ for i in pbar:
         )
     # LGN 输出已做约束：speed_pref_sign in [-1,1]，其余权重非负。
     effective_weights_seq = weights_seq_raw
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         print(
             f"[DIAG iter={i}] effective_weights: requires_grad={effective_weights_seq.requires_grad}, "
             f"grad_fn={type(effective_weights_seq.grad_fn).__name__ if effective_weights_seq.grad_fn else 'None'}"
@@ -4379,7 +1034,7 @@ for i in pbar:
 
     # 3. 最终 Proxy Loss
     proxy_loss = weighted_loss_map.mean() + loss_heading_safety
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         print(
             f"[DIAG iter={i}] weighted_loss_map: requires_grad={weighted_loss_map.requires_grad}, "
             f"grad_fn={type(weighted_loss_map.grad_fn).__name__ if weighted_loss_map.grad_fn else 'None'}"
@@ -4416,7 +1071,6 @@ for i in pbar:
         meta_loss_collision_seq = loss_collision_seq
         meta_loss_stuck_seq = loss_stuck_seq
         meta_loss_height_seq = loss_height_seq
-        meta_v_preds_tensor = v_preds_tensor
     else:
         meta_p_history = p_history.detach()
         meta_v_history = v_history.detach()
@@ -4425,7 +1079,6 @@ for i in pbar:
         meta_loss_collision_seq = loss_collision_seq.detach()
         meta_loss_stuck_seq = loss_stuck_seq.detach()
         meta_loss_height_seq = loss_height_seq.detach()
-        meta_v_preds_tensor = v_preds_tensor.detach()
 
     loss_meta_pos = safe_l2_norm(meta_p_history[-1] - env.p_target, dim=-1).mean()
     loss_meta_arrival_reward, meta_arrival_hit_rate, meta_arrival_best_dist = compute_arrival_reward(
@@ -4439,7 +1092,6 @@ for i in pbar:
     loss_meta_snap = (F.normalize(meta_act_buffer - env.g_std, dim=-1)
                       .diff(1, 0).diff(1, 0).mul(15.0 ** 2).pow(2).sum(-1).mean())
     loss_meta_height = meta_loss_height_seq.mean()
-    loss_meta_v_pred = F.mse_loss(meta_v_preds_tensor, meta_v_history.detach())
 
     # --- 全局规划引导损失 ---
     guidance_active_this_phase = bool(train_lgn_phase or args.guidance_all_phases)
@@ -4447,6 +1099,9 @@ for i in pbar:
         if train_lgn_phase:
             loss_meta_guidance, guidance_components = compute_global_guidance_meta_loss(
                 env, meta_p_history, meta_v_history, env.p_target, vec_to_pt, dist_obj,
+                config=args,
+                potential_map_cache=POTENTIAL_MAP_CACHE,
+                planner=global_planner,
                 a_history=meta_a_history,
                 sample_count=args.guide_sample_count,
                 strategy=args.guide_sample_strategy,
@@ -4471,6 +1126,9 @@ for i in pbar:
                     env.p_target,
                     vec_to_pt.detach(),
                     dist_obj.detach(),
+                    config=args,
+                    potential_map_cache=POTENTIAL_MAP_CACHE,
+                    planner=global_planner,
                     a_history=meta_a_history.detach(),
                     sample_count=args.guide_sample_count,
                     strategy=args.guide_sample_strategy,
@@ -4523,13 +1181,12 @@ for i in pbar:
         args.meta_guidance_weight * loss_meta_guidance +
         args.meta_smooth_jerk_weight * loss_meta_jerk +
         args.meta_smooth_snap_weight * loss_meta_snap +
-        args.meta_smooth_v_pred_weight * loss_meta_v_pred +
         args.stuck_loss_weight * loss_meta_stuck +
         loss_heading_safety +
         args.coef_yaw_smooth * loss_yaw_smooth
         - args.meta_arrival_reward_weight * loss_meta_arrival_reward
     )
-    if _diag_should_log(i):
+    if _diag_should_log(i, args):
         _diag_tensor_finite("loss_meta_pos", loss_meta_pos, i)
         _diag_tensor_finite("loss_meta_arrival_reward", loss_meta_arrival_reward, i)
         _diag_tensor_finite("loss_meta_coll", loss_meta_coll, i)
@@ -4537,7 +1194,6 @@ for i in pbar:
         _diag_tensor_finite("loss_meta_guidance", loss_meta_guidance, i)
         _diag_tensor_finite("loss_meta_jerk", loss_meta_jerk, i)
         _diag_tensor_finite("loss_meta_snap", loss_meta_snap, i)
-        _diag_tensor_finite("loss_meta_v_pred", loss_meta_v_pred, i)
         _diag_tensor_finite("loss_meta_stuck", loss_meta_stuck, i)
         _diag_tensor_finite("loss_heading_safety", loss_heading_safety, i)
         _diag_tensor_finite("loss_yaw_smooth", loss_yaw_smooth, i)
@@ -4553,39 +1209,14 @@ for i in pbar:
     worker_grad_nonfinite = 0.0
     worker_grad_elems = 0.0
     worker_clip_pre = 0.0
-    proxy_grad_speed_pref_reward = 0.0
-    proxy_grad_dir = 0.0
-    proxy_grad_avoid = 0.0
-    proxy_grad_expl = 0.0
-    proxy_grad_turn = 0.0
-    proxy_grad_vref = 0.0
-    proxy_grad_speed_pref_reward_nonfinite = 0.0
-    proxy_grad_dir_nonfinite = 0.0
-    proxy_grad_avoid_nonfinite = 0.0
-    proxy_grad_expl_nonfinite = 0.0
-    proxy_grad_turn_nonfinite = 0.0
-    proxy_grad_vref_nonfinite = 0.0
-    proxy_grad_speed_pref_reward_elems = 0.0
-    proxy_grad_dir_elems = 0.0
-    proxy_grad_avoid_elems = 0.0
-    proxy_grad_expl_elems = 0.0
-    proxy_grad_turn_elems = 0.0
-    proxy_grad_vref_elems = 0.0
     lgn_grad_norm = 0.0
     lgn_grad_max = 0.0
     lgn_grad_nonfinite = 0.0
     lgn_grad_elems = 0.0
     lgn_clip_pre = 0.0
-    meta_grad_window_mean = 0.0
-    meta_grad_window_min = 0.0
-    meta_grad_window_max = 0.0
-    meta_grad_window_finite_ratio = 0.0
-    meta_grad_window_nonzero_ratio = 0.0
     lgn_meta_probe_norm = 0.0
     lgn_meta_probe_nonfinite = 0.0
     lgn_meta_probe_elems = 0.0
-    lgn_step_skipped = 0.0
-    lgn_skip_code = 0.0
     meta_pos_ur = torch.tensor(0.0, device=device)
     meta_coll_ur = torch.tensor(0.0, device=device)
     meta_ctrl_ur = torch.tensor(0.0, device=device)
@@ -4606,32 +1237,6 @@ for i in pbar:
         if term_log_now:
             pbar.set_description(f"[{phase_str}] non-finite rollout skipped")
         continue
-
-    run_proxy_grad_diag = args.diag_proxy_worker_grads and _diag_should_log(i)
-    if run_proxy_grad_diag:
-        worker_params = tuple(worknet.parameters())
-        proxy_grad_speed_pref_reward, proxy_grad_speed_pref_reward_nonfinite, proxy_grad_speed_pref_reward_elems = \
-            get_loss_to_worker_grad_norm(weighted_speed_pref_reward_seq.mean(), worker_params)
-        proxy_grad_dir, proxy_grad_dir_nonfinite, proxy_grad_dir_elems = \
-            get_loss_to_worker_grad_norm(loss_direction_seq.mean(), worker_params)
-        proxy_grad_avoid, proxy_grad_avoid_nonfinite, proxy_grad_avoid_elems = \
-            get_loss_to_worker_grad_norm(loss_avoidance_seq.mean(), worker_params)
-        proxy_grad_expl, proxy_grad_expl_nonfinite, proxy_grad_expl_elems = \
-            get_loss_to_worker_grad_norm(loss_exploration_seq.mean(), worker_params)
-        proxy_grad_turn, proxy_grad_turn_nonfinite, proxy_grad_turn_elems = \
-            get_loss_to_worker_grad_norm(loss_turn_seq.mean(), worker_params)
-        proxy_grad_vref, proxy_grad_vref_nonfinite, proxy_grad_vref_elems = \
-            get_loss_to_worker_grad_norm(loss_lgn_vref_seq.mean(), worker_params)
-    if run_proxy_grad_diag:
-        print(
-            f"[DIAG iter={i}] loss_to_worker: "
-            f"speed_pref_reward={proxy_grad_speed_pref_reward:.6f} (NonFinite={proxy_grad_speed_pref_reward_nonfinite}/{proxy_grad_speed_pref_reward_elems}), "
-            f"dir={proxy_grad_dir:.6f} (NonFinite={proxy_grad_dir_nonfinite}/{proxy_grad_dir_elems}), "
-            f"avoid={proxy_grad_avoid:.6f} (NonFinite={proxy_grad_avoid_nonfinite}/{proxy_grad_avoid_elems}), "
-            f"expl={proxy_grad_expl:.6f} (NonFinite={proxy_grad_expl_nonfinite}/{proxy_grad_expl_elems}), "
-            f"turn={proxy_grad_turn:.6f} (NonFinite={proxy_grad_turn_nonfinite}/{proxy_grad_turn_elems}), "
-            f"vref={proxy_grad_vref:.6f} (NonFinite={proxy_grad_vref_nonfinite}/{proxy_grad_vref_elems})"
-        )
 
     if train_lgn_phase:
         # ===== Unrolled Bilevel: 可微内循环 =====
@@ -4654,7 +1259,7 @@ for i in pbar:
                 inner_scale = (args.inner_grad_clip / (inner_grad_norm_tensor + 1e-6)).clamp(max=1.0)
                 inner_grads = tuple((g * inner_scale) if g is not None else None for g in inner_grads)
 
-            if _inner == 0 and _diag_should_log(i):
+            if _inner == 0 and _diag_should_log(i, args):
                 fast_param_values = tuple(fast_params.values())
 
                 if args.diag_second_order:
@@ -4704,12 +1309,10 @@ for i in pbar:
             }
 
         if not inner_update_is_finite:
-            lgn_step_skipped = 1.0
-            lgn_skip_code = 1.0  # inner-update non-finite
             if term_log_now:
                 pbar.set_description(f"[{phase_str}] non-finite inner-update skipped")
         else:
-            if _diag_should_log(i):
+            if _diag_should_log(i, args):
                 fast_param_vals = list(fast_params.values())
                 if len(fast_param_vals) > 0:
                     _diag_tensor_finite("first_fast_param", fast_param_vals[0], i)
@@ -4722,21 +1325,18 @@ for i in pbar:
                     env,
                     worknet,
                     fast_params,
-                    state_normalizer,
-                    geom_normalizer,
-                    progress_normalizer,
                     args,
                     B,
                     device,
+                    POTENTIAL_MAP_CACHE,
+                    global_planner,
                     iter_idx=i,
                 )
             if not torch.isfinite(meta_loss_unrolled):
-                lgn_step_skipped = 1.0
-                lgn_skip_code = 2.0  # unrolled meta non-finite
                 if term_log_now:
                     pbar.set_description(f"[{phase_str}] non-finite unroll skipped")
             else:
-                if _diag_should_log(i):
+                if _diag_should_log(i, args):
                     print(
                         f"[DIAG iter={i}] meta_loss_unrolled: requires_grad={meta_loss_unrolled.requires_grad}, "
                         f"grad_fn={type(meta_loss_unrolled.grad_fn).__name__ if meta_loss_unrolled.grad_fn else 'None'}"
@@ -4766,9 +1366,7 @@ for i in pbar:
                 )
                 scaled_meta = scale_scalar_objective(meta_loss_unrolled)
                 if not meta_grad_usable:
-                    lgn_step_skipped = 1.0
-                    lgn_skip_code = 3.0  # meta probe unusable
-                    if _diag_should_log(i):
+                    if _diag_should_log(i, args):
                         print(
                             f"[DIAG iter={i}] skip LGN step: unusable meta gradients "
                             f"(meta_probe_norm={lgn_meta_probe_norm:.6f}, "
@@ -4781,34 +1379,10 @@ for i in pbar:
 
                     lgn_total.backward()
                     lgn_grad_norm, lgn_grad_max, lgn_grad_nonfinite, lgn_grad_elems = get_grad_stats(lgn)
-                    if _diag_should_log(i):
+                    if _diag_should_log(i, args):
                         print(
                             f"[DIAG iter={i}] lgn_grads: norm={lgn_grad_norm:.6f}, "
                             f"nonfinite={int(lgn_grad_nonfinite)}/{int(lgn_grad_elems)}, max={lgn_grad_max:.6f}"
-                        )
-                    if math.isfinite(lgn_grad_norm):
-                        meta_lgn_grad_window.append(float(lgn_grad_norm))
-                    else:
-                        meta_lgn_grad_window.append(float('nan'))
-
-                    valid_meta_grad = [g for g in meta_lgn_grad_window if math.isfinite(g)]
-                    if valid_meta_grad:
-                        meta_grad_window_mean = float(sum(valid_meta_grad) / len(valid_meta_grad))
-                        meta_grad_window_min = float(min(valid_meta_grad))
-                        meta_grad_window_max = float(max(valid_meta_grad))
-                    meta_grad_window_finite_ratio = float(
-                        sum(1 for g in meta_lgn_grad_window if math.isfinite(g)) / max(1, len(meta_lgn_grad_window))
-                    )
-                    meta_grad_window_nonzero_ratio = float(
-                        sum(1 for g in meta_lgn_grad_window if math.isfinite(g) and g > 0.0) / max(1, len(meta_lgn_grad_window))
-                    )
-
-                    if _diag_should_log(i):
-                        print(
-                            f"[DIAG iter={i}] meta_loss_unrolled->LGN grad window "
-                            f"len={len(meta_lgn_grad_window)}, finite_ratio={meta_grad_window_finite_ratio:.3f}, "
-                            f"nonzero_ratio={meta_grad_window_nonzero_ratio:.3f}, mean={meta_grad_window_mean:.6g}, "
-                            f"min={meta_grad_window_min:.6g}, max={meta_grad_window_max:.6g}"
                         )
 
                     lgn_clip_pre = float(nn.utils.clip_grad_norm_(lgn.parameters(), 1.0).item())
@@ -4899,9 +1473,6 @@ for i in pbar:
             'LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
             'LGN/Potential_VRef_Weight': float(args.lgn_potential_vref_weight),
             'LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],
-            'Diagnostics/Proxy_Stuck': loss_stuck_seq.mean(),
-            'Diagnostics/Proxy_Collision_Duration': loss_collision_duration_seq.mean(),
-            'Diagnostics/Proxy_Stuck_Total': loss_stuck_total,
             'Stuck/Ratio': stuck_ratio,
             'Stuck/Collision_Streak_Mean': loss_collision_duration_seq.mean(),
             'Stuck/Collision_Streak_Max': loss_collision_duration_seq.max(),
@@ -4924,7 +1495,6 @@ for i in pbar:
             'Meta_Comp/6_Stuck': loss_meta_stuck,
             'Meta_Comp/8_Smooth_Jerk': loss_meta_jerk,
             'Meta_Comp/9_Smooth_Snap': loss_meta_snap,
-            'Meta_Comp/10_Smooth_V_Pred': loss_meta_v_pred,
             'Meta_Comp/11_Heading_Safety': loss_heading_safety,
             'Meta_Comp/12_Yaw_Smooth': loss_yaw_smooth,
             'Guidance/Applied_In_Current_Phase': 1.0 if guidance_active_this_phase else 0.0,
@@ -4952,19 +1522,6 @@ for i in pbar:
             'Control/Accel_Cmd_Y_AbsMean': act_cmd_abs_mean[1],
             'Control/Accel_Cmd_Z_AbsMean': act_cmd_abs_mean[2],
 
-            # === [对齐] 归一化统计命名（与第二脚本风格一致） ===
-            'Norm/State_Mean': state_normalizer.mean[0],
-            'Norm/State_Var': state_normalizer.var[0],
-            'Norm/Update_Count': state_normalizer.count,
-            'Norm/Geom_Mean': geom_normalizer.mean[0],
-            'Norm/Geom_Var': geom_normalizer.var[0],
-            'Norm/Progress_Mean': progress_normalizer.mean[0],
-            'Norm/Progress_Var': progress_normalizer.var[0],
-
-            # === [兼容] 保留旧命名 ===
-            'Stats/Norm_Mean': state_normalizer.mean[0],
-            'Stats/Norm_Var': state_normalizer.var[0],
-            'Stats/Norm_Count': state_normalizer.count,
             'Status/Exploration_Window_Effective': exploration_window_effective,
             'Status/Guidance_All_Phases': 1.0 if args.guidance_all_phases else 0.0,
 
@@ -5046,11 +1603,6 @@ for i in pbar:
                 'Grad/LGN_NonFinite_Count': lgn_grad_nonfinite,
                 'Grad/LGN_GradElem_Count': lgn_grad_elems,
                 'Grad/LGN_Clip_PreNorm': lgn_clip_pre,
-                'Grad/LGN_MetaWindow_Mean': meta_grad_window_mean,
-                'Grad/LGN_MetaWindow_Min': meta_grad_window_min,
-                'Grad/LGN_MetaWindow_Max': meta_grad_window_max,
-                'Grad/LGN_MetaWindow_FiniteRatio': meta_grad_window_finite_ratio,
-                'Grad/LGN_MetaWindow_NonZeroRatio': meta_grad_window_nonzero_ratio,
                 'Grad/LGN_MetaProbe_NonFinite_Count': lgn_meta_probe_nonfinite,
                 'Grad/LGN_MetaProbe_GradElem_Count': lgn_meta_probe_elems,
             })
@@ -5061,28 +1613,6 @@ for i in pbar:
                 'Grad/Worker_NonFinite_Count': worker_grad_nonfinite,
                 'Grad/Worker_GradElem_Count': worker_grad_elems,
                 'Grad/Worker_Clip_PreNorm': worker_clip_pre,
-            })
-
-        if run_proxy_grad_diag:
-            log_data.update({
-                'Grad_ProxyWorker/0_SpeedPrefReward_Norm': proxy_grad_speed_pref_reward,
-                'Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
-                'Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
-                'Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
-                'Grad_ProxyWorker/4_Turn_Norm': proxy_grad_turn,
-                'Grad_ProxyWorker/5_VRef_Norm': proxy_grad_vref,
-                'Grad_ProxyWorker/0_SpeedPrefReward_NonFinite': proxy_grad_speed_pref_reward_nonfinite,
-                'Grad_ProxyWorker/1_Direction_NonFinite': proxy_grad_dir_nonfinite,
-                'Grad_ProxyWorker/2_Avoidance_NonFinite': proxy_grad_avoid_nonfinite,
-                'Grad_ProxyWorker/3_Exploration_NonFinite': proxy_grad_expl_nonfinite,
-                'Grad_ProxyWorker/4_Turn_NonFinite': proxy_grad_turn_nonfinite,
-                'Grad_ProxyWorker/5_VRef_NonFinite': proxy_grad_vref_nonfinite,
-                'Grad_ProxyWorker/0_SpeedPrefReward_GradElem': proxy_grad_speed_pref_reward_elems,
-                'Grad_ProxyWorker/1_Direction_GradElem': proxy_grad_dir_elems,
-                'Grad_ProxyWorker/2_Avoidance_GradElem': proxy_grad_avoid_elems,
-                'Grad_ProxyWorker/3_Exploration_GradElem': proxy_grad_expl_elems,
-                'Grad_ProxyWorker/4_Turn_GradElem': proxy_grad_turn_elems,
-                'Grad_ProxyWorker/5_VRef_GradElem': proxy_grad_vref_elems,
             })
 
         if train_lgn_phase:
@@ -5106,159 +1636,17 @@ for i in pbar:
             for feat_idx in range(min(4, progress_feat_last.shape[-1])):
                 log_data[f'LGN_Input/Progress_{feat_idx}'] = progress_feat_last[:, feat_idx].mean()
 
-        debug_log_data = {
-            'Debug/Loss/Proxy_Total': proxy_loss,
-            'Debug/Loss/Meta_Total': meta_loss,
-            'Debug/Loss/LGN_Unrolled_Meta': lgn_update_loss if train_lgn_phase else 0.0,
-            'Debug/Loss/Meta_Position': loss_meta_pos,
-            'Debug/Loss/Meta_Arrival_Reward': loss_meta_arrival_reward,
-            'Debug/Loss/Meta_Arrival_Term': -args.meta_arrival_reward_weight * loss_meta_arrival_reward,
-            'Debug/Loss/Meta_Collision': loss_meta_coll,
-            'Debug/Loss/Meta_Height': loss_meta_height,
-            'Debug/Loss/Meta_Guidance': loss_meta_guidance,
-            'Debug/Loss/Meta_Jerk': loss_meta_jerk,
-            'Debug/Loss/Meta_Snap': loss_meta_snap,
-            'Debug/Loss/Meta_V_Pred': loss_meta_v_pred,
-            'Debug/Proxy/Direction': loss_direction_seq.mean(),
-            'Debug/Proxy/Avoidance': loss_avoidance_seq.mean(),
-            'Debug/Proxy/Exploration': loss_exploration_seq.mean(),
-            'Debug/Proxy/Turn': loss_turn_seq.mean(),
-            'Debug/Proxy/LGN_VRef': loss_lgn_vref_seq.mean(),
-            'Debug/Proxy/Turn_Base': loss_turn_base_seq.mean(),
-            'Debug/Proxy/Yaw_Smooth': loss_yaw_smooth,
-            'Debug/Proxy/Height': loss_height_seq.mean(),
-            'Debug/LGN/VRef_Weight': weights_eff_mean_tb[6],
-            'Debug/LGN/VRef_Norm': safe_l2_norm(vref_body_seq, dim=-1).mean(),
-            'Debug/LGN/VRef_Real_Cos': lgn_vref_real_cos_seq.mean(),
-            'Debug/LGN/VRef_Worker_Cos': lgn_vref_real_cos_seq.mean(),
-            'Debug/LGN/Potential_VRef_Loss': loss_lgn_potential_vref,
-            'Debug/LGN/Potential_VRef_Weight': float(args.lgn_potential_vref_weight),
-            'Debug/LGN/Potential_VRef_Valid_Ratio': lgn_potential_vref_components['valid_ratio'],
-            'Debug/Yaw/Heading_Vel_Error_Deg': heading_vel_error_deg.mean(),
-            'Debug/Yaw/Backward_Ratio': backward_ratio,
-            'Debug/Yaw/Side_Backward_Ratio': side_backward_ratio,
-            'Debug/Yaw/Heading_Safety_Loss': loss_heading_safety,
-            'Debug/Yaw/Heading_Align_Loss': loss_heading_align_seq.mean(),
-            'Debug/Yaw/Backward_Loss': loss_backward_seq.mean(),
-            'Debug/Yaw/Yaw_Smooth_Loss': loss_yaw_smooth,
-            'Debug/Guidance/Applied': 1.0 if guidance_active_this_phase else 0.0,
-            'Debug/Guidance/Backprop': guidance_backprop_in_phase,
-            'Debug/Guidance/Valid_Ratio': guidance_components.get('valid_ratio', 0.0),
-            'Debug/Guidance/Invalid_Ratio': guidance_components.get('invalid_ratio', 0.0),
-            'Debug/Guidance/Collision_Ratio': guidance_components.get('collision_ratio', 0.0),
-            'Debug/Guidance/Dir_Align': guidance_components.get('dir_align', 0.0),
-            'Debug/Guidance/Field_Dir_Align': guidance_components.get('field_dir_align', 0.0),
-            'Debug/Guidance/Potential_Valid_Ratio': guidance_components.get(
-                'potential_valid_ratio', guidance_components.get('valid_ratio', 0.0)
-            ),
-            'Debug/Guidance/Potential_Mean': guidance_components.get('potential_mean', 0.0),
-            'Debug/Guidance/Potential_Decrease': guidance_components.get('potential_decrease', 0.0),
-            'Debug/Guidance/Potential_Step_Penalty': guidance_components.get('potential_step_penalty', 0.0),
-            'Debug/Guidance/Recovery_Speed': guidance_components.get('recovery_speed', 0.0),
-            'Debug/Guidance/Escape': guidance_components.get('escape', 0.0),
-            'Debug/Guidance/Depth': guidance_components.get('depth', 0.0),
-            'Debug/Guidance/Avg_Ref_Speed': guidance_components.get('avg_ref_speed', 0.0),
-            'Debug/Map/Precomputed_Enabled': 1.0 if args.use_precomputed_potential_maps else 0.0,
-            'Debug/Map/Current_Index': current_precomputed_map_idx,
-            'Debug/Map/Type_Code': map_type_code,
-            'Debug/Map/Curriculum_Stage_Code': map_stage_code,
-            'Debug/Map/Is_Easy': 1.0 if current_precomputed_map_type == "easy" else 0.0,
-            'Debug/Map/Is_Hairpin': 1.0 if current_precomputed_map_type == "hairpin" else 0.0,
-            'Debug/Map/Is_U_Min': 1.0 if current_precomputed_map_type == "u_min" else 0.0,
-            'Debug/Metrics/Success_Rate': success.float().mean(),
-            'Debug/Metrics/No_Collision_Rate': collision_free.float().mean(),
-            'Debug/Metrics/Reach_Goal_Rate': reached_goal.float().mean(),
-            'Debug/Metrics/Final_Dist_To_Goal': final_dist_to_goal.mean(),
-            'Debug/Metrics/Avg_Speed': avg_speed,
-            'Debug/Metrics/Min_Speed': v_norm.min(),
-            'Debug/Metrics/Max_Speed': v_norm.max(),
-            'Debug/Metrics/Collision_Depth_Mean': collision_depth.mean(),
-            'Debug/Metrics/Dist_Obj_Min': dist_obj.min(),
-            'Debug/Metrics/Dist_Obj_Mean': dist_obj.mean(),
-            'Debug/Metrics/Episode_Length': actual_T,
-            'Debug/Grad/LGN_Global_Norm': lgn_grad_norm,
-            'Debug/Grad/LGN_MetaProbe_Norm': lgn_meta_probe_norm,
-            'Debug/Grad/LGN_MetaWindow_Mean': meta_grad_window_mean,
-            'Debug/Grad/LGN_MetaWindow_FiniteRatio': meta_grad_window_finite_ratio,
-            'Debug/Grad/LGN_MetaWindow_NonZeroRatio': meta_grad_window_nonzero_ratio,
-            'Debug/Grad/Worker_Global_Norm': worker_grad_norm,
-            'Debug/Grad/Worker_Clip_PreNorm': worker_clip_pre,
-            'Debug/Grad_ProxyWorker/0_SpeedPrefReward_Norm': proxy_grad_speed_pref_reward,
-            'Debug/Grad_ProxyWorker/1_Direction_Norm': proxy_grad_dir,
-            'Debug/Grad_ProxyWorker/2_Avoidance_Norm': proxy_grad_avoid,
-            'Debug/Grad_ProxyWorker/3_Exploration_Norm': proxy_grad_expl,
-            'Debug/Grad_ProxyWorker/4_Turn_Norm': proxy_grad_turn,
-            'Debug/Grad_ProxyWorker/5_VRef_Norm': proxy_grad_vref,
-            'Debug/Status/Train_LGN_Phase': 1.0 if train_lgn_phase else 0.0,
-            'Debug/Status/Maze_Age': (maze_update_counter - 1) % args.maze_update_interval,
-            'Debug/Status/LGN_Step_Skipped': lgn_step_skipped,
-            'Debug/Status/LGN_Skip_Code': lgn_skip_code,
-            'Debug/Status/Guidance_All_Phases': 1.0 if args.guidance_all_phases else 0.0,
-        }
-        for weight_idx, weight_name in enumerate(['SpeedPref_Signed', 'SpeedPref_Strength', 'Direction', 'Avoidance', 'Exploration', 'Turn', 'VRef']):
-            if weight_idx < weights_eff_mean_tb.numel():
-                debug_log_data[f'Debug/Weights/{weight_idx}_{weight_name}'] = weights_eff_mean_tb[weight_idx]
-                debug_log_data[f'Debug/Weights_Raw/{weight_idx}_{weight_name}'] = weights_raw_mean_tb[weight_idx]
-                debug_log_data[f'Debug/Weights_Snapshot/{weight_idx}_{weight_name}'] = weights_snapshot_eff_tb[weight_idx]
-        debug_log_data.update({
-            'Debug/Weights/Std': weights_eff_tb.std(unbiased=False),
-            'Debug/Weights/Raw_Min': weights_raw_tb.min(),
-            'Debug/Weights/Raw_Max': weights_raw_tb.max(),
-            'Debug/Weights/Raw_Mean': weights_raw_tb.mean(),
-            'Debug/Weights_Snapshot/Std': weights_snapshot_eff_tb.std(unbiased=False),
-            'Debug/Weights_Snapshot/Raw_Min': snapshot_raw_flat_tb.min(),
-            'Debug/Weights_Snapshot/Raw_Max': snapshot_raw_flat_tb.max(),
-            'Debug/Weights_Snapshot/Raw_Mean': snapshot_raw_flat_tb.mean(),
-        })
-        if use_attitude_v2:
-            debug_log_data.update({
-                'Debug/Heading/Yaw_Error_Abs_Deg': yaw_error_abs_deg,
-                'Debug/Heading/Yaw_Rate_Env_Abs_Deg': yaw_rate_env_abs_deg,
-                'Debug/Heading/Yaw_Rate_Cmd_Abs_Deg': yaw_rate_cmd_abs_deg,
-            })
-        if geom_feat_last is not None and progress_feat_last is not None:
-            debug_log_data.update({
-                'Debug/LGN_Input/Geom_Mean': geom_feat_last.mean(),
-                'Debug/LGN_Input/Geom_Std': geom_feat_last.std(unbiased=False),
-                'Debug/LGN_Input/Progress_Mean': progress_feat_last.mean(),
-                'Debug/LGN_Input/Progress_Std': progress_feat_last.std(unbiased=False),
-            })
-
-        active_map_log_key = _resolve_map_log_key(current_precomputed_map_type)
-        active_tb_writer = _resolve_tb_writer(current_precomputed_map_type)
-        smooth_dict(log_data, map_log_key=active_map_log_key)
+        active_map_log_key = _resolve_map_log_key(current_precomputed_map_type, map_writers)
+        active_tb_writer = _resolve_tb_writer(current_precomputed_map_type, writer, map_writers)
+        smooth_dict(log_data, scaler_q_by_map, map_log_key=active_map_log_key)
         if tb_log_now:
             writer_q = scaler_q_by_map[active_map_log_key]
             active_tb_writer.add_scalar("Status_Raw/Train_LGN_Phase", float(train_lgn_phase), i + 1)
-            if train_lgn_phase:
-                active_tb_writer.add_scalar("Grad_LGN_Raw/Global_Norm", lgn_grad_norm, i + 1)
-                active_tb_writer.add_scalar("Grad_LGN_Raw/MetaProbe_Norm", lgn_meta_probe_norm, i + 1)
-                active_tb_writer.add_scalar("Grad_LGN_Raw/Step_Skipped", lgn_step_skipped, i + 1)
-                active_tb_writer.add_scalar("Grad_LGN_Raw/Skip_Code", lgn_skip_code, i + 1)
             active_tb_writer.add_scalar('Status/Train_Mode', 1.0 if train_lgn_phase else 0.0, i + 1)
             active_tb_writer.add_scalar('Status/Maze_Age', (maze_update_counter - 1) % args.maze_update_interval, i + 1)
             for k, v in writer_q.items():
                 active_tb_writer.add_scalar(k, sum(v) / len(v), i + 1)
             writer_q.clear()
-        if debug_tb_log_now:
-            write_scalar_dict(active_tb_writer, debug_log_data, i + 1)
-            active_tb_writer.flush()
-
-        if is_save_iter(i):
-            torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{i:06d}.pth'))
-            torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{i:06d}.pth'))
-            torch.save(state_normalizer.state_dict(), os.path.join(save_dir, f'norm_ckpt_{i:06d}.pth'))
-            try:
-                sync_stats = sync_multi_pub_to_checkpoint_dir(save_dir)
-                print(
-                    f"[CheckpointSync] iter={i + 1} "
-                    f"src={sync_stats['src_root']} -> dst={sync_stats['dst_root']} "
-                    f"copied={sync_stats['files_copied']} "
-                    f"deleted_files={sync_stats['files_deleted']} "
-                    f"deleted_dirs={sync_stats['dirs_deleted']}"
-                )
-            except Exception as e:
-                print(f"[CheckpointSync][WARN] iter={i + 1} sync failed: {e}")
 
         if current_precomputed_map_type in VIZ_MAP_TYPES:
             idx = 0
@@ -5278,52 +1666,83 @@ for i in pbar:
                 'R_cpu': R_history[:, idx].detach().cpu().clone(),
                 'act_cpu': real_act_history[:, idx].detach().cpu().clone(),
                 'weights_cpu': effective_weights_seq[:, idx, :].detach().cpu().clone(),
-                'weights_snapshot': weights_snapshot_eff_tb.detach().cpu().clone(),
-                'raw_snapshot': snapshot_raw_flat_tb.detach().cpu().clone(),
                 'depth_stack': depth_stack,
                 'astar_paths_sampled': astar_paths_sampled,
             }
-            cache_msg = (
-                f"iter={i + 1}, type={current_precomputed_map_type}, "
-                f"idx={current_precomputed_map_idx}, file={current_precomputed_map_file}"
-            )
-            if debug_tb_log_now:
-                _resolve_tb_writer(current_precomputed_map_type).add_text(
-                    f'Debug/VizCache/Latest_{current_precomputed_map_type}',
-                    cache_msg,
-                    i + 1,
-                )
 
-        if is_save_trajectory_iter(i):
-            available_types = [
-                map_type for map_type in VIZ_MAP_TYPES
-                if latest_viz_by_map_type.get(map_type) is not None
-            ]
-            missing_types = [
-                map_type for map_type in VIZ_MAP_TYPES
-                if latest_viz_by_map_type.get(map_type) is None
-            ]
-            status_msg = (
-                f"save_iter={i + 1}, available={','.join(available_types) or 'none'}, "
-                f"missing={','.join(missing_types) or 'none'}"
-            )
-            if debug_tb_log_now:
-                writer.add_text('Debug/VizCache/Save_Status', status_msg, i + 1)
-                write_scalar_dict(
-                    writer,
-                    {
-                        'Debug/VizCache/Has_Easy': 1.0 if latest_viz_by_map_type.get('easy') is not None else 0.0,
-                        'Debug/VizCache/Has_Hairpin': 1.0 if latest_viz_by_map_type.get('hairpin') is not None else 0.0,
-                        'Debug/VizCache/Has_U_Min': 1.0 if latest_viz_by_map_type.get('u_min') is not None else 0.0,
-                        'Debug/VizCache/Available_Count': len(available_types),
-                    },
-                    i + 1,
-                )
+        if is_artifact_save_iter(i, args):
+            save_step = i + 1
+            selection_loss = float(meta_loss.detach().item())
+            is_new_best = math.isfinite(selection_loss) and selection_loss < best_meta_loss
+
+            torch.save(worknet.state_dict(), os.path.join(save_dir, f'worker_ckpt_{save_step:06d}.pth'))
+            torch.save(lgn.state_dict(), os.path.join(save_dir, f'lgn_ckpt_{save_step:06d}.pth'))
+
             for map_type in VIZ_MAP_TYPES:
                 record = latest_viz_by_map_type.get(map_type)
                 if record is None:
                     continue
-                save_cached_viz_record(record, i + 1)
+                save_cached_viz_record(
+                    record,
+                    i + 1,
+                    args=args,
+                    potential_map_cache=POTENTIAL_MAP_CACHE,
+                    video_dir=video_dir,
+                    writer=writer,
+                )
+
+            if is_new_best:
+                best_meta_loss = selection_loss
+                best_meta_loss_step = save_step
+                best_artifact_label = f'best_step_{save_step:06d}'
+                best_worker_file = f'worker_{best_artifact_label}.pth'
+                best_lgn_file = f'lgn_{best_artifact_label}.pth'
+                torch.save(worknet.state_dict(), os.path.join(save_dir, best_worker_file))
+                torch.save(lgn.state_dict(), os.path.join(save_dir, best_lgn_file))
+
+                best_record = latest_viz_by_map_type.get(current_precomputed_map_type)
+                if best_record is not None:
+                    save_cached_viz_record(
+                        best_record,
+                        save_step,
+                        args=args,
+                        potential_map_cache=POTENTIAL_MAP_CACHE,
+                        video_dir=video_dir,
+                        writer=writer,
+                        artifact_label=best_artifact_label,
+                    )
+
+                best_metadata = {
+                    'step': best_meta_loss_step,
+                    'meta_loss': best_meta_loss,
+                    'worker_checkpoint': best_worker_file,
+                    'lgn_checkpoint': best_lgn_file,
+                    'artifact_label': best_artifact_label,
+                    'map_type': current_precomputed_map_type,
+                    'map_index': int(current_precomputed_map_idx),
+                    'map_file': str(current_precomputed_map_file),
+                }
+                with open(os.path.join(save_dir, 'best_checkpoint.json'), 'w') as f:
+                    json.dump(best_metadata, f, indent=4)
+                writer.add_scalar('Best/Meta_Loss', best_meta_loss, save_step)
+                writer.add_scalar('Best/Step', best_meta_loss_step, save_step)
+                print(
+                    f"[BestCheckpoint] iter={save_step} "
+                    f"meta_loss={best_meta_loss:.6f} "
+                    f"map={current_precomputed_map_type}:{current_precomputed_map_idx}"
+                )
+
+            try:
+                sync_stats = sync_multi_pub_to_checkpoint_dir(save_dir)
+                print(
+                    f"[CheckpointSync] iter={save_step} "
+                    f"src={sync_stats['src_root']} -> dst={sync_stats['dst_root']} "
+                    f"copied={sync_stats['files_copied']} "
+                    f"deleted_files={sync_stats['files_deleted']} "
+                    f"deleted_dirs={sync_stats['dirs_deleted']}"
+                )
+            except Exception as e:
+                print(f"[CheckpointSync][WARN] iter={save_step} sync failed: {e}")
             writer.flush()
 
 print(f"Training Finished. Artifacts in: {save_dir}")

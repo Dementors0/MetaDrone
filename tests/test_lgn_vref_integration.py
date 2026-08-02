@@ -29,7 +29,7 @@ class LGNVRefIntegrationTest(unittest.TestCase):
         progress = torch.randn(B, 32, dtype=torch.float32)
 
         weights, vref, hx = model(depth, state, geom, progress, hx=None)
-        self.assertEqual(weights.shape, torch.Size([B, 6]))
+        self.assertEqual(weights.shape, torch.Size([B, 7]))
         self.assertEqual(vref.shape, torch.Size([B, 3]))
         self.assertEqual(hx.shape, torch.Size([B, 1, 64]))
         self.assertTrue(torch.isfinite(weights).all())
@@ -61,10 +61,10 @@ class LGNVRefIntegrationTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(vref).all())
         self.assertTrue(torch.allclose(vref, torch.zeros_like(vref), atol=1e-6))
 
-    def test_vpred_world_to_body_and_lgn_vref_loss_range(self):
+    def test_real_velocity_world_to_body_and_lgn_vref_loss_range(self):
         T, B = 3, 2
 
-        v_preds_tensor = torch.tensor(
+        v_real_world = torch.tensor(
             [
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -83,19 +83,19 @@ class LGNVRefIntegrationTest(unittest.TestCase):
             dim=0,
         )  # [T, B, 3, 3]
 
-        v_pred_body_seq = torch.squeeze(v_preds_tensor[:, :, None, :] @ r_proxy_seq, 2)
-        v_pred_body_dir = _safe_normalize(v_pred_body_seq)
+        v_real_body_seq = torch.squeeze(v_real_world[:, :, None, :] @ r_proxy_seq, 2)
+        v_real_body_dir = _safe_normalize(v_real_body_seq)
 
-        vref_same = v_pred_body_dir.clone()
-        loss_same = (1.0 - (v_pred_body_dir * vref_same).sum(dim=-1)).clamp(0.0, 2.0)
+        vref_same = v_real_body_dir.clone()
+        loss_same = (1.0 - (v_real_body_dir * vref_same).sum(dim=-1)).clamp(0.0, 2.0)
         self.assertTrue(torch.allclose(loss_same, torch.zeros_like(loss_same), atol=1e-6))
 
-        vref_opposite = -v_pred_body_dir
-        loss_opposite = (1.0 - (v_pred_body_dir * vref_opposite).sum(dim=-1)).clamp(0.0, 2.0)
+        vref_opposite = -v_real_body_dir
+        loss_opposite = (1.0 - (v_real_body_dir * vref_opposite).sum(dim=-1)).clamp(0.0, 2.0)
         self.assertTrue(torch.allclose(loss_opposite, torch.full_like(loss_opposite, 2.0), atol=1e-6))
 
-        random_vref = _safe_normalize(torch.randn_like(v_pred_body_seq))
-        loss_random = (1.0 - (v_pred_body_dir * random_vref).sum(dim=-1)).clamp(0.0, 2.0)
+        random_vref = _safe_normalize(torch.randn_like(v_real_body_seq))
+        loss_random = (1.0 - (v_real_body_dir * random_vref).sum(dim=-1)).clamp(0.0, 2.0)
         self.assertTrue(torch.isfinite(loss_random).all())
         self.assertGreaterEqual(loss_random.min().item(), 0.0)
         self.assertLessEqual(loss_random.max().item(), 2.0)

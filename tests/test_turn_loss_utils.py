@@ -1,114 +1,117 @@
+import math
 import unittest
 
 import torch
 
-from turn_loss_utils import compute_turn_preference_loss_xy_windowed
+from turn_loss_utils import compute_direction_stability_loss_3d
 
 
-class TurnPreferenceLossXYWindowedTest(unittest.TestCase):
-    def test_z_variation_does_not_change_turn_loss(self):
-        v_up = torch.tensor(
+class DirectionStabilityLoss3DTest(unittest.TestCase):
+    def test_loss_is_monotonic_with_three_dimensional_angle(self):
+        angles_deg = [0.0, 5.0, 10.0, 30.0, 90.0, 180.0]
+        losses = []
+        for angle_deg in angles_deg:
+            angle = math.radians(angle_deg)
+            velocity = torch.tensor(
+                [
+                    [[1.0, 0.0, 0.0]],
+                    [[math.cos(angle), 0.0, math.sin(angle)]],
+                ],
+                dtype=torch.float64,
+            )
+            loss = compute_direction_stability_loss_3d(velocity)
+            losses.append(loss[1, 0].item())
+
+        self.assertAlmostEqual(losses[0], 0.0, places=12)
+        for previous, current in zip(losses, losses[1:]):
+            self.assertLess(previous, current)
+        self.assertAlmostEqual(losses[-1], 1.0, places=6)
+
+    def test_vertical_direction_change_is_penalized(self):
+        velocity = torch.tensor(
             [
                 [[1.0, 0.0, 0.0]],
-                [[1.0, 0.0, 8.0]],
+                [[0.0, 0.0, 1.0]],
             ],
             dtype=torch.float32,
         )
-        v_down = torch.tensor(
+        loss = compute_direction_stability_loss_3d(velocity)
+        self.assertGreater(loss[1, 0].item(), 0.45)
+
+    def test_same_direction_with_different_speed_has_zero_loss(self):
+        velocity = torch.tensor(
             [
-                [[1.0, 0.0, 0.0]],
-                [[1.0, 0.0, -8.0]],
+                [[0.5, 1.0, -0.5]],
+                [[1.0, 2.0, -1.0]],
             ],
             dtype=torch.float32,
         )
-
-        loss_up = compute_turn_preference_loss_xy_windowed(v_up, speed_threshold=0.2, window=8)
-        loss_down = compute_turn_preference_loss_xy_windowed(v_down, speed_threshold=0.2, window=8)
-
-        self.assertTrue(torch.allclose(loss_up, loss_down, atol=1e-6))
-        # Straight motion has zero turn magnitude -> normalized turn=0 -> loss=1.
-        self.assertAlmostEqual(loss_up[1, 0].item(), 1.0, places=6)
-
-    def test_sustained_arc_beats_small_wiggle(self):
-        # sustained_arc: 0 -> 45 -> 90 -> 135 deg (larger cumulative turn)
-        arc = torch.tensor(
-            [
-                [[1.0, 0.0, 0.0]],
-                [[0.70710677, 0.70710677, 0.0]],
-                [[0.0, 1.0, 0.0]],
-                [[-0.70710677, 0.70710677, 0.0]],
-            ],
-            dtype=torch.float32,
-        )
-        # wiggle: tiny alternating heading around x-axis
-        wiggle = torch.tensor(
-            [
-                [[1.0, 0.0, 0.0]],
-                [[1.0, 0.1, 0.0]],
-                [[1.0, -0.1, 0.0]],
-                [[1.0, 0.1, 0.0]],
-            ],
-            dtype=torch.float32,
-        )
-
-        loss_arc = compute_turn_preference_loss_xy_windowed(arc, speed_threshold=0.2, window=8)
-        loss_wiggle = compute_turn_preference_loss_xy_windowed(wiggle, speed_threshold=0.2, window=8)
-        self.assertLess(loss_arc[3, 0].item(), loss_wiggle[3, 0].item())
-
-    def test_wrap_at_pi_boundary_is_stable(self):
-        # heading jumps across pi/-pi should result in a small wrapped delta (~0.02 rad), not ~2pi.
-        eps = 0.01
-        v_history = torch.tensor(
-            [
-                [[-1.0, eps, 0.0]],
-                [[-1.0, -eps, 0.0]],
-            ],
-            dtype=torch.float32,
-        )
-        loss = compute_turn_preference_loss_xy_windowed(v_history, speed_threshold=0.2, window=8)
-        # Should be close to 1 (small turn), definitely finite and not a huge-turn score.
-        self.assertTrue(torch.isfinite(loss).all())
-        self.assertGreater(loss[1, 0].item(), 0.95)
-
-    def test_opposite_turns_cancel_in_vector_sum(self):
-        # 0 -> +45 -> 0 : signed turns (+45, -45) should largely cancel in |sum dtheta|.
-        v_history = torch.tensor(
-            [
-                [[1.0, 0.0, 0.0]],
-                [[0.70710677, 0.70710677, 0.0]],
-                [[1.0, 0.0, 0.0]],
-            ],
-            dtype=torch.float32,
-        )
-        loss = compute_turn_preference_loss_xy_windowed(v_history, speed_threshold=0.2, window=8)
-        # With cancellation, turn reward is weak -> loss stays high.
-        self.assertGreater(loss[2, 0].item(), 0.9)
-
-    def test_low_horizontal_speed_is_masked_out(self):
-        v_history = torch.tensor(
-            [
-                [[0.05, 0.0, 6.0]],
-                [[0.05, 0.0, -6.0]],
-            ],
-            dtype=torch.float32,
-        )
-
-        loss = compute_turn_preference_loss_xy_windowed(v_history, speed_threshold=0.2, window=8)
+        loss = compute_direction_stability_loss_3d(velocity)
         self.assertAlmostEqual(loss[1, 0].item(), 0.0, places=6)
 
-    def test_short_prefix_is_stable(self):
-        # T < window should still produce valid output.
-        v_history = torch.tensor(
+    def test_soft_speed_gate_matches_threshold_weight(self):
+        velocity = torch.tensor(
             [
-                [[1.0, 1.0, 0.0]],
-                [[2.0, 2.0, 0.0]],
+                [[0.2, 0.0, 0.0]],
+                [[0.0, 0.2, 0.0]],
             ],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
+        loss = compute_direction_stability_loss_3d(
+            velocity,
+            speed_threshold=0.2,
+            speed_softness=0.01,
+            soft_angle_deg=10.0,
+        )
+        beta = math.radians(10.0)
+        angle_loss = (0.5 * math.pi - 0.5 * beta) / (
+            math.pi - 0.5 * beta
+        )
+        self.assertAlmostEqual(loss[1, 0].item(), 0.25 * angle_loss, places=6)
 
-        loss = compute_turn_preference_loss_xy_windowed(v_history, speed_threshold=0.2, window=8)
-        self.assertEqual(loss.shape, torch.Size([2, 1]))
+    def test_soft_speed_gate_keeps_velocity_gradient(self):
+        velocity = torch.tensor(
+            [
+                [[0.2, 0.0, 0.0]],
+                [[0.0, 0.2, 0.0]],
+            ],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        loss = compute_direction_stability_loss_3d(velocity).sum()
+        loss.backward()
+
+        self.assertIsNotNone(velocity.grad)
+        self.assertTrue(torch.isfinite(velocity.grad).all())
+        self.assertGreater(velocity.grad.abs().sum().item(), 0.0)
+
+    def test_low_speed_suppresses_but_does_not_hard_cut_loss(self):
+        low_speed = torch.tensor(
+            [
+                [[0.15, 0.0, 0.0]],
+                [[0.0, 0.15, 0.0]],
+            ],
+            dtype=torch.float64,
+        )
+        high_speed = torch.tensor(
+            [
+                [[0.25, 0.0, 0.0]],
+                [[0.0, 0.25, 0.0]],
+            ],
+            dtype=torch.float64,
+        )
+        low_loss = compute_direction_stability_loss_3d(low_speed)[1, 0]
+        high_loss = compute_direction_stability_loss_3d(high_speed)[1, 0]
+
+        self.assertGreater(low_loss.item(), 0.0)
+        self.assertLess(low_loss.item(), high_loss.item() * 1e-3)
+
+    def test_single_step_is_zero_and_finite(self):
+        velocity = torch.tensor([[[1.0, 2.0, 3.0]]])
+        loss = compute_direction_stability_loss_3d(velocity)
+        self.assertEqual(loss.shape, torch.Size([1, 1]))
         self.assertTrue(torch.isfinite(loss).all())
+        self.assertEqual(loss[0, 0].item(), 0.0)
 
 
 if __name__ == "__main__":
